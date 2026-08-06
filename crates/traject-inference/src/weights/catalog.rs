@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use memmap2::Mmap;
 use safetensors::tensor::SafeTensors;
 use serde::Deserialize;
-use tracing::info;
+use tracing::{info, warn};
 use traject_core::{Result, TrajectError};
 
 use super::dtype::{bytes_to_f32_vec, dequant_fp8_block_scaled};
@@ -215,9 +215,9 @@ impl SafetensorCatalog {
     }
 }
 
-/// Layer-0 attention projections (DeepSeek-V4 MLA compressed form).
+/// Layer-0 attention projections (DeepSeek-V4 MLA compressed + optional Q expand).
 ///
-/// Routed MoE experts are **not** loaded here — that remains sglang-lite.
+/// Routed MoE experts / full `wo_*` output are **not** loaded here.
 #[derive(Debug, Clone)]
 pub struct Layer0AttnWeights {
     /// RMSNorm γ before attention, shape [hidden].
@@ -227,14 +227,29 @@ pub struct Layer0AttnWeights {
     pub wq_a: TensorF32,
     /// `wkv`: [kv_lora, hidden] — compressed KV projection.
     pub wkv: TensorF32,
+    /// Optional RMSNorm on q_lora (after `wq_a`).
+    pub q_norm: Option<Vec<f32>>,
+    /// Optional RMSNorm on kv_lora (after `wkv`).
+    pub kv_norm: Option<Vec<f32>>,
+    /// Optional `wq_b`: [n_heads * head_dim, q_lora] — expand Q to full heads.
+    pub wq_b: Option<TensorF32>,
+    /// Head count implied by `wq_b` rows / `kv_lora` (when present).
+    pub n_heads: Option<usize>,
 }
 
 impl Layer0AttnWeights {
-    pub fn q_dim(&self) -> usize {
+    pub fn q_lora_dim(&self) -> usize {
         self.wq_a.rows()
     }
     pub fn kv_dim(&self) -> usize {
         self.wkv.rows()
+    }
+    pub fn has_q_expand(&self) -> bool {
+        self.wq_b.is_some()
+    }
+    /// Full Q width after `wq_b` (e.g. 32768), if loaded.
+    pub fn q_full_dim(&self) -> Option<usize> {
+        self.wq_b.as_ref().map(|t| t.rows())
     }
 }
 
@@ -341,12 +356,81 @@ pub fn load_layer0_attn(model_dir: &Path) -> Result<Layer0AttnWeights> {
         )));
     }
 
+    let q_norm = cat
+        .load_f32("layers.0.attn.q_norm.weight")
+        .ok()
+        .map(|t| t.data);
+    let kv_norm = cat
+        .load_f32("layers.0.attn.kv_norm.weight")
+        .ok()
+        .map(|t| t.data);
+
+    // Optional Q expand (full MLA heads). ~134MB f32 for V4 Flash.
+    let wq_b = match load_weight_fp8_or_f32(
+        &mut cat,
+        &[
+            "layers.0.attn.wq_b.weight",
+            "layers.0.attn.wq_b",
+            "model.layers.0.self_attn.q_b_proj.weight",
+        ],
+    ) {
+        Ok(t) => {
+            if t.shape.len() == 2 && t.cols() == wq_a.rows() {
+                Some(t)
+            } else {
+                warn!(
+                    shape = ?t.shape,
+                    q_lora = wq_a.rows(),
+                    "wq_b shape incompatible with wq_a; skipping Q expand"
+                );
+                None
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "wq_b not loaded; Q stays at q_lora");
+            None
+        }
+    };
+
+    let n_heads = wq_b.as_ref().and_then(|t| {
+        let kv = wkv.rows();
+        if kv > 0 && t.rows() % kv == 0 {
+            Some(t.rows() / kv)
+        } else {
+            None
+        }
+    });
+
+    if let Some(ref qn) = q_norm {
+        if qn.len() != wq_a.rows() {
+            return Err(TrajectError::Other(format!(
+                "q_norm len {} != q_lora {}",
+                qn.len(),
+                wq_a.rows()
+            )));
+        }
+    }
+    if let Some(ref kn) = kv_norm {
+        if kn.len() != wkv.rows() {
+            return Err(TrajectError::Other(format!(
+                "kv_norm len {} != kv_lora {}",
+                kn.len(),
+                wkv.rows()
+            )));
+        }
+    }
+
     info!(
         dir = %model_dir.display(),
         hidden,
         q_lora = wq_a.rows(),
         kv_lora = wkv.rows(),
-        "loaded layer-0 attention projections"
+        has_q_norm = q_norm.is_some(),
+        has_kv_norm = kv_norm.is_some(),
+        has_wq_b = wq_b.is_some(),
+        q_full = wq_b.as_ref().map(|t| t.rows()),
+        n_heads = ?n_heads,
+        "loaded layer-0 attention projections (MLA Q path)"
     );
 
     Ok(Layer0AttnWeights {
@@ -354,6 +438,10 @@ pub fn load_layer0_attn(model_dir: &Path) -> Result<Layer0AttnWeights> {
         hidden,
         wq_a,
         wkv,
+        q_norm,
+        kv_norm,
+        wq_b,
+        n_heads,
     })
 }
 

@@ -90,12 +90,13 @@ toy char-hash encode and id-list decode.
 
 When present, loads DeepSeek-V4:
 
-1. **Attention (compressed):** `attn_norm` + FP8 `wq_a` / `wkv` → Q/K/V into `KernelBackend`
+1. **Attention:** `attn_norm` + FP8 `wq_a` / `wkv` + optional `q_norm` / `kv_norm`  
+   + optional FP8 `wq_b` (full multi-head Q, mean-pooled to `kv_lora` for KernelBackend)
 2. **Shared expert FFN:** `ffn_norm` + FP8 `shared_experts.w1/w2/w3` as SwiGLU residual  
    (`y = w2(silu(w1 x) ⊙ w3 x)`)
 
-**Not loaded yet:** full MLA (`wq_b` / `wo_*`), **routed** MoE (256 experts), layers 1–42.
-Attention output projection still uses residual adapter (`w_up`).
+**Not loaded yet:** `wo_*` output proj, **routed** MoE (256 FP4 experts), layers 1–42.
+Attention→hidden still uses residual adapter (`w_up`).
 
 ## Status
 
@@ -106,4 +107,5 @@ Attention output projection still uses residual adapter (`w_up`).
 - [x] FlashInfer as default attention for LocalWeightRunner when `--features flashinfer`  
 - [x] Layer-0 attention projections (`attn_norm` + FP8 `wq_a`/`wkv` block dequant)  
 - [x] Layer-0 shared-expert SwiGLU FFN (not routed MoE)  
+- [x] Layer-0 MLA Q expand (`q_norm`/`kv_norm`/`wq_b`, head mean-pool)  
 - [ ] Full MoE / MLA layer stack in-process (still sglang for production MoE)  
