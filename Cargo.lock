@@ -3574,6 +3574,7 @@ dependencies = [
  "traject-memory",
  "traject-policy",
  "traject-runtime",
+ "traject-scheduler",
  "uuid",
  "zene-config",
  "zene-core",

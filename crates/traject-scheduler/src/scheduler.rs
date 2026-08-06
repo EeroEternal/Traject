@@ -189,8 +189,12 @@ impl Scheduler {
         self.ready.sort_by(|a, b| a.priority.cmp(&b.priority));
 
         let mut actions = Vec::new();
-        let pin_decisions = Vec::new();
+        let mut pin_decisions = Vec::new();
         let mut still_ready = Vec::new();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
 
         for item in self.ready.drain(..) {
             match item.step {
@@ -230,10 +234,21 @@ impl Scheduler {
                 }
                 Step::Tool { id, call, timeout_ms } => {
                     if self.budget.tools.try_acquire() {
+                        // Advise pin for tool gap (driver applies + may refine with p95).
+                        let ttl = self.config.pin_policy.base_ttl_ms;
+                        pin_decisions.push(crate::priority::PinDecision {
+                            trajectory_id: item.trajectory_id,
+                            action: crate::priority::PinAction::Pin {
+                                until_ms: now.saturating_add(ttl),
+                                reason: traject_core::PinReason::WaitingTool,
+                                strength: 2,
+                            },
+                        });
                         actions.push(TickAction::RunTool {
                             trajectory_id: item.trajectory_id,
                             step_id: id,
                         });
+                        let _ = call;
                     } else {
                         still_ready.push(ReadyStep {
                             trajectory_id: item.trajectory_id,
@@ -255,7 +270,10 @@ impl Scheduler {
 
         self.ready = still_ready;
 
-        let _ = self.memory_pressure_high;
+        // Under memory pressure, emit unpin advice for weak pins (driver enforces).
+        if self.memory_pressure_high {
+            // Driver walks live trajs; keep marker decision empty here.
+        }
 
         SchedulerTick {
             actions,

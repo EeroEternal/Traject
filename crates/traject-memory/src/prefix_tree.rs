@@ -4,6 +4,10 @@ use traject_core::{PinInfo, PrefixNodeId, TrajectoryId};
 use crate::{BlockId, TierId};
 
 /// One node in the logical radix / prefix tree.
+///
+/// Physical KV lives in the engine (sglang-lite radix / V4 prefix cache).
+/// `engine_handle` is the opaque key the engine uses for that materialization
+/// so Traject can pin / reuse / evict in lockstep with MemoryManager.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrefixNode {
     pub id: PrefixNodeId,
@@ -17,6 +21,12 @@ pub struct PrefixNode {
     pub owners: Vec<TrajectoryId>,
     pub tier: TierId,
     pub blocks: Vec<BlockId>,
+    /// Engine-side radix / prefix-cache handle (session-stable key).
+    pub engine_handle: Option<String>,
+    /// Last touch time for LRU eviction under pressure.
+    pub last_access_ms: u64,
+    /// Cumulative cache-hit tokens reported by the engine for this node.
+    pub cache_hit_tokens: u32,
 }
 
 impl PrefixNode {
@@ -32,6 +42,9 @@ impl PrefixNode {
             owners: Vec::new(),
             tier: TierId::Gpu,
             blocks: Vec::new(),
+            engine_handle: None,
+            last_access_ms: 0,
+            cache_hit_tokens: 0,
         }
     }
 }
@@ -154,6 +167,9 @@ impl PrefixTree {
             owners: node.owners.clone(),
             tier: node.tier,
             blocks: Vec::new(),
+            engine_handle: None,
+            last_access_ms: node.last_access_ms,
+            cache_hit_tokens: 0,
         };
 
         // Rewire parent: replace node_id with mid_id.
@@ -197,9 +213,40 @@ impl PrefixTree {
             owners: vec![owner],
             tier: TierId::Gpu,
             blocks: Vec::new(),
+            engine_handle: None,
+            last_access_ms: 0,
+            cache_hit_tokens: 0,
         };
         self.nodes.insert(child_id, node);
         Some(child_id)
+    }
+
+    pub fn touch(&mut self, id: PrefixNodeId, now_ms: u64) {
+        if let Some(n) = self.nodes.get_mut(&id) {
+            n.last_access_ms = now_ms;
+        }
+    }
+
+    pub fn set_engine_handle(&mut self, id: PrefixNodeId, handle: impl Into<String>) -> bool {
+        if let Some(n) = self.nodes.get_mut(&id) {
+            n.engine_handle = Some(handle.into());
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn engine_handle(&self, id: PrefixNodeId) -> Option<&str> {
+        self.nodes
+            .get(&id)
+            .and_then(|n| n.engine_handle.as_deref())
+    }
+
+    pub fn add_cache_hits(&mut self, id: PrefixNodeId, hits: u32) {
+        if let Some(n) = self.nodes.get_mut(&id) {
+            n.cache_hit_tokens = n.cache_hit_tokens.saturating_add(hits);
+            n.share_score += hits as f32 * 0.01;
+        }
     }
 
     fn bump_share(&mut self, id: PrefixNodeId) {

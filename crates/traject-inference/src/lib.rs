@@ -10,8 +10,8 @@ mod gpu;
 mod kernel;
 
 pub use backend::{
-    HttpOpenAiBackend, KernelSmokeBackend, LocalEngineConfig, LocalEngineHandle,
-    SglangLiteEngineBackend,
+    EnginePrefixClient, HttpOpenAiBackend, KernelSmokeBackend, LocalEngineConfig,
+    LocalEngineHandle, SglangLiteEngineBackend,
 };
 pub use chunked::{ChunkRequest, ChunkResult};
 pub use engine::{

@@ -48,6 +48,11 @@ _TP_MODE = False
 # thread-affine; asyncio default executors break device binding).
 _TP_CUDA_Q: "queue.Queue" = None  # type: ignore[assignment]
 _TP_CUDA_THREAD: Optional[threading.Thread] = None
+# Traject MemoryManager alignment: pin/ref + last prompt tokens per session.
+_PREFIX_PINS: Dict[str, Dict[str, Any]] = {}
+_SESSION_LAST_IDS: Dict[str, List[int]] = {}
+# prefix_id → last prompt token ids (for free/evict of V4 snapshots).
+_PREFIX_TOKEN_IDS: Dict[str, List[int]] = {}
 
 
 class ChatMessage(BaseModel):
@@ -98,6 +103,27 @@ class GenerationRequest(BaseModel):
 
 class CancelRequest(BaseModel):
     request_id: str
+
+
+class PrefixPinRequest(BaseModel):
+    """Traject MemoryManager → engine pin for tool gaps / prefetch."""
+
+    prefix_id: str
+    session_id: Optional[str] = None
+    trajectory_id: Optional[str] = None
+    ttl_ms: int = 30_000
+    reason: str = "WaitingTool"
+
+
+class PrefixUnpinRequest(BaseModel):
+    prefix_id: str
+
+
+class PrefixFreeRequest(BaseModel):
+    """Traject MemoryManager eviction: drop pin + any V4 snapshot for this handle."""
+
+    prefix_id: str
+    session_id: Optional[str] = None
 
 
 def _input_ids_from_req(req: GenerationRequest) -> List[int]:
@@ -213,6 +239,105 @@ async def cancel(req: CancelRequest):
     return {"ok": ok, "request_id": req.request_id, "tp": _TP_MODE}
 
 
+@app.post("/v1/prefix/pin")
+async def prefix_pin(req: PrefixPinRequest):
+    """Mark a prefix handle as pinned (Traject tool-wait / prefetch)."""
+    import time
+
+    until = time.time() + max(0.001, req.ttl_ms / 1000.0)
+    entry = _PREFIX_PINS.get(req.prefix_id) or {"refs": 0}
+    entry["refs"] = int(entry.get("refs", 0)) + 1
+    entry["until"] = max(float(entry.get("until", 0)), until)
+    entry["reason"] = req.reason
+    entry["session_id"] = req.session_id
+    entry["trajectory_id"] = req.trajectory_id
+    _PREFIX_PINS[req.prefix_id] = entry
+    logger.info(
+        "prefix pin id=%s refs=%s until=%.0f reason=%s session=%s",
+        req.prefix_id,
+        entry["refs"],
+        entry["until"],
+        req.reason,
+        req.session_id,
+    )
+    return {"ok": True, "prefix_id": req.prefix_id, "refs": entry["refs"]}
+
+
+@app.post("/v1/prefix/unpin")
+async def prefix_unpin(req: PrefixUnpinRequest):
+    entry = _PREFIX_PINS.get(req.prefix_id)
+    if not entry:
+        return {"ok": True, "prefix_id": req.prefix_id, "refs": 0}
+    entry["refs"] = max(0, int(entry.get("refs", 1)) - 1)
+    if entry["refs"] == 0:
+        _PREFIX_PINS.pop(req.prefix_id, None)
+    else:
+        _PREFIX_PINS[req.prefix_id] = entry
+    logger.info("prefix unpin id=%s refs=%s", req.prefix_id, entry["refs"])
+    return {"ok": True, "prefix_id": req.prefix_id, "refs": entry["refs"]}
+
+
+@app.get("/v1/prefix/stats")
+async def prefix_stats():
+    import time
+
+    now = time.time()
+    live = {
+        k: v
+        for k, v in _PREFIX_PINS.items()
+        if float(v.get("until", 0)) > now or int(v.get("refs", 0)) > 0
+    }
+    return {
+        "pinned": len(live),
+        "sessions_tracked": len(_SESSION_LAST_IDS),
+        "prefix_token_maps": len(_PREFIX_TOKEN_IDS),
+        "pins": {
+            k: {"refs": v.get("refs"), "reason": v.get("reason")} for k, v in list(live.items())[:32]
+        },
+    }
+
+
+@app.post("/v1/prefix/free")
+async def prefix_free(req: PrefixFreeRequest):
+    """Evict a prefix handle: unpin, drop session map entry, drop V4 snapshot if known."""
+    _PREFIX_PINS.pop(req.prefix_id, None)
+    token_ids = _PREFIX_TOKEN_IDS.pop(req.prefix_id, None)
+    if req.session_id:
+        # Only clear session last-ids if they match this prefix's tokens.
+        prev = _SESSION_LAST_IDS.get(req.session_id)
+        if prev is not None and token_ids is not None and prev == token_ids:
+            _SESSION_LAST_IDS.pop(req.session_id, None)
+    dropped = 0
+    if token_ids and LOOP is not None and getattr(LOOP, "runner", None) is not None:
+        runner = LOOP.runner
+        cache = getattr(runner, "_v4_prefix_cache", None)
+        if cache is not None and hasattr(cache, "drop_exact"):
+            dropped = int(cache.drop_exact(token_ids) or 0)
+        elif cache is not None and hasattr(cache, "drop_prefix"):
+            dropped = int(cache.drop_prefix(token_ids) or 0)
+    logger.info(
+        "prefix free id=%s tokens=%s v4_dropped=%s session=%s",
+        req.prefix_id,
+        len(token_ids) if token_ids else 0,
+        dropped,
+        req.session_id,
+    )
+    return {
+        "ok": True,
+        "prefix_id": req.prefix_id,
+        "token_len": len(token_ids) if token_ids else 0,
+        "v4_dropped": dropped,
+    }
+
+
+def _common_prefix_len(a: List[int], b: List[int]) -> int:
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
+
 @app.post("/v1/generate")
 async def generate(req: GenerationRequest, request: Request):
     if LOOP is None or not READY:
@@ -229,6 +354,8 @@ async def generate(req: GenerationRequest, request: Request):
             req.step_id,
             req.request_id,
         )
+    if req.prefix_id and req.prefix_id in _PREFIX_PINS:
+        logger.info("prefix_id %s is pinned refs=%s", req.prefix_id, _PREFIX_PINS[req.prefix_id].get("refs"))
     if req.model and req.model != MODEL_NAME and req.model not in list_verified_models():
         return JSONResponse(
             {
@@ -255,14 +382,55 @@ async def generate(req: GenerationRequest, request: Request):
             status_code=400,
         )
 
+    # Session continuity: log LCP vs last turn (helps diagnose Traject multi-turn).
+    session_lcp = 0
+    if req.session_id:
+        prev = _SESSION_LAST_IDS.get(req.session_id)
+        if prev:
+            session_lcp = _common_prefix_len(prev, input_ids)
+            logger.info(
+                "session %s prompt_lcp=%s prev_len=%s new_len=%s",
+                req.session_id,
+                session_lcp,
+                len(prev),
+                len(input_ids),
+            )
+        _SESSION_LAST_IDS[req.session_id] = list(input_ids)
+    if req.prefix_id:
+        _PREFIX_TOKEN_IDS[req.prefix_id] = list(input_ids)
+    # Stash on request for streaming final usage enrichment.
+    req._session_lcp = session_lcp  # type: ignore[attr-defined]
+
     if _TP_MODE:
         return await _generate_tp(req, request, input_ids)
     return await _generate_local(req, request, input_ids)
 
 
+def _enrich_usage(item: Dict[str, Any], session_lcp: int) -> Dict[str, Any]:
+    """Inject session LCP into final usage; raise cache_hit_tokens floor to max(v4, lcp)."""
+    if session_lcp <= 0:
+        return item
+    usage = item.get("usage")
+    if not isinstance(usage, dict):
+        if item.get("finish_reason") is None and not item.get("error"):
+            return item
+        usage = {}
+        item = dict(item)
+        item["usage"] = usage
+    else:
+        item = dict(item)
+        usage = dict(usage)
+        item["usage"] = usage
+    usage["session_lcp_tokens"] = int(session_lcp)
+    v4_hit = int(usage.get("cache_hit_tokens") or 0)
+    usage["cache_hit_tokens"] = max(v4_hit, int(session_lcp))
+    return item
+
+
 async def _generate_local(req: GenerationRequest, request: Request, input_ids: List[int]):
     assert LOOP is not None
     params = _params_from_req(req)
+    session_lcp = int(getattr(req, "_session_lcp", 0) or 0)
     try:
         submitted = LOOP.submit(req.request_id, input_ids, params)
     except Exception as e:
@@ -278,6 +446,8 @@ async def _generate_local(req: GenerationRequest, request: Request, input_ids: L
                 item = await asyncio.get_event_loop().run_in_executor(None, dq.get, True, 0.5)
             except Exception:
                 continue
+            if item.get("finish_reason") is not None or item.get("usage") is not None:
+                item = _enrich_usage(item, session_lcp)
             yield json.dumps(item, ensure_ascii=True) + "\n"
             if item.get("finish_reason") is not None or item.get("error"):
                 break
@@ -339,6 +509,7 @@ async def _generate_tp(req: GenerationRequest, request: Request, input_ids: List
     assert LOOP is not None
     if _TP_CUDA_Q is None:
         _start_tp_cuda_thread()
+    session_lcp = int(getattr(req, "_session_lcp", 0) or 0)
     msg = _msg_generate(req, input_ids)
     holder: Dict[str, Any] = {
         "event": threading.Event(),
@@ -369,6 +540,8 @@ async def _generate_tp(req: GenerationRequest, request: Request, input_ids: List
                     if holder["done"].is_set() and dq.empty():
                         break
                     continue
+                if item.get("finish_reason") is not None or item.get("usage") is not None:
+                    item = _enrich_usage(item, session_lcp)
                 yield json.dumps(item, ensure_ascii=True) + "\n"
                 if item.get("finish_reason") is not None or item.get("error"):
                     break

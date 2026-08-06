@@ -80,6 +80,9 @@ struct TokenDelta {
 struct UsageDelta {
     #[serde(default)]
     cache_hit_tokens: Option<u32>,
+    /// Session prompt longest-common-prefix (token count) vs previous turn.
+    #[serde(default)]
+    session_lcp_tokens: Option<u32>,
     #[serde(default)]
     #[allow(dead_code)]
     prompt_tokens: Option<u32>,
@@ -159,7 +162,12 @@ impl InferenceBackend for SglangLiteEngineBackend {
                     token_ids.push(id);
                 }
                 if let Some(usage) = delta.usage {
-                    if let Some(hit) = usage.cache_hit_tokens {
+                    let mut hit = usage.cache_hit_tokens.unwrap_or(0);
+                    if let Some(lcp) = usage.session_lcp_tokens {
+                        // Prefer engine floor(max(v4, lcp)); also accept lcp alone.
+                        hit = hit.max(lcp);
+                    }
+                    if hit > 0 {
                         cache_hit_tokens = hit;
                     }
                 }

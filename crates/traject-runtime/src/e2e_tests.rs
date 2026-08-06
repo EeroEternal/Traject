@@ -96,4 +96,123 @@ mod e2e {
         let traj = driver.manager.get(id).unwrap();
         assert_eq!(traj.state, TrajectoryState::Finished);
     }
+
+    #[tokio::test]
+    async fn external_generate_and_tool_via_driver() {
+        use traject_core::{
+            Constraints, GenerateDelta, ToolCall, ToolResult, TrajectoryConfig,
+        };
+
+        let mut driver = Driver::new(DriverConfig::default())
+            .with_stub_mode(StubMode::AlwaysStop);
+        let id = driver.create_external_trajectory(TrajectoryConfig::default());
+        assert!(driver.is_external(id));
+
+        let outcome = driver
+            .run_generate_step(
+                id,
+                GenerateDelta::from_text("hello agent"),
+                Constraints::default(),
+                32,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            traject_core::StepOutcome::Generated { .. }
+        ));
+
+        driver
+            .run_external_tool_step(
+                id,
+                ToolCall {
+                    name: "Glob".into(),
+                    arguments: "{}".into(),
+                    call_id: Some("c1".into()),
+                },
+                ToolResult {
+                    call_id: Some("c1".into()),
+                    name: "Glob".into(),
+                    output: "a.txt".into(),
+                    is_error: false,
+                },
+                5_000,
+            )
+            .unwrap();
+
+        let traj = driver.manager.get(id).unwrap();
+        assert_eq!(traj.history.len(), 2);
+        assert!(driver.memory.binding(id).is_some());
+        assert!(driver.memory.engine_prefix_hint(id).is_some());
+
+        driver.finish_trajectory(id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn tool_latency_influences_pin_and_prefetch() {
+        use traject_core::{
+            Constraints, GenerateDelta, PinReason, ToolCall, ToolResult, TrajectoryConfig,
+        };
+
+        let mut driver = Driver::new(DriverConfig::default())
+            .with_stub_mode(StubMode::AlwaysStop);
+        let id = driver.create_external_trajectory(TrajectoryConfig::default());
+
+        // Simulate tool gap pin start + slow tool.
+        driver.pin_for_tool_gap(id).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        driver
+            .run_external_tool_step(
+                id,
+                ToolCall {
+                    name: "Glob".into(),
+                    arguments: "{}".into(),
+                    call_id: Some("c1".into()),
+                },
+                ToolResult {
+                    call_id: Some("c1".into()),
+                    name: "Glob".into(),
+                    output: "a.txt".into(),
+                    is_error: false,
+                },
+                5_000,
+            )
+            .unwrap();
+
+        // Prefetch pin should be active after tool.
+        let traj = driver.manager.get(id).unwrap();
+        assert_eq!(traj.pin.reason, PinReason::Prefetch);
+        assert!(traj.pin.pin_until_ms.is_some());
+
+        // Second sample builds histogram.
+        driver.pin_for_tool_gap(id).unwrap();
+        driver
+            .run_external_tool_step(
+                id,
+                ToolCall {
+                    name: "Glob".into(),
+                    arguments: "{}".into(),
+                    call_id: Some("c2".into()),
+                },
+                ToolResult {
+                    call_id: Some("c2".into()),
+                    name: "Glob".into(),
+                    output: "b.txt".into(),
+                    is_error: false,
+                },
+                5_000,
+            )
+            .unwrap();
+
+        let _ = driver
+            .run_generate_step(
+                id,
+                GenerateDelta::from_text("after tools"),
+                Constraints::default(),
+                16,
+            )
+            .await
+            .unwrap();
+        driver.finish_trajectory(id).unwrap();
+    }
 }

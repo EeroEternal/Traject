@@ -1,26 +1,24 @@
 //! Traject-owned LLM provider for the vendored Zene agent.
 //!
-//! Each Zene `chat` call becomes a Generate step on a shared Trajectory.
-//! Tool call/result events become Tool steps. Inference goes through
-//! `InferenceBackend` (typically sglang-lite `:9001`) with trajectory/session/
-//! prefix metadata so the engine can track the agent session.
+//! Every Zene `chat` call is a Generate step executed through
+//! `Driver` → `Scheduler` → `InferenceEngine` → `MemoryManager`.
+//! Tool call/result events become Tool steps on the same Trajectory
+//! (pin / fairness / history), still via the Driver.
 
 use std::pin::Pin;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use futures::{stream, Stream};
-use parking_lot::Mutex;
 use serde_json::Value;
+use tokio::sync::Mutex;
 use tracing::info;
 use traject_core::{
-    Constraints, FinishReason, GenerateDelta, PinInfo, PinReason, Step, StepOutcome,
-    ToolCall as TrajectToolCall, ToolResult as TrajectToolResult, Trajectory, TrajectoryConfig,
-    TrajectoryId,
+    Constraints, GenerateDelta, StepOutcome, ToolCall as TrajectToolCall,
+    ToolResult as TrajectToolResult, Trajectory, TrajectoryConfig, TrajectoryId,
 };
-use traject_inference::{ChunkRequest, InferenceBackend};
-use traject_memory::MemoryManager;
+use traject_runtime::Driver;
 use zene_core::{AgentEvent, EventHandler};
 use zene_llm::{
     ChatRequest, ChatResponse, Message, Provider, Role, StreamEvent, ToolCall, ToolDefinition,
@@ -31,60 +29,53 @@ const TOOL_PROTOCOL: &str = r#"You are a coding agent with tools. When you need 
 When you are done and do not need tools, reply with plain text only (no tool_calls JSON).
 "#;
 
-/// Shared host state for one agent prompt (one Trajectory).
+/// Shared host: one Driver + one external Trajectory for a Zene prompt.
 pub struct TrajectSession {
-    pub trajectory: Trajectory,
-    pub memory: MemoryManager,
-    pub backend: Arc<dyn InferenceBackend>,
-    pub session_id: String,
+    pub driver: Driver,
+    pub trajectory_id: TrajectoryId,
     pub model: String,
     pub max_tokens: u32,
     pub generate_steps: u32,
     pub tool_steps: u32,
-    pub total_cache_hit_tokens: u32,
 }
 
 impl TrajectSession {
-    pub fn new(backend: Arc<dyn InferenceBackend>, model: impl Into<String>) -> Self {
-        let mut trajectory = Trajectory::create(TrajectoryConfig {
+    pub fn new(mut driver: Driver, model: impl Into<String>) -> Self {
+        let trajectory_id = driver.create_external_trajectory(TrajectoryConfig {
             tenant: traject_core::TenantId::new("zene"),
             ..TrajectoryConfig::default()
         });
-        let _ = trajectory.start();
-        let mut memory = MemoryManager::new(8192);
-        let root = memory.root_id();
-        let _ = memory.bind_trajectory(trajectory.id, root);
-        trajectory.bind_prefix(root);
-        let session_id = trajectory.id.to_string();
         Self {
-            trajectory,
-            memory,
-            backend,
-            session_id,
+            driver,
+            trajectory_id,
             model: model.into(),
             max_tokens: 1024,
             generate_steps: 0,
             tool_steps: 0,
-            total_cache_hit_tokens: 0,
         }
     }
 
     pub fn trajectory_id(&self) -> TrajectoryId {
-        self.trajectory.id
+        self.trajectory_id
     }
 
+    pub fn total_cache_hit_tokens(&self) -> u32 {
+        self.driver.cache_hit_tokens(self.trajectory_id)
+    }
+
+    /// Sync event handler: records tool pin/complete when the host is free
+    /// (Zene fires these between chat awaits, so try_lock succeeds).
     pub fn event_handler(host: Arc<Mutex<Self>>) -> EventHandler {
         Arc::new(move |event: AgentEvent| {
-            let mut s = host.lock();
+            let Ok(mut s) = host.try_lock() else {
+                tracing::warn!("traject session busy; dropping agent event");
+                return;
+            };
+            let traj_id = s.trajectory_id;
             match event {
                 AgentEvent::ToolCall { .. } => {
-                    if let Some(prefix) = s.trajectory.current_prefix {
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as u64)
-                            .unwrap_or(0);
-                        let pin = PinInfo::pin_until(now + 120_000, PinReason::WaitingTool, 1);
-                        let _ = s.memory.pin_node(prefix, pin);
+                    if let Err(e) = s.driver.pin_for_tool_gap(traj_id) {
+                        tracing::warn!(error = %e, "pin_for_tool_gap failed");
                     }
                 }
                 AgentEvent::ToolResult {
@@ -95,33 +86,32 @@ impl TrajectSession {
                     ..
                 } => {
                     s.tool_steps += 1;
-                    let step = Step::tool(
-                        TrajectToolCall {
-                            name: name.clone(),
-                            arguments: String::new(),
-                            call_id: Some(id.clone()),
-                        },
-                        120_000,
-                    );
-                    let step_id = step.id();
-                    let _ = s.trajectory.submit_step(step);
-                    let _ = s.trajectory.complete_step(StepOutcome::ToolDone {
-                        step_id,
-                        result: TrajectToolResult {
-                            call_id: Some(id),
-                            name,
-                            output: content,
-                            is_error,
-                        },
-                    });
-                    if let Some(prefix) = s.trajectory.current_prefix {
-                        let _ = s.memory.unpin_node(prefix);
+                    let call = TrajectToolCall {
+                        name: name.clone(),
+                        arguments: String::new(),
+                        call_id: Some(id.clone()),
+                    };
+                    let result = TrajectToolResult {
+                        call_id: Some(id),
+                        name,
+                        output: content,
+                        is_error,
+                    };
+                    match s
+                        .driver
+                        .run_external_tool_step(traj_id, call, result, 120_000)
+                    {
+                        Ok(_) => {
+                            info!(
+                                trajectory = %traj_id,
+                                tool_steps = s.tool_steps,
+                                "tool step via driver/scheduler"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "external tool step failed");
+                        }
                     }
-                    info!(
-                        trajectory = %s.trajectory.id,
-                        tool_steps = s.tool_steps,
-                        "recorded tool step on trajectory"
-                    );
                 }
                 _ => {}
             }
@@ -129,7 +119,7 @@ impl TrajectSession {
     }
 }
 
-/// Zene `Provider` that drives Traject inference + Trajectory ledger.
+/// Zene `Provider` that drives every LLM turn through Traject Driver/Scheduler.
 pub struct TrajectLlmProvider {
     host: Arc<Mutex<TrajectSession>>,
 }
@@ -147,98 +137,50 @@ impl TrajectLlmProvider {
 #[async_trait]
 impl Provider for TrajectLlmProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
-        let (backend, chunk_req, step_id) = {
-            let mut s = self.host.lock();
-            s.generate_steps += 1;
-            let prompt = render_prompt(&request.messages, &request.tools);
-            let step = Step::generate(
-                GenerateDelta::from_text(prompt.clone()),
+        let prompt = render_prompt(&request.messages, &request.tools);
+
+        let mut s = self.host.lock().await;
+        s.generate_steps += 1;
+        let traj_id = s.trajectory_id;
+        let max_tokens = s.max_tokens;
+        let outcome = s
+            .driver
+            .run_generate_step(
+                traj_id,
+                GenerateDelta::from_text(prompt),
                 Constraints {
                     temperature: Some(0.2),
                     top_p: Some(0.95),
                     ..Constraints::default()
                 },
-                s.max_tokens,
-            );
-            let step_id = step.id();
-            s.trajectory
-                .submit_step(step)
-                .map_err(|e| anyhow!("submit generate: {e}"))?;
-
-            let prefix = s.trajectory.current_prefix;
-            let chunk_req = ChunkRequest {
-                trajectory_id: s.trajectory.id,
-                step_id,
-                prefix,
-                delta: GenerateDelta::from_text(prompt),
-                constraints: Constraints {
-                    temperature: Some(0.2),
-                    top_p: Some(0.95),
-                    ..Constraints::default()
-                },
-                chunk_tokens: s.max_tokens,
-                decoded_so_far: 0,
-                max_tokens: s.max_tokens,
-                session_id: Some(s.session_id.clone()),
-                prefix_hint: prefix.map(|p| p.to_string()),
-            };
-            (Arc::clone(&s.backend), chunk_req, step_id)
-        };
-
-        let result = backend
-            .generate_chunk(chunk_req)
+                max_tokens,
+            )
             .await
-            .map_err(|e| anyhow!("traject inference: {e}"))?;
+            .map_err(|e| anyhow!("driver generate: {e}"))?;
 
-        let message = parse_assistant_message(&result.text);
-        let finish = result.finish_reason.unwrap_or(FinishReason::Stop);
-        let tool_call = message.tool_calls.as_ref().and_then(|calls| {
-            calls.first().map(|c| TrajectToolCall {
-                name: c.name.clone(),
-                arguments: c.arguments.clone(),
-                call_id: Some(c.id.clone()),
-            })
-        });
+        let cache_hits = s.driver.cache_hit_tokens(traj_id);
+        let history_len = s
+            .driver
+            .manager
+            .get(traj_id)
+            .map(|t| t.history.len())
+            .unwrap_or(0);
+        let gen_steps = s.generate_steps;
+        drop(s);
 
-        {
-            let mut s = self.host.lock();
-            s.total_cache_hit_tokens += result.cache_hit_tokens;
-            let hit = result.cache_hit_tokens.to_string();
-            let total = s.total_cache_hit_tokens.to_string();
-            let traj_id = s.trajectory.id;
-            s.trajectory
-                .memory
-                .set_slot("last_cache_hit_tokens", &hit);
-            s.trajectory
-                .memory
-                .set_slot("total_cache_hit_tokens", &total);
-            if !result.token_ids.is_empty() {
-                if let Ok(node) = s.memory.append_tokens(traj_id, result.token_ids.clone()) {
-                    s.trajectory.bind_prefix(node);
-                }
-            }
-            s.trajectory
-                .complete_step(StepOutcome::Generated {
-                    step_id,
-                    text: result.text.clone(),
-                    token_ids: result.token_ids,
-                    finish_reason: if tool_call.is_some() {
-                        FinishReason::ToolCall
-                    } else {
-                        finish
-                    },
-                    tool_call,
-                })
-                .map_err(|e| anyhow!("complete generate: {e}"))?;
-            info!(
-                trajectory = %s.trajectory.id,
-                generate_steps = s.generate_steps,
-                cache_hit_tokens = result.cache_hit_tokens,
-                total_cache_hit = s.total_cache_hit_tokens,
-                history = s.trajectory.history.len(),
-                "recorded generate step on trajectory"
-            );
-        }
+        let text = match &outcome {
+            StepOutcome::Generated { text, .. } => text.clone(),
+            other => return Err(anyhow!("expected Generated outcome, got {other:?}")),
+        };
+        let message = parse_assistant_message(&text);
+
+        info!(
+            trajectory = %traj_id,
+            generate_steps = gen_steps,
+            cache_hit_tokens = cache_hits,
+            history = history_len,
+            "generate step via driver/scheduler"
+        );
 
         Ok(ChatResponse {
             message,
@@ -370,13 +312,34 @@ fn extract_json_object(text: &str) -> Option<Value> {
     }
 }
 
-/// Helper used by tests / runner to finish a trajectory cleanly.
-pub fn finish_session(host: &Arc<Mutex<TrajectSession>>) -> Result<Trajectory> {
-    let mut s = host.lock();
-    s.trajectory
-        .finish()
-        .context("finish trajectory")?;
-    Ok(s.trajectory.clone())
+/// Snapshot + finish trajectory after the agent loop returns.
+pub async fn finish_session_snapshot(host: &Arc<Mutex<TrajectSession>>) -> Result<Trajectory> {
+    let mut s = host.lock().await;
+    let traj_id = s.trajectory_id;
+    let traj = s
+        .driver
+        .manager
+        .get(traj_id)
+        .map_err(|e| anyhow!("get trajectory: {e}"))?;
+    let generate_steps = s.generate_steps;
+    let tool_steps = s.tool_steps;
+    let cache = s.driver.cache_hit_tokens(traj_id);
+    let mut snapshot = traj;
+    if !snapshot.is_finished() {
+        let _ = s.driver.manager.finish(traj_id);
+        snapshot.state = traject_core::TrajectoryState::Finished;
+    }
+    snapshot
+        .memory
+        .set_slot("generate_steps", generate_steps.to_string());
+    snapshot
+        .memory
+        .set_slot("tool_steps", tool_steps.to_string());
+    snapshot
+        .memory
+        .set_slot("total_cache_hit_tokens", cache.to_string());
+    s.driver.memory.release_trajectory(traj_id);
+    Ok(snapshot)
 }
 
 #[cfg(test)]

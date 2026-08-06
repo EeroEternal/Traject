@@ -22,6 +22,24 @@ pub fn pin_for_tool_wait(
     }
 }
 
+/// After a tool returns, keep prefix warm briefly for the next Generate (prefetch).
+pub fn pin_for_prefetch(
+    traj: &Trajectory,
+    now_ms: u64,
+    policy: &PinPolicy,
+) -> PinDecision {
+    // Prefetch window is a fraction of the base tool TTL (not full tool wait).
+    let ttl = (policy.base_ttl_ms / 2).clamp(policy.min_ttl_ms, policy.max_ttl_ms);
+    PinDecision {
+        trajectory_id: traj.id,
+        action: PinAction::Pin {
+            until_ms: now_ms.saturating_add(ttl),
+            reason: PinReason::Prefetch,
+            strength: 1,
+        },
+    }
+}
+
 /// Under memory pressure, prefer unpinning late + low-share pins.
 pub fn should_force_unpin(pin: &PinInfo, now_ms: u64, pressure_high: bool) -> bool {
     if !pressure_high {

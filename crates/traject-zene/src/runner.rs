@@ -2,23 +2,25 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use parking_lot::Mutex;
+use tokio::sync::Mutex;
 use tracing::info;
 use traject_core::{Trajectory, TrajectoryId};
 use traject_inference::InferenceBackend;
+use traject_runtime::{Driver, DriverConfig};
+use traject_scheduler::{Scheduler, SchedulerConfig};
 use zene_config::{AgentProfile, ZeneConfig};
 use zene_core::{Agent, PermissionMode, PromptOptions};
 use zene_llm::ChatClient;
 use zene_sandbox::LocalSandbox;
 use zene_session::SessionRecord;
 
-use crate::provider::{finish_session, TrajectLlmProvider, TrajectSession};
+use crate::provider::{finish_session_snapshot, TrajectLlmProvider, TrajectSession};
 
-/// How to host Zene on Traject-owned inference.
+/// How to host Zene on Traject-owned inference + Driver.
 #[derive(Debug, Clone)]
 pub struct ZeneRunConfig {
     pub workdir: PathBuf,
-    /// Fallback OpenAI base URL (only used when `engine_backend` is None).
+    /// Fallback OpenAI base URL (only used for legacy HTTP path).
     pub base_url: String,
     pub model: String,
     pub api_key: String,
@@ -94,7 +96,7 @@ pub struct ZeneRunResult {
     pub history_len: usize,
 }
 
-/// Hosts a Zene `Agent` on a Traject Trajectory + InferenceBackend.
+/// Hosts a Zene `Agent` on a Traject Driver (Scheduler + MemoryManager + Inference).
 pub struct ZeneRunner {
     config: ZeneRunConfig,
     backend: Option<Arc<dyn InferenceBackend>>,
@@ -140,20 +142,32 @@ impl ZeneRunner {
         };
 
         let (trajectory_id, answer, stats) = if let Some(backend) = &self.backend {
-            let host = Arc::new(Mutex::new(TrajectSession::new(
-                Arc::clone(backend),
-                self.config.model.clone(),
-            )));
-            {
-                let mut s = host.lock();
-                s.max_tokens = self.config.max_tokens;
+            let chunk = self.config.max_tokens.max(64);
+            let mut sched_cfg = SchedulerConfig::default();
+            sched_cfg.chunk_tokens = chunk;
+            let mut driver = Driver::new(DriverConfig {
+                scheduler: sched_cfg.clone(),
+                max_ticks: 4096,
+                block_capacity: 8192,
+                ..DriverConfig::default()
+            })
+            .with_backend_arc(Arc::clone(backend));
+            driver.scheduler = Scheduler::new(sched_cfg);
+            if let Ok(url) = std::env::var("TRAJECT_ENGINE_URL") {
+                driver.set_engine_prefix_client(&url);
+            } else if let Ok(url) = std::env::var("ENGINE_URL") {
+                driver.set_engine_prefix_client(&url);
             }
-            let trajectory_id = host.lock().trajectory_id();
+
+            let mut session_host = TrajectSession::new(driver, self.config.model.clone());
+            session_host.max_tokens = self.config.max_tokens;
+            let host = Arc::new(Mutex::new(session_host));
+            let trajectory_id = host.lock().await.trajectory_id();
             info!(
                 %trajectory_id,
                 workdir = %workdir.display(),
                 model = %self.config.model,
-                "zene agent turn starting (traject inference)"
+                "zene agent turn starting (driver/scheduler path)"
             );
 
             let provider = TrajectLlmProvider::new(Arc::clone(&host));
@@ -178,10 +192,10 @@ impl ZeneRunner {
                 .await
                 .context("zene agent prompt")?;
 
-            let traj = finish_session(&host)?;
-            let generate_steps = host.lock().generate_steps;
-            let tool_steps = host.lock().tool_steps;
-            let total_cache_hit_tokens = host.lock().total_cache_hit_tokens;
+            let generate_steps = host.lock().await.generate_steps;
+            let tool_steps = host.lock().await.tool_steps;
+            let total_cache_hit_tokens = host.lock().await.total_cache_hit_tokens();
+            let traj = finish_session_snapshot(&host).await?;
             let history_len = traj.history.len();
             self.trajectories.push(traj);
 
@@ -191,12 +205,11 @@ impl ZeneRunner {
                 (generate_steps, tool_steps, total_cache_hit_tokens, history_len),
             )
         } else {
-            // Legacy HTTP OpenAI path (tool-bridge / external).
             info!(
                 workdir = %workdir.display(),
                 base_url = %self.config.base_url,
                 model = %self.config.model,
-                "zene agent turn starting (legacy openai http)"
+                "zene agent turn starting (legacy openai http — demoted)"
             );
             let mut agent = Agent::new(zene_cfg, sandbox, session, permission)
                 .await
@@ -213,11 +226,7 @@ impl ZeneRunner {
                 )
                 .await
                 .context("zene agent prompt")?;
-            (
-                TrajectoryId::new(),
-                answer,
-                (0, 0, 0, 0),
-            )
+            (TrajectoryId::new(), answer, (0, 0, 0, 0))
         };
 
         info!(
