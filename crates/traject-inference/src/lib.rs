@@ -1,7 +1,8 @@
 //! Inference core — forward, sample, constrained decode.
 //!
-//! Backends: stub, OpenAI HTTP, sglang-lite engine, in-process KernelBackend
-//! (CPU ref always; FlashInfer via `--features flashinfer`).
+//! Backends: stub, OpenAI HTTP, sglang-lite engine, in-process
+//! [`LocalWeightRunner`] (physical paged KV + toy/weights), KernelBackend
+//! smoke (CPU ref; FlashInfer via `--features flashinfer`).
 
 mod backend;
 mod chunked;
@@ -11,7 +12,7 @@ mod kernel;
 
 pub use backend::{
     EnginePrefixClient, HttpOpenAiBackend, KernelSmokeBackend, LocalEngineConfig,
-    LocalEngineHandle, SglangLiteEngineBackend,
+    LocalEngineHandle, LocalWeightConfig, LocalWeightRunner, PagedKvPool, SglangLiteEngineBackend,
 };
 pub use chunked::{ChunkRequest, ChunkResult};
 pub use engine::{

@@ -10,6 +10,7 @@ use futures_util::StreamExt;
 use serde_json::json;
 use traject_core::{FinishReason, Result, TrajectError};
 
+use crate::backend::EnginePrefixClient;
 use crate::{ChunkRequest, ChunkResult, InferenceBackend};
 
 #[derive(Debug, Clone)]
@@ -17,12 +18,15 @@ pub struct SglangLiteEngineBackend {
     pub base_url: String,
     pub model: String,
     client: reqwest::Client,
+    prefix: EnginePrefixClient,
 }
 
 impl SglangLiteEngineBackend {
     pub fn new(base_url: impl Into<String>, model: impl Into<String>) -> Self {
+        let base_url = base_url.into().trim_end_matches('/').to_string();
         Self {
-            base_url: base_url.into().trim_end_matches('/').to_string(),
+            prefix: EnginePrefixClient::new(&base_url),
+            base_url,
             model: model.into(),
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(600))
@@ -209,5 +213,10 @@ impl InferenceBackend for SglangLiteEngineBackend {
             new_prefix: None,
             cache_hit_tokens,
         })
+    }
+
+    async fn free_prefix(&self, prefix_id: &str, session_id: Option<&str>) -> Result<()> {
+        self.prefix.free(prefix_id, session_id).await;
+        Ok(())
     }
 }

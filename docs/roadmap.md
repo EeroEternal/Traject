@@ -26,12 +26,13 @@
 - [x] Zene steps fully via Driver/Scheduler (`run_generate_step` / `run_external_tool_step`)
 - [x] `--legacy-http` / tool-bridge demoted to non-default path
 - 执行计划：[merge-zene-sglite.md](merge-zene-sglite.md)
-- [ ] Full in-process model runner (weights + paged KV owned by MemoryManager)
+- [x] In-process `LocalWeightRunner` (toy weights + physical `PagedKvPool`; CLI `--local-runner`)
+- [ ] Load real MoE safetensors into LocalWeightRunner (prod MoE remains sglang-lite)
 - [x] Tool latency-aware pin TTL from histograms (`ToolLatencyTracker` p95)
 - [x] Prefetch pin after tool return (`PinReason::Prefetch`)
 - [x] Engine `/v1/prefix/pin|unpin|free` + Driver client (soft-fail if offline)
 - [x] V4 prefix save fix (save by prompt ids after prefill/finish)
-- [x] Engine-side V4 snapshot drop on MemoryManager eviction (`/v1/prefix/free` + `drop_exact`)
+- [x] Engine-side V4 snapshot drop + radix **GPU page zero/free** on eviction
 - [x] Session `prompt_lcp` floors `cache_hit_tokens` when V4 snapshot misses
 
 ## Phase 2 – Production

@@ -299,34 +299,67 @@ async def prefix_stats():
 
 @app.post("/v1/prefix/free")
 async def prefix_free(req: PrefixFreeRequest):
-    """Evict a prefix handle: unpin, drop session map entry, drop V4 snapshot if known."""
+    """Physical + logical free for a Traject prefix handle.
+
+    1. Drop pin + session token map
+    2. Drop V4 CPU snapshots (and zero associated GPU slot when hybrid)
+    3. Free radix paged GPU blocks for private leaves matching the token path
+    """
     _PREFIX_PINS.pop(req.prefix_id, None)
     token_ids = _PREFIX_TOKEN_IDS.pop(req.prefix_id, None)
     if req.session_id:
-        # Only clear session last-ids if they match this prefix's tokens.
         prev = _SESSION_LAST_IDS.get(req.session_id)
         if prev is not None and token_ids is not None and prev == token_ids:
             _SESSION_LAST_IDS.pop(req.session_id, None)
-    dropped = 0
-    if token_ids and LOOP is not None and getattr(LOOP, "runner", None) is not None:
-        runner = LOOP.runner
-        cache = getattr(runner, "_v4_prefix_cache", None)
-        if cache is not None and hasattr(cache, "drop_exact"):
-            dropped = int(cache.drop_exact(token_ids) or 0)
-        elif cache is not None and hasattr(cache, "drop_prefix"):
-            dropped = int(cache.drop_prefix(token_ids) or 0)
+
+    v4_dropped = 0
+    radix_stats: Dict[str, int] = {"nodes_unlinked": 0, "blocks_released": 0}
+    gpu_slot_cleared = 0
+
+    if token_ids and LOOP is not None:
+        runner = getattr(LOOP, "runner", None)
+        # V4 hybrid: drop CPU snapshot + zero live GPU batch slot (physical free).
+        if runner is not None:
+            cache = getattr(runner, "_v4_prefix_cache", None)
+            if cache is not None and hasattr(cache, "drop_exact"):
+                v4_dropped = int(cache.drop_exact(token_ids) or 0)
+            elif cache is not None and hasattr(cache, "drop_prefix"):
+                v4_dropped = int(cache.drop_prefix(token_ids) or 0)
+            if getattr(runner, "_v4_hybrid", False) and getattr(runner, "model", None) is not None:
+                try:
+                    from .v4_prefix_cache import clear_v4_kv_slot
+
+                    gpu_slot_cleared = int(clear_v4_kv_slot(runner.model, batch_slot=0) or 0)
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("clear_v4_kv_slot failed: %s", e)
+
+        # Non-V4 / radix path: free private GPU pages for this token path.
+        radix = getattr(LOOP, "radix", None)
+        if radix is None and runner is not None:
+            radix = getattr(runner, "radix", None)
+        if radix is not None and hasattr(radix, "free_prefix_tokens"):
+            try:
+                radix_stats = dict(radix.free_prefix_tokens(token_ids) or {})
+            except Exception as e:  # noqa: BLE001
+                logger.debug("radix free_prefix_tokens failed: %s", e)
+
     logger.info(
-        "prefix free id=%s tokens=%s v4_dropped=%s session=%s",
+        "prefix free id=%s tokens=%s v4_dropped=%s radix=%s gpu_slot_cleared=%s session=%s",
         req.prefix_id,
         len(token_ids) if token_ids else 0,
-        dropped,
+        v4_dropped,
+        radix_stats,
+        gpu_slot_cleared,
         req.session_id,
     )
     return {
         "ok": True,
         "prefix_id": req.prefix_id,
         "token_len": len(token_ids) if token_ids else 0,
-        "v4_dropped": dropped,
+        "v4_dropped": v4_dropped,
+        "radix_nodes_unlinked": int(radix_stats.get("nodes_unlinked", 0)),
+        "radix_blocks_released": int(radix_stats.get("blocks_released", 0)),
+        "gpu_slot_tensors_cleared": gpu_slot_cleared,
     }
 
 

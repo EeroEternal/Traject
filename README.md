@@ -11,6 +11,12 @@ Agent-native Runtime：以 **Trajectory** 为调度单位，把 Agent 轨迹执�
 - 执行计划：[docs/merge-zene-sglite.md](docs/merge-zene-sglite.md)
 - 真机 e2e 记录：[docs/e2e-pro6000.md](docs/e2e-pro6000.md)
 
+## 进程内 runner（物理 paged KV，玩具权重）
+
+```bash
+cargo run -p traject-cli -- --local-runner --max-tokens 16 "hello from local runner"
+```
+
 ## 远端真实推理
 
 ```bash

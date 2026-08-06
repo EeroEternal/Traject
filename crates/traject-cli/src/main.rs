@@ -42,6 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let use_tools = args.iter().any(|a| a == "--tools");
     let kernel = args.iter().any(|a| a == "--kernel-smoke");
     let flashinfer = args.iter().any(|a| a == "--flashinfer");
+    let local_runner = args.iter().any(|a| a == "--local-runner");
     let engine_url = take_flag_value(&mut args, "--engine-url");
     let backend_url = take_flag_value(&mut args, "--backend-url");
     let model = take_flag_value(&mut args, "--model")
@@ -49,7 +50,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let max_tokens = take_flag_value(&mut args, "--max-tokens")
         .and_then(|s| s.parse().ok())
         .unwrap_or(64u32);
-    args.retain(|a| a != "--tools" && a != "--kernel-smoke" && a != "--flashinfer");
+    args.retain(|a| {
+        a != "--tools" && a != "--kernel-smoke" && a != "--flashinfer" && a != "--local-runner"
+    });
     let prompt = args
         .first()
         .cloned()
@@ -80,7 +83,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })
     .with_policy(std::sync::Arc::new(policy));
 
-    driver = if flashinfer || kernel {
+    driver = if local_runner {
+        use traject_inference::LocalWeightConfig;
+        tracing::info!("using in-process LocalWeightRunner (physical paged KV + toy weights)");
+        driver.with_local_weight_runner(LocalWeightConfig {
+            max_new_tokens_default: max_tokens,
+            ..LocalWeightConfig::default()
+        })
+    } else if flashinfer || kernel {
         #[cfg(feature = "flashinfer")]
         {
             if flashinfer {
