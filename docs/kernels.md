@@ -95,9 +95,11 @@ When present, loads DeepSeek-V4:
 2. **o_proj:** FP8 `wo_a` / `wo_b` (`o_groups=8 × o_lora=1024`). Pooled attn is
    injected into each group; `mid += wo_a @ h`, then `h += wo_b @ mid`.
 3. **Shared expert FFN:** `ffn_norm` + FP8 `shared_experts.w1/w2/w3` SwiGLU residual
+4. **Routed MoE:** gate top-k (default 6) + lazy FP4 e2m1 expert dequant  
+   (`h += route_scale * Σ w_i expert_i(n)`); experts cached (cap 32)
 
-**Not loaded yet:** **routed** MoE (256 FP4 experts), layers 1–42, full multi-head
-attention without mean-pool (KernelBackend still uses compressed `kv_lora` width).
+**Not loaded yet:** layers 1–42, full multi-head attention without mean-pool
+(KernelBackend still uses compressed `kv_lora` width).
 
 ## Status
 
@@ -110,4 +112,5 @@ attention without mean-pool (KernelBackend still uses compressed `kv_lora` width
 - [x] Layer-0 shared-expert SwiGLU FFN (not routed MoE)  
 - [x] Layer-0 MLA Q expand (`q_norm`/`kv_norm`/`wq_b`, head mean-pool)  
 - [x] Layer-0 o_proj (`wo_a`/`wo_b` group inject + residual)  
+- [x] Layer-0 routed MoE (gate top-k + lazy FP4 experts)  
 - [ ] Full MoE / MLA layer stack in-process (still sglang for production MoE)  

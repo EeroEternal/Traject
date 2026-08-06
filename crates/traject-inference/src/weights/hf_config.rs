@@ -32,6 +32,12 @@ pub struct HfModelConfig {
     /// DeepSeek-V4 o_proj LoRA rank per group (e.g. 1024).
     #[serde(default)]
     pub o_lora_rank: Option<u32>,
+    /// MoE top-k (e.g. 6).
+    #[serde(default)]
+    pub num_experts_per_tok: Option<u32>,
+    /// Multiplier on routed expert sum (e.g. 1.5).
+    #[serde(default)]
+    pub routed_scaling_factor: Option<f32>,
 }
 
 fn default_vocab() -> u32 {
