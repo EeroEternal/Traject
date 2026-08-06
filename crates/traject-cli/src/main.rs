@@ -83,10 +83,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })
     .with_policy(std::sync::Arc::new(policy));
 
+    // `--local-runner` owns weights + KV. Built with `--features flashinfer`,
+    // it auto-selects FlashInfer attention (soft-fail → cpu-ref). Standalone
+    // `--flashinfer` / `--kernel-smoke` still use KernelSmokeBackend (no weights).
     driver = if local_runner {
         use std::path::PathBuf;
         use traject_inference::{LocalWeightConfig, LocalWeightRunner};
         let model_path = PathBuf::from(&model);
+        #[cfg(not(feature = "flashinfer"))]
+        if flashinfer {
+            tracing::warn!(
+                "rebuild with --features flashinfer for GPU attention under --local-runner; using cpu-ref"
+            );
+        }
         if model_path.is_dir()
             && (model_path.join("config.json").exists()
                 || model_path.join("model.safetensors.index.json").exists()
@@ -101,6 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tracing::info!(
                         source = %runner.weight_source(),
                         has_tokenizer = runner.has_tokenizer(),
+                        kernel = runner.kernel_name(),
                         "weights ready"
                     );
                     driver.with_backend(runner)
@@ -129,10 +139,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             if flashinfer {
                 use traject_inference::{
-                    FlashInferKernel, FlashInferKernelConfig, KernelSmokeBackend,
+                    FlashInferKernel, FlashInferKernelConfig, KernelBackend, KernelSmokeBackend,
                 };
                 let k = FlashInferKernel::new(FlashInferKernelConfig::default())?;
-                tracing::info!(kernel = k.name(), "using in-process FlashInfer kernel");
+                tracing::info!(kernel = k.name(), "using in-process FlashInfer kernel smoke");
                 driver.with_kernel_smoke(KernelSmokeBackend::with_kernel(std::sync::Arc::new(k)))
             } else {
                 tracing::info!("using in-process CPU kernel smoke");

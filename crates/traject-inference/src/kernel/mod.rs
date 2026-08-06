@@ -11,7 +11,7 @@ mod types;
 
 pub use cpu_ref::CpuRefKernel;
 #[cfg(feature = "flashinfer")]
-pub use flashinfer_py::{FlashInferKernel, FlashInferKernelConfig};
+pub use flashinfer_py::{discover_site_packages, FlashInferKernel, FlashInferKernelConfig};
 pub use types::{
     DecodeRequest, DecodeResult, KernelBackend, KvLayout, PrefillRequest, PrefillResult,
     SampleRequest, SampleResult,
