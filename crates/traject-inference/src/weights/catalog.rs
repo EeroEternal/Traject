@@ -10,7 +10,7 @@ use serde::Deserialize;
 use tracing::info;
 use traject_core::{Result, TrajectError};
 
-use super::dtype::bytes_to_f32_vec;
+use super::dtype::{bytes_to_f32_vec, dequant_fp8_block_scaled};
 
 #[derive(Debug, Deserialize)]
 struct IndexFile {
@@ -119,7 +119,7 @@ impl SafetensorCatalog {
         Ok(self.open.get(&key).expect("just inserted"))
     }
 
-    /// Load a tensor as contiguous f32 (BF16/F16/F32).
+    /// Load a tensor as contiguous f32 (BF16/F16/F32/F8_* unscaled).
     pub fn load_f32(&mut self, name: &str) -> Result<TensorF32> {
         let shard = self.shard_for(name)?;
         let mmap = self.ensure_mmap(&shard)?;
@@ -150,9 +150,206 @@ impl SafetensorCatalog {
         Ok(TensorF32 { data, shape })
     }
 
-    pub fn has(&self, name: &str) -> bool {
-        self.weight_map.contains_key(name) || self.shard_for(name).is_ok()
+    /// Load DeepSeek-style block-scaled FP8 weight (`*.weight` + sibling `*.scale`).
+    ///
+    /// Weight is F8_E4M3, scale is F8_E8M0, block size 128 (V4 default).
+    /// Example: `layers.0.attn.wq_a.weight` + `layers.0.attn.wq_a.scale`.
+    pub fn load_fp8_block_scaled(&mut self, weight_name: &str, block: usize) -> Result<TensorF32> {
+        // `layers.0.attn.wq_a.weight` → `layers.0.attn.wq_a.scale`
+        let scale_name = if weight_name.ends_with(".weight") {
+            format!("{}.scale", weight_name.trim_end_matches(".weight"))
+        } else {
+            format!("{weight_name}.scale")
+        };
+        if !self.has(&scale_name) {
+            return Err(TrajectError::Other(format!(
+                "no scale tensor for `{weight_name}` (expected `{scale_name}`)"
+            )));
+        }
+
+        let (w_bytes, w_shape, w_dtype) = self.load_raw(weight_name)?;
+        let (s_bytes, s_shape, s_dtype) = self.load_raw(&scale_name)?;
+        if w_dtype != safetensors::Dtype::F8_E4M3 {
+            return Err(TrajectError::Other(format!(
+                "`{weight_name}` dtype {w_dtype:?}, expected F8_E4M3"
+            )));
+        }
+        if s_dtype != safetensors::Dtype::F8_E8M0 {
+            return Err(TrajectError::Other(format!(
+                "`{scale_name}` dtype {s_dtype:?}, expected F8_E8M0"
+            )));
+        }
+        let data = dequant_fp8_block_scaled(&w_bytes, &w_shape, &s_bytes, &s_shape, block)
+            .map_err(|e| TrajectError::Other(format!("dequant `{weight_name}`: {e}")))?;
+        info!(
+            tensor = weight_name,
+            scale = %scale_name,
+            shape = ?w_shape,
+            block,
+            "loaded FP8 block-scaled weight as f32"
+        );
+        Ok(TensorF32 {
+            data,
+            shape: w_shape,
+        })
     }
+
+    fn load_raw(&mut self, name: &str) -> Result<(Vec<u8>, Vec<usize>, safetensors::Dtype)> {
+        let shard = self.shard_for(name)?;
+        let mmap = self.ensure_mmap(&shard)?;
+        let st = SafeTensors::deserialize(mmap).map_err(|e| {
+            TrajectError::Other(format!("deserialize {}: {e}", shard.display()))
+        })?;
+        let view = st.tensor(name).map_err(|e| {
+            TrajectError::Other(format!("tensor `{name}`: {e}"))
+        })?;
+        Ok((view.data().to_vec(), view.shape().to_vec(), view.dtype()))
+    }
+
+    pub fn has(&self, name: &str) -> bool {
+        self.weight_map.contains_key(name)
+            || {
+                // avoid recursive error noise on missing single-file fallback
+                self.shard_for(name).is_ok()
+            }
+    }
+}
+
+/// Layer-0 attention projections (DeepSeek-V4 MLA compressed form).
+///
+/// FFN / MoE experts are **not** loaded here — that remains sglang-lite.
+#[derive(Debug, Clone)]
+pub struct Layer0AttnWeights {
+    /// RMSNorm γ before attention, shape [hidden].
+    pub attn_norm: Vec<f32>,
+    pub hidden: usize,
+    /// `wq_a`: [q_lora, hidden] — Q down-projection.
+    pub wq_a: TensorF32,
+    /// `wkv`: [kv_lora, hidden] — compressed KV projection.
+    pub wkv: TensorF32,
+}
+
+impl Layer0AttnWeights {
+    pub fn q_dim(&self) -> usize {
+        self.wq_a.rows()
+    }
+    pub fn kv_dim(&self) -> usize {
+        self.wkv.rows()
+    }
+}
+
+/// Load layer-0 attention norms + FP8 `wq_a` / `wkv` (block-scaled).
+pub fn load_layer0_attn(model_dir: &Path) -> Result<Layer0AttnWeights> {
+    let mut cat = SafetensorCatalog::open(model_dir)?;
+    let norm_names = [
+        "layers.0.attn_norm.weight",
+        "model.layers.0.input_layernorm.weight",
+    ];
+    let mut attn_norm = None;
+    for n in norm_names {
+        if let Ok(t) = cat.load_f32(n) {
+            attn_norm = Some(t);
+            break;
+        }
+    }
+    let attn_norm = attn_norm.ok_or_else(|| {
+        TrajectError::Other(format!(
+            "layer-0 attn_norm not found in {}",
+            model_dir.display()
+        ))
+    })?;
+
+    let wq_names = [
+        "layers.0.attn.wq_a.weight",
+        "layers.0.attn.wq_a",
+        "model.layers.0.self_attn.q_a_proj.weight",
+    ];
+    let mut wq_a = None;
+    for n in wq_names {
+        if cat.has(n) {
+            // Prefer FP8 block path; fall back to plain f32/bf16.
+            wq_a = Some(if n.ends_with(".weight") || cat.has(&format!("{n}.scale")) {
+                let key = if n.ends_with(".weight") {
+                    n.to_string()
+                } else {
+                    format!("{n}.weight")
+                };
+                match cat.load_fp8_block_scaled(&key, 128) {
+                    Ok(t) => t,
+                    Err(_) => cat.load_f32(n).or_else(|_| cat.load_f32(&key))?,
+                }
+            } else {
+                cat.load_f32(n)?
+            });
+            break;
+        }
+    }
+    let wq_a = wq_a.ok_or_else(|| {
+        TrajectError::Other(format!(
+            "layer-0 wq_a not found in {}",
+            model_dir.display()
+        ))
+    })?;
+
+    let wkv_names = [
+        "layers.0.attn.wkv.weight",
+        "layers.0.attn.wkv",
+        "model.layers.0.self_attn.kv_a_proj_with_mqa.weight",
+    ];
+    let mut wkv = None;
+    for n in wkv_names {
+        if cat.has(n) {
+            wkv = Some(if n.ends_with(".weight") || cat.has(&format!("{n}.scale")) {
+                let key = if n.ends_with(".weight") {
+                    n.to_string()
+                } else {
+                    format!("{n}.weight")
+                };
+                match cat.load_fp8_block_scaled(&key, 128) {
+                    Ok(t) => t,
+                    Err(_) => cat.load_f32(n).or_else(|_| cat.load_f32(&key))?,
+                }
+            } else {
+                cat.load_f32(n)?
+            });
+            break;
+        }
+    }
+    let wkv = wkv.ok_or_else(|| {
+        TrajectError::Other(format!(
+            "layer-0 wkv not found in {}",
+            model_dir.display()
+        ))
+    })?;
+
+    if wq_a.shape.len() != 2 || wkv.shape.len() != 2 {
+        return Err(TrajectError::Other(format!(
+            "layer-0 projections must be 2D, wq_a={:?} wkv={:?}",
+            wq_a.shape, wkv.shape
+        )));
+    }
+    let hidden = attn_norm.data.len();
+    if wq_a.cols() != hidden || wkv.cols() != hidden {
+        return Err(TrajectError::Other(format!(
+            "layer-0 in_features mismatch: norm_h={hidden} wq_a={:?} wkv={:?}",
+            wq_a.shape, wkv.shape
+        )));
+    }
+
+    info!(
+        dir = %model_dir.display(),
+        hidden,
+        q_lora = wq_a.rows(),
+        kv_lora = wkv.rows(),
+        "loaded layer-0 attention projections (no MoE FFN)"
+    );
+
+    Ok(Layer0AttnWeights {
+        attn_norm: attn_norm.data,
+        hidden,
+        wq_a,
+        wkv,
+    })
 }
 
 /// Load the tensors needed for LocalWeightRunner from a HF model dir.
@@ -241,7 +438,7 @@ mod tests {
         tensors.insert("embed.weight".to_string(), tensor);
         let tensor2 = TensorView::new(Dtype::F32, vec![4, 3], &data).unwrap();
         tensors.insert("head.weight".to_string(), tensor2);
-        let bytes = serialize(&tensors, &None).unwrap();
+        let bytes = serialize(&tensors, None).unwrap();
         std::fs::write(dir.join("model.safetensors"), bytes).unwrap();
 
         let (embed, head, _norm, _) = load_embed_head_norm(&dir).unwrap();

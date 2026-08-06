@@ -86,6 +86,14 @@ Also loads `tokenizer.json` via the HuggingFace `tokenizers` crate
 template helper, not the BPE vocab.) Without `tokenizer.json`, falls back to
 toy char-hash encode and id-list decode.
 
+### Layer-0 attention (first cut)
+
+When present, loads DeepSeek-V4 `layers.0.attn_norm` plus FP8 block-scaled
+`layers.0.attn.wq_a` / `layers.0.attn.wkv` (F8_E4M3 × F8_E8M0, block 128) and
+uses them for Q/K/V into `KernelBackend`. **Not loaded yet:** full MLA
+(`wq_b` / `wo_*`), MoE FFN experts, remaining 42 layers. Output projection
+still uses a residual adapter (`w_up`).
+
 ## Status
 
 - [x] Physical free path for sglang radix pages + V4 GPU slot clear  
@@ -93,4 +101,5 @@ toy char-hash encode and id-list decode.
 - [x] Load real **embed + lm head (+ norm)** safetensors (sharded HF)  
 - [x] Official HF `tokenizer.json` via `tokenizers` crate (`HfTokenizer`; text↔ids)  
 - [x] FlashInfer as default attention for LocalWeightRunner when `--features flashinfer`  
+- [x] Layer-0 attention projections (`attn_norm` + FP8 `wq_a`/`wkv` block dequant)  
 - [ ] Full MoE / MLA layer stack in-process (still sglang for production MoE)  

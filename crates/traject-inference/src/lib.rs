@@ -12,7 +12,10 @@ mod kernel;
 mod tokenizer;
 mod weights;
 
-pub use weights::{load_embed_head_norm, HfModelConfig, SafetensorCatalog, TensorF32};
+pub use weights::{
+    load_embed_head_norm, load_layer0_attn, HfModelConfig, Layer0AttnWeights, SafetensorCatalog,
+    TensorF32,
+};
 pub use tokenizer::HfTokenizer;
 
 pub use backend::{

@@ -176,7 +176,7 @@ impl PagedKvPool {
     }
 }
 
-/// In-process model weights (toy or real safetensors embed/head/norm).
+/// In-process model weights (toy or real safetensors embed/head/norm + optional layer-0).
 struct ModelWeights {
     vocab: u32,
     /// Model hidden size (e.g. 4096 for DeepSeek-V4).
@@ -187,12 +187,14 @@ struct ModelWeights {
     embed: Vec<f32>,
     /// [vocab, hidden] row-major (lm head)
     head: Vec<f32>,
-    /// Optional RMSNorm weights [hidden]
+    /// Optional final RMSNorm weights [hidden]
     norm: Option<Vec<f32>>,
-    /// Fixed down-projection hidden → attn_dim (not from MoE; adapter until full layers land)
+    /// Fixed down-projection hidden → attn_dim (fallback when no layer-0)
     w_down: Vec<f32>,
     /// Up-projection attn_dim → hidden
     w_up: Vec<f32>,
+    /// Optional real layer-0 attn projections (FP8 dequantized).
+    layer0: Option<crate::weights::Layer0AttnWeights>,
     source: String,
     eos_token_id: Option<u32>,
 }
@@ -219,6 +221,7 @@ impl ModelWeights {
             norm: None,
             w_down,
             w_up,
+            layer0: None,
             source: "toy".into(),
             eos_token_id: Some(1),
         }
@@ -229,7 +232,7 @@ impl ModelWeights {
         attn_heads: u32,
         attn_dim_per_head: u32,
     ) -> Result<Self> {
-        use crate::weights::{load_embed_head_norm, HfModelConfig};
+        use crate::weights::{load_embed_head_norm, load_layer0_attn, HfModelConfig};
 
         let cfg = HfModelConfig::load(model_dir).ok();
         let (embed_t, head_t, norm_t, embed_key) = load_embed_head_norm(model_dir)?;
@@ -250,7 +253,20 @@ impl ModelWeights {
                 )));
             }
         }
-        let attn_dim = (attn_heads * attn_dim_per_head) as usize;
+        let mut attn_dim = (attn_heads * attn_dim_per_head) as usize;
+        let layer0 = match load_layer0_attn(model_dir) {
+            Ok(l0) => {
+                // Match KernelBackend dim to compressed KV width when possible.
+                if l0.kv_dim() > 0 {
+                    attn_dim = l0.kv_dim();
+                }
+                Some(l0)
+            }
+            Err(e) => {
+                warn!(error = %e, "layer-0 attn not loaded; using random projections");
+                None
+            }
+        };
         let (w_down, w_up) = random_projections(hidden, attn_dim, 7);
         let norm = norm_t.map(|t| t.data);
         let eos = cfg.as_ref().and_then(|c| c.eos_token_id);
@@ -260,6 +276,8 @@ impl ModelWeights {
             hidden,
             embed_key = %embed_key,
             has_norm = norm.is_some(),
+            has_layer0 = layer0.is_some(),
+            attn_dim,
             model_type = ?cfg.as_ref().and_then(|c| c.model_type.clone()),
             "loaded real safetensors embed/head for local runner"
         );
@@ -272,6 +290,7 @@ impl ModelWeights {
             norm,
             w_down,
             w_up,
+            layer0,
             source: format!("safetensors:{}", model_dir.display()),
             eos_token_id: eos.or(Some(1)),
         })
@@ -283,14 +302,14 @@ impl ModelWeights {
         self.embed[s..s + self.hidden].to_vec()
     }
 
-    fn rms_norm(&self, x: &[f32]) -> Vec<f32> {
+    fn rms_norm_with(&self, x: &[f32], gamma: Option<&[f32]>) -> Vec<f32> {
         let mut ss = 0.0f32;
         for v in x {
             ss += v * v;
         }
         let scale = (ss / x.len() as f32 + 1e-6).sqrt().recip();
         let mut out: Vec<f32> = x.iter().map(|v| v * scale).collect();
-        if let Some(w) = &self.norm {
+        if let Some(w) = gamma {
             for (o, wi) in out.iter_mut().zip(w.iter()) {
                 *o *= *wi;
             }
@@ -298,14 +317,44 @@ impl ModelWeights {
         out
     }
 
-    /// Project model hidden → attention dim.
-    fn down(&self, h: &[f32]) -> Vec<f32> {
+    fn rms_norm(&self, x: &[f32]) -> Vec<f32> {
+        self.rms_norm_with(x, self.norm.as_deref())
+    }
+
+    /// Hidden → Q vector in attention space (real wq_a when layer-0 present).
+    fn project_q(&self, h: &[f32]) -> Vec<f32> {
+        if let Some(l0) = &self.layer0 {
+            let hn = self.rms_norm_with(h, Some(&l0.attn_norm));
+            let q = matvec(&l0.wq_a.data, l0.q_dim(), l0.hidden, &hn);
+            // Truncate / pad to attn_dim for KernelBackend.
+            let mut out = q;
+            out.resize(self.attn_dim, 0.0);
+            return out;
+        }
         matvec(&self.w_down, self.attn_dim, self.hidden, h)
     }
 
-    /// Project attention dim → model hidden.
+    /// Hidden → compressed K/V (real wkv when layer-0 present).
+    fn project_kv(&self, h: &[f32]) -> (Vec<f32>, Vec<f32>) {
+        if let Some(l0) = &self.layer0 {
+            let hn = self.rms_norm_with(h, Some(&l0.attn_norm));
+            let mut kv = matvec(&l0.wkv.data, l0.kv_dim(), l0.hidden, &hn);
+            kv.resize(self.attn_dim, 0.0);
+            let v = kv.iter().map(|x| x * 0.5).collect();
+            return (kv, v);
+        }
+        let a = matvec(&self.w_down, self.attn_dim, self.hidden, h);
+        let v = a.iter().map(|x| x * 0.5).collect();
+        (a, v)
+    }
+
+    /// Project attention dim → model hidden (still adapter; full wo_a/wo_b later).
     fn up(&self, a: &[f32]) -> Vec<f32> {
         matvec(&self.w_up, self.hidden, self.attn_dim, a)
+    }
+
+    fn has_layer0(&self) -> bool {
+        self.layer0.is_some()
     }
 
     fn logits(&self, h: &[f32]) -> Vec<f32> {
@@ -495,6 +544,11 @@ impl LocalWeightRunner {
         self.tokenizer.is_some()
     }
 
+    /// Whether real layer-0 attention projections were loaded.
+    pub fn has_layer0_attn(&self) -> bool {
+        self.weights.has_layer0()
+    }
+
     /// Name of the active attention kernel (`cpu-ref` or `flashinfer-py`).
     pub fn kernel_name(&self) -> &str {
         self.kernel.name()
@@ -567,31 +621,27 @@ impl InferenceBackend for LocalWeightRunner {
             kv.bind_prefix(req.trajectory_id, prefix.clone());
         }
 
-        // Prefill: real embed → down-project to attn dim → store physical KV.
+        // Prefill: embed → (layer-0 wq_a/wkv or toy down) → physical KV.
         let heads = self.cfg.num_heads as usize;
         let dim = self.weights.attn_dim / heads.max(1);
         let dim = dim.max(1);
         let attn_dim = heads * dim;
+        // Prefer weight-side dim when layer-0 fixed kv_lora width.
+        let attn_dim = self.weights.attn_dim.max(attn_dim);
+        let dim = attn_dim / heads.max(1);
+        let dim = dim.max(1);
 
         if req.decoded_so_far == 0 {
             for &tid in &prompt_ids {
                 let emb = self.weights.embed_token(tid);
-                let a = self.weights.down(&emb);
-                let k = a.clone();
-                let v = a.iter().map(|x| x * 0.5).collect::<Vec<_>>();
-                let k = &k[..attn_dim.min(k.len())];
-                let v = &v[..attn_dim.min(v.len())];
-                // pad if needed
-                let mut kk = k.to_vec();
-                let mut vv = v.to_vec();
+                let (mut kk, mut vv) = self.weights.project_kv(&emb);
                 kk.resize(attn_dim, 0.0);
                 vv.resize(attn_dim, 0.0);
                 self.kv.lock().append_kv(&prefix, &kk, &vv);
             }
             if let Some(&last) = prompt_ids.last() {
                 let emb = self.weights.embed_token(last);
-                let q = self.weights.down(&emb);
-                let mut qq = q;
+                let mut qq = self.weights.project_q(&emb);
                 qq.resize(attn_dim, 0.0);
                 let (k_cache, v_cache, seq_len) = self.kv.lock().materialize_kv(&prefix);
                 if seq_len > 0 {
@@ -632,7 +682,7 @@ impl InferenceBackend for LocalWeightRunner {
                 .or_else(|| prompt_ids.last().copied())
                 .unwrap_or(1);
             let emb = self.weights.embed_token(last_tid);
-            let mut q = self.weights.down(&emb);
+            let mut q = self.weights.project_q(&emb);
             q.resize(attn_dim, 0.0);
             let dec = self
                 .kernel
@@ -649,6 +699,7 @@ impl InferenceBackend for LocalWeightRunner {
                 .map_err(|e| TrajectError::Inference(format!("local decode: {e}")))?;
 
             // Map attention output back to model hidden, then real lm_head.
+            // Full wo_a/wo_b not loaded yet — residual adapter via w_up.
             let mut attn_o = dec.o;
             attn_o.resize(attn_dim, 0.0);
             let hidden = self.weights.up(&attn_o);
@@ -669,10 +720,9 @@ impl InferenceBackend for LocalWeightRunner {
 
             let tid = sampled.token_id % self.weights.vocab;
             let emb_n = self.weights.embed_token(tid);
-            let mut a = self.weights.down(&emb_n);
-            a.resize(attn_dim, 0.0);
-            let k = a.clone();
-            let v = a.iter().map(|x| x * 0.5).collect::<Vec<_>>();
+            let (mut k, mut v) = self.weights.project_kv(&emb_n);
+            k.resize(attn_dim, 0.0);
+            v.resize(attn_dim, 0.0);
             self.kv.lock().append_kv(&prefix, &k, &v);
 
             out_ids.push(tid);
@@ -711,6 +761,7 @@ impl InferenceBackend for LocalWeightRunner {
             source = %self.weights.source,
             vocab = self.weights.vocab,
             has_tokenizer = self.tokenizer.is_some(),
+            has_layer0 = self.weights.has_layer0(),
             kernel = self.kernel.name(),
             "local weight runner chunk"
         );

@@ -110,6 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tracing::info!(
                         source = %runner.weight_source(),
                         has_tokenizer = runner.has_tokenizer(),
+                        has_layer0 = runner.has_layer0_attn(),
                         kernel = runner.kernel_name(),
                         "weights ready"
                     );
