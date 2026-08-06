@@ -19,6 +19,8 @@ pub struct HfModelConfig {
     #[serde(default)]
     pub head_dim: Option<u32>,
     #[serde(default)]
+    pub num_hidden_layers: Option<u32>,
+    #[serde(default)]
     pub eos_token_id: Option<u32>,
     #[serde(default)]
     pub bos_token_id: Option<u32>,

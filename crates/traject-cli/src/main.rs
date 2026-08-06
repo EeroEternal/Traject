@@ -115,6 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         has_q_expand = runner.has_layer0_q_expand(),
                         has_o_proj = runner.has_layer0_o_proj(),
                         has_moe = runner.has_layer0_moe(),
+                        n_layers = runner.n_layers(),
                         kernel = runner.kernel_name(),
                         "weights ready"
                     );

@@ -355,15 +355,15 @@ fn load_weight_fp8_or_f32(cat: &mut SafetensorCatalog, names: &[&str]) -> Result
     )))
 }
 
-/// Load layer-0 attention norms + FP8 `wq_a` / `wkv` (block-scaled).
-pub fn load_layer0_attn(model_dir: &Path) -> Result<Layer0AttnWeights> {
+/// Load attention weights for `layers.{layer}` (DeepSeek-V4 MLA path).
+pub fn load_layer_attn(model_dir: &Path, layer: usize) -> Result<Layer0AttnWeights> {
     let mut cat = SafetensorCatalog::open(model_dir)?;
     let norm_names = [
-        "layers.0.attn_norm.weight",
-        "model.layers.0.input_layernorm.weight",
+        format!("layers.{layer}.attn_norm.weight"),
+        format!("model.layers.{layer}.input_layernorm.weight"),
     ];
     let mut attn_norm = None;
-    for n in norm_names {
+    for n in &norm_names {
         if let Ok(t) = cat.load_f32(n) {
             attn_norm = Some(t);
             break;
@@ -371,60 +371,57 @@ pub fn load_layer0_attn(model_dir: &Path) -> Result<Layer0AttnWeights> {
     }
     let attn_norm = attn_norm.ok_or_else(|| {
         TrajectError::Other(format!(
-            "layer-0 attn_norm not found in {}",
+            "layer-{layer} attn_norm not found in {}",
             model_dir.display()
         ))
     })?;
 
-    let wq_a = load_weight_fp8_or_f32(
-        &mut cat,
-        &[
-            "layers.0.attn.wq_a.weight",
-            "layers.0.attn.wq_a",
-            "model.layers.0.self_attn.q_a_proj.weight",
-        ],
-    )?;
-    let wkv = load_weight_fp8_or_f32(
-        &mut cat,
-        &[
-            "layers.0.attn.wkv.weight",
-            "layers.0.attn.wkv",
-            "model.layers.0.self_attn.kv_a_proj_with_mqa.weight",
-        ],
-    )?;
+    let wq_a_names = [
+        format!("layers.{layer}.attn.wq_a.weight"),
+        format!("layers.{layer}.attn.wq_a"),
+        format!("model.layers.{layer}.self_attn.q_a_proj.weight"),
+    ];
+    let wq_a_refs: Vec<&str> = wq_a_names.iter().map(|s| s.as_str()).collect();
+    let wq_a = load_weight_fp8_or_f32(&mut cat, &wq_a_refs)?;
+    let wkv_names = [
+        format!("layers.{layer}.attn.wkv.weight"),
+        format!("layers.{layer}.attn.wkv"),
+        format!("model.layers.{layer}.self_attn.kv_a_proj_with_mqa.weight"),
+    ];
+    let wkv_refs: Vec<&str> = wkv_names.iter().map(|s| s.as_str()).collect();
+    let wkv = load_weight_fp8_or_f32(&mut cat, &wkv_refs)?;
 
     if wq_a.shape.len() != 2 || wkv.shape.len() != 2 {
         return Err(TrajectError::Other(format!(
-            "layer-0 projections must be 2D, wq_a={:?} wkv={:?}",
+            "layer-{layer} projections must be 2D, wq_a={:?} wkv={:?}",
             wq_a.shape, wkv.shape
         )));
     }
     let hidden = attn_norm.data.len();
     if wq_a.cols() != hidden || wkv.cols() != hidden {
         return Err(TrajectError::Other(format!(
-            "layer-0 in_features mismatch: norm_h={hidden} wq_a={:?} wkv={:?}",
+            "layer-{layer} in_features mismatch: norm_h={hidden} wq_a={:?} wkv={:?}",
             wq_a.shape, wkv.shape
         )));
     }
 
     let q_norm = cat
-        .load_f32("layers.0.attn.q_norm.weight")
+        .load_f32(&format!("layers.{layer}.attn.q_norm.weight"))
         .ok()
         .map(|t| t.data);
     let kv_norm = cat
-        .load_f32("layers.0.attn.kv_norm.weight")
+        .load_f32(&format!("layers.{layer}.attn.kv_norm.weight"))
         .ok()
         .map(|t| t.data);
 
     // Optional Q expand (full MLA heads). ~134MB f32 for V4 Flash.
-    let wq_b = match load_weight_fp8_or_f32(
-        &mut cat,
-        &[
-            "layers.0.attn.wq_b.weight",
-            "layers.0.attn.wq_b",
-            "model.layers.0.self_attn.q_b_proj.weight",
-        ],
-    ) {
+    let wq_b_names = [
+        format!("layers.{layer}.attn.wq_b.weight"),
+        format!("layers.{layer}.attn.wq_b"),
+        format!("model.layers.{layer}.self_attn.q_b_proj.weight"),
+    ];
+    let wq_b_refs: Vec<&str> = wq_b_names.iter().map(|s| s.as_str()).collect();
+    let wq_b = match load_weight_fp8_or_f32(&mut cat, &wq_b_refs) {
         Ok(t) => {
             if t.shape.len() == 2 && t.cols() == wq_a.rows() {
                 Some(t)
@@ -484,14 +481,13 @@ pub fn load_layer0_attn(model_dir: &Path) -> Result<Layer0AttnWeights> {
     };
     let o_inter = o_groups * o_lora_rank;
 
-    let wo_a = match load_weight_fp8_or_f32(
-        &mut cat,
-        &[
-            "layers.0.attn.wo_a.weight",
-            "layers.0.attn.wo_a",
-            "model.layers.0.self_attn.o_a_proj.weight",
-        ],
-    ) {
+    let wo_a_names = [
+        format!("layers.{layer}.attn.wo_a.weight"),
+        format!("layers.{layer}.attn.wo_a"),
+        format!("model.layers.{layer}.self_attn.o_a_proj.weight"),
+    ];
+    let wo_a_refs: Vec<&str> = wo_a_names.iter().map(|s| s.as_str()).collect();
+    let wo_a = match load_weight_fp8_or_f32(&mut cat, &wo_a_refs) {
         Ok(t) if t.shape == [o_inter, hidden] => Some(t),
         Ok(t) => {
             warn!(shape = ?t.shape, want = ?[o_inter, hidden], "wo_a shape mismatch; skip");
@@ -502,14 +498,13 @@ pub fn load_layer0_attn(model_dir: &Path) -> Result<Layer0AttnWeights> {
             None
         }
     };
-    let wo_b = match load_weight_fp8_or_f32(
-        &mut cat,
-        &[
-            "layers.0.attn.wo_b.weight",
-            "layers.0.attn.wo_b",
-            "model.layers.0.self_attn.o_b_proj.weight",
-        ],
-    ) {
+    let wo_b_names = [
+        format!("layers.{layer}.attn.wo_b.weight"),
+        format!("layers.{layer}.attn.wo_b"),
+        format!("model.layers.{layer}.self_attn.o_b_proj.weight"),
+    ];
+    let wo_b_refs: Vec<&str> = wo_b_names.iter().map(|s| s.as_str()).collect();
+    let wo_b = match load_weight_fp8_or_f32(&mut cat, &wo_b_refs) {
         Ok(t) if t.shape == [hidden, o_inter] => Some(t),
         Ok(t) => {
             warn!(shape = ?t.shape, want = ?[hidden, o_inter], "wo_b shape mismatch; skip");
@@ -535,7 +530,8 @@ pub fn load_layer0_attn(model_dir: &Path) -> Result<Layer0AttnWeights> {
         n_heads = ?n_heads,
         o_groups,
         o_lora_rank,
-        "loaded layer-0 attention projections (MLA Q + o_proj)"
+        layer,
+        "loaded layer attention projections (MLA Q + o_proj)"
     );
 
     Ok(Layer0AttnWeights {
@@ -569,6 +565,7 @@ pub struct ExpertF32 {
 #[derive(Debug)]
 pub struct Layer0RoutedMoe {
     pub model_dir: PathBuf,
+    pub layer: usize,
     /// [n_experts, hidden]
     pub gate: TensorF32,
     pub n_experts: usize,
@@ -586,6 +583,7 @@ impl Clone for Layer0RoutedMoe {
         // Fresh empty cache on clone (weights reloaded lazily).
         Self {
             model_dir: self.model_dir.clone(),
+            layer: self.layer,
             gate: self.gate.clone(),
             n_experts: self.n_experts,
             top_k: self.top_k,
@@ -642,7 +640,7 @@ impl Layer0RoutedMoe {
             }
         }
         let mut cat = SafetensorCatalog::open(&self.model_dir)?;
-        let e = load_fp4_expert(&mut cat, 0, id)?;
+        let e = load_fp4_expert(&mut cat, self.layer, id)?;
         {
             let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
             if cache.len() >= self.cache_cap {
@@ -673,15 +671,16 @@ fn load_fp4_expert(cat: &mut SafetensorCatalog, layer: usize, id: usize) -> Resu
     Ok(ExpertF32 { w1, w2, w3 })
 }
 
-/// Load layer-0 routed MoE gate (experts dequantized lazily).
-pub fn load_layer0_routed_moe(model_dir: &Path) -> Result<Layer0RoutedMoe> {
+/// Load routed MoE gate for `layers.{layer}` (experts dequantized lazily).
+pub fn load_layer_routed_moe(model_dir: &Path, layer: usize) -> Result<Layer0RoutedMoe> {
     let mut cat = SafetensorCatalog::open(model_dir)?;
-    if !cat.has("layers.0.ffn.gate.weight") {
-        return Err(TrajectError::Other(
-            "layers.0.ffn.gate.weight not found".into(),
-        ));
+    let gate_name = format!("layers.{layer}.ffn.gate.weight");
+    if !cat.has(&gate_name) {
+        return Err(TrajectError::Other(format!(
+            "{gate_name} not found"
+        )));
     }
-    let gate = cat.load_f32("layers.0.ffn.gate.weight")?;
+    let gate = cat.load_f32(&gate_name)?;
     if gate.shape.len() != 2 {
         return Err(TrajectError::Other(format!(
             "gate shape {:?} want [n_experts, hidden]",
@@ -692,7 +691,7 @@ pub fn load_layer0_routed_moe(model_dir: &Path) -> Result<Layer0RoutedMoe> {
     let hidden = gate.cols();
 
     // Probe expert 0 for intermediate size.
-    let e0 = load_fp4_expert(&mut cat, 0, 0)?;
+    let e0 = load_fp4_expert(&mut cat, layer, 0)?;
     if e0.w1.cols() != hidden || e0.w3.cols() != hidden {
         return Err(TrajectError::Other(format!(
             "expert0 in_features mismatch: hidden={hidden} w1={:?} w3={:?}",
@@ -729,11 +728,13 @@ pub fn load_layer0_routed_moe(model_dir: &Path) -> Result<Layer0RoutedMoe> {
         route_scale,
         hidden,
         intermediate,
-        "loaded layer-0 routed MoE gate (FP4 experts lazy)"
+        layer,
+        "loaded layer routed MoE gate (FP4 experts lazy)"
     );
 
     Ok(Layer0RoutedMoe {
         model_dir: model_dir.to_path_buf(),
+        layer,
         gate,
         n_experts,
         top_k,
@@ -745,52 +746,47 @@ pub fn load_layer0_routed_moe(model_dir: &Path) -> Result<Layer0RoutedMoe> {
     })
 }
 
-/// Load layer-0 shared-expert SwiGLU (`ffn_norm` + `w1`/`w2`/`w3`).
-///
-/// Does **not** load the 256 routed experts.
-pub fn load_layer0_shared_ffn(model_dir: &Path) -> Result<Layer0SharedFfn> {
+/// Load shared-expert SwiGLU for `layers.{layer}`.
+pub fn load_layer_shared_ffn(model_dir: &Path, layer: usize) -> Result<Layer0SharedFfn> {
     let mut cat = SafetensorCatalog::open(model_dir)?;
     let mut ffn_norm = None;
     for n in [
-        "layers.0.ffn_norm.weight",
-        "model.layers.0.post_attention_layernorm.weight",
+        format!("layers.{layer}.ffn_norm.weight"),
+        format!("model.layers.{layer}.post_attention_layernorm.weight"),
     ] {
-        if let Ok(t) = cat.load_f32(n) {
+        if let Ok(t) = cat.load_f32(&n) {
             ffn_norm = Some(t);
             break;
         }
     }
     let ffn_norm = ffn_norm.ok_or_else(|| {
         TrajectError::Other(format!(
-            "layer-0 ffn_norm not found in {}",
+            "layer-{layer} ffn_norm not found in {}",
             model_dir.display()
         ))
     })?;
 
-    let w1 = load_weight_fp8_or_f32(
-        &mut cat,
-        &[
-            "layers.0.ffn.shared_experts.w1.weight",
-            "layers.0.ffn.shared_experts.w1",
-            "layers.0.mlp.shared_experts.gate_proj.weight",
-        ],
-    )?;
-    let w2 = load_weight_fp8_or_f32(
-        &mut cat,
-        &[
-            "layers.0.ffn.shared_experts.w2.weight",
-            "layers.0.ffn.shared_experts.w2",
-            "layers.0.mlp.shared_experts.down_proj.weight",
-        ],
-    )?;
-    let w3 = load_weight_fp8_or_f32(
-        &mut cat,
-        &[
-            "layers.0.ffn.shared_experts.w3.weight",
-            "layers.0.ffn.shared_experts.w3",
-            "layers.0.mlp.shared_experts.up_proj.weight",
-        ],
-    )?;
+    let w1n = [
+        format!("layers.{layer}.ffn.shared_experts.w1.weight"),
+        format!("layers.{layer}.ffn.shared_experts.w1"),
+        format!("layers.{layer}.mlp.shared_experts.gate_proj.weight"),
+    ];
+    let w1r: Vec<&str> = w1n.iter().map(|s| s.as_str()).collect();
+    let w1 = load_weight_fp8_or_f32(&mut cat, &w1r)?;
+    let w2n = [
+        format!("layers.{layer}.ffn.shared_experts.w2.weight"),
+        format!("layers.{layer}.ffn.shared_experts.w2"),
+        format!("layers.{layer}.mlp.shared_experts.down_proj.weight"),
+    ];
+    let w2r: Vec<&str> = w2n.iter().map(|s| s.as_str()).collect();
+    let w2 = load_weight_fp8_or_f32(&mut cat, &w2r)?;
+    let w3n = [
+        format!("layers.{layer}.ffn.shared_experts.w3.weight"),
+        format!("layers.{layer}.ffn.shared_experts.w3"),
+        format!("layers.{layer}.mlp.shared_experts.up_proj.weight"),
+    ];
+    let w3r: Vec<&str> = w3n.iter().map(|s| s.as_str()).collect();
+    let w3 = load_weight_fp8_or_f32(&mut cat, &w3r)?;
 
     if w1.shape.len() != 2 || w2.shape.len() != 2 || w3.shape.len() != 2 {
         return Err(TrajectError::Other(format!(
@@ -817,7 +813,8 @@ pub fn load_layer0_shared_ffn(model_dir: &Path) -> Result<Layer0SharedFfn> {
         dir = %model_dir.display(),
         hidden,
         intermediate,
-        "loaded layer-0 shared expert FFN (no routed MoE)"
+        layer,
+        "loaded layer shared expert FFN"
     );
 
     Ok(Layer0SharedFfn {
@@ -828,6 +825,47 @@ pub fn load_layer0_shared_ffn(model_dir: &Path) -> Result<Layer0SharedFfn> {
         w2,
         w3,
     })
+}
+
+
+/// Backward-compatible layer-0 loaders.
+pub fn load_layer0_attn(model_dir: &Path) -> Result<Layer0AttnWeights> {
+    load_layer_attn(model_dir, 0)
+}
+pub fn load_layer0_shared_ffn(model_dir: &Path) -> Result<Layer0SharedFfn> {
+    load_layer_shared_ffn(model_dir, 0)
+}
+pub fn load_layer0_routed_moe(model_dir: &Path) -> Result<Layer0RoutedMoe> {
+    load_layer_routed_moe(model_dir, 0)
+}
+
+/// Load the first `n_layers` transformer blocks (attn + shared FFN + routed MoE).
+pub fn load_layer_stack(model_dir: &Path, n_layers: usize) -> Result<Vec<LayerBlock>> {
+    let n = n_layers.max(1);
+    let mut out = Vec::with_capacity(n);
+    for layer in 0..n {
+        let attn = load_layer_attn(model_dir, layer)?;
+        let ffn = load_layer_shared_ffn(model_dir, layer).ok();
+        let moe = load_layer_routed_moe(model_dir, layer).ok();
+        if ffn.is_none() {
+            warn!(layer, "shared FFN missing for layer");
+        }
+        if moe.is_none() {
+            warn!(layer, "routed MoE missing for layer");
+        }
+        out.push(LayerBlock { layer, attn, ffn, moe });
+    }
+    info!(n_layers = n, dir = %model_dir.display(), "loaded layer stack");
+    Ok(out)
+}
+
+/// One transformer block (attn + optional FFN/MoE).
+#[derive(Debug, Clone)]
+pub struct LayerBlock {
+    pub layer: usize,
+    pub attn: Layer0AttnWeights,
+    pub ffn: Option<Layer0SharedFfn>,
+    pub moe: Option<Layer0RoutedMoe>,
 }
 
 /// Load the tensors needed for LocalWeightRunner from a HF model dir.
