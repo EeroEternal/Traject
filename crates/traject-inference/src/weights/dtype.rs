@@ -70,6 +70,86 @@ pub fn e8m0_bits_to_f32(bits: u8) -> f32 {
     2f32.powi(bits as i32 - 127)
 }
 
+/// OCP FP4 E2M1 nibble (1 sign / 2 exp / 1 mant) → f32.
+///
+/// Values: ±{0, 0.5, 1, 1.5, 2, 3, 4, 6}.
+#[inline]
+pub fn e2m1_nibble_to_f32(nibble: u8) -> f32 {
+    let n = nibble & 0x0f;
+    let sign = (n >> 3) & 1;
+    let exp = (n >> 1) & 0x03;
+    let mant = n & 1;
+    let val = if exp == 0 {
+        0.5 * mant as f32
+    } else {
+        (1.0 + 0.5 * mant as f32) * 2f32.powi(exp as i32 - 1)
+    };
+    if sign == 1 {
+        -val
+    } else {
+        val
+    }
+}
+
+/// Dequant packed FP4 (two e2m1 per byte along K) with per-row e8m0 block scales.
+///
+/// DeepSeek-V4 experts: packed `I8` weight `[rows, cols/2]`, scale `F8_E8M0`
+/// `[rows, cols/block_k]`, `block_k=32`. Low nibble is even column.
+pub fn dequant_fp4_block_scaled(
+    packed: &[u8],
+    packed_shape: &[usize],
+    scale_e8m0: &[u8],
+    scale_shape: &[usize],
+    block_k: usize,
+) -> Result<Vec<f32>, String> {
+    if packed_shape.len() != 2 || scale_shape.len() != 2 {
+        return Err(format!(
+            "fp4 dequant expects 2D, packed={packed_shape:?} scale={scale_shape:?}"
+        ));
+    }
+    let rows = packed_shape[0];
+    let packed_cols = packed_shape[1];
+    let cols = packed_cols.saturating_mul(2);
+    let sr = scale_shape[0];
+    let sc = scale_shape[1];
+    let block_k = block_k.max(1);
+    if sr < rows || sc * block_k < cols {
+        return Err(format!(
+            "fp4 scale {scale_shape:?} * block_k {block_k} too small for logical [{rows}, {cols}]"
+        ));
+    }
+    if packed.len() != rows * packed_cols {
+        return Err(format!(
+            "packed len {} != rows*packed_cols {}",
+            packed.len(),
+            rows * packed_cols
+        ));
+    }
+    if scale_e8m0.len() != sr * sc {
+        return Err(format!(
+            "scale len {} != sr*sc {}",
+            scale_e8m0.len(),
+            sr * sc
+        ));
+    }
+
+    let mut out = vec![0.0f32; rows * cols];
+    for i in 0..rows {
+        for jb in 0..packed_cols {
+            let b = packed[i * packed_cols + jb];
+            for nibble in 0..2 {
+                let j = jb * 2 + nibble;
+                let bits = if nibble == 0 { b & 0x0f } else { b >> 4 };
+                let w = e2m1_nibble_to_f32(bits);
+                let sj = j / block_k;
+                let s = e8m0_bits_to_f32(scale_e8m0[i * sc + sj]);
+                out[i * cols + j] = w * s;
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub fn bytes_to_f32_vec(data: &[u8], dtype: safetensors::Dtype) -> Result<Vec<f32>, String> {
     match dtype {
         safetensors::Dtype::F32 => {
@@ -210,5 +290,26 @@ mod tests {
         for v in out {
             assert!((v - 2.25).abs() < 1e-5, "v={v}");
         }
+    }
+
+    #[test]
+    fn e2m1_known() {
+        assert!((e2m1_nibble_to_f32(0) - 0.0).abs() < 1e-6);
+        assert!((e2m1_nibble_to_f32(1) - 0.5).abs() < 1e-6);
+        assert!((e2m1_nibble_to_f32(2) - 1.0).abs() < 1e-6);
+        assert!((e2m1_nibble_to_f32(7) - 6.0).abs() < 1e-6);
+        assert!((e2m1_nibble_to_f32(10) + 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fp4_block_dequant_tiny() {
+        // 1 row, 2 logical cols, packed 1 byte; scale block_k=2 → 1 scale
+        // nibble0=2 → 1.0, nibble1=2 → 1.0; scale 127 → 1.0
+        let packed = [2u8 | (2u8 << 4)];
+        let scale = [127u8];
+        let out = dequant_fp4_block_scaled(&packed, &[1, 1], &scale, &[1, 1], 2).unwrap();
+        assert_eq!(out.len(), 2);
+        assert!((out[0] - 1.0).abs() < 1e-5);
+        assert!((out[1] - 1.0).abs() < 1e-5);
     }
 }

@@ -10,7 +10,7 @@ use serde::Deserialize;
 use tracing::{info, warn};
 use traject_core::{Result, TrajectError};
 
-use super::dtype::{bytes_to_f32_vec, dequant_fp8_block_scaled};
+use super::dtype::{bytes_to_f32_vec, dequant_fp4_block_scaled, dequant_fp8_block_scaled};
 
 #[derive(Debug, Deserialize)]
 struct IndexFile {
@@ -191,6 +191,43 @@ impl SafetensorCatalog {
         Ok(TensorF32 {
             data,
             shape: w_shape,
+        })
+    }
+
+    /// Load DeepSeek FP4 expert weight: packed `I8` + `F8_E8M0` scale, block_k=32.
+    ///
+    /// Returns dequantized f32 with logical shape `[rows, packed_cols * 2]`.
+    pub fn load_fp4_block_scaled(&mut self, weight_name: &str, block_k: usize) -> Result<TensorF32> {
+        let scale_name = if weight_name.ends_with(".weight") {
+            format!("{}.scale", weight_name.trim_end_matches(".weight"))
+        } else {
+            format!("{weight_name}.scale")
+        };
+        if !self.has(&scale_name) {
+            return Err(TrajectError::Other(format!(
+                "no scale for FP4 `{weight_name}` (expected `{scale_name}`)"
+            )));
+        }
+        let (w_bytes, w_shape, w_dtype) = self.load_raw(weight_name)?;
+        let (s_bytes, s_shape, s_dtype) = self.load_raw(&scale_name)?;
+        // Packed FP4 stored as I8 or U8 in safetensors.
+        if !matches!(w_dtype, safetensors::Dtype::I8 | safetensors::Dtype::U8) {
+            return Err(TrajectError::Other(format!(
+                "`{weight_name}` dtype {w_dtype:?}, expected I8/U8 packed FP4"
+            )));
+        }
+        if s_dtype != safetensors::Dtype::F8_E8M0 {
+            return Err(TrajectError::Other(format!(
+                "`{scale_name}` dtype {s_dtype:?}, expected F8_E8M0"
+            )));
+        }
+        let data = dequant_fp4_block_scaled(&w_bytes, &w_shape, &s_bytes, &s_shape, block_k)
+            .map_err(|e| TrajectError::Other(format!("fp4 dequant `{weight_name}`: {e}")))?;
+        let logical = vec![w_shape[0], w_shape[1] * 2];
+        debug_assert_eq!(data.len(), logical[0] * logical[1]);
+        Ok(TensorF32 {
+            data,
+            shape: logical,
         })
     }
 
@@ -514,6 +551,197 @@ pub fn load_layer0_attn(model_dir: &Path) -> Result<Layer0AttnWeights> {
         wo_b,
         o_groups,
         o_lora_rank,
+    })
+}
+
+/// One routed expert after FP4→f32 dequant (SwiGLU w1/w2/w3).
+#[derive(Debug, Clone)]
+pub struct ExpertF32 {
+    pub w1: TensorF32,
+    pub w2: TensorF32,
+    pub w3: TensorF32,
+}
+
+/// Layer-0 routed MoE: gate + lazy FP4 expert cache.
+///
+/// Experts are **not** all loaded at once (~3GB packed); top-k are dequantized
+/// on demand and kept in a small LRU-ish cache.
+#[derive(Debug)]
+pub struct Layer0RoutedMoe {
+    pub model_dir: PathBuf,
+    /// [n_experts, hidden]
+    pub gate: TensorF32,
+    pub n_experts: usize,
+    pub top_k: usize,
+    pub route_scale: f32,
+    pub hidden: usize,
+    pub intermediate: usize,
+    /// expert_id → dequantized weights
+    cache: std::sync::Mutex<std::collections::HashMap<usize, ExpertF32>>,
+    cache_cap: usize,
+}
+
+impl Clone for Layer0RoutedMoe {
+    fn clone(&self) -> Self {
+        // Fresh empty cache on clone (weights reloaded lazily).
+        Self {
+            model_dir: self.model_dir.clone(),
+            gate: self.gate.clone(),
+            n_experts: self.n_experts,
+            top_k: self.top_k,
+            route_scale: self.route_scale,
+            hidden: self.hidden,
+            intermediate: self.intermediate,
+            cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            cache_cap: self.cache_cap,
+        }
+    }
+}
+
+impl Layer0RoutedMoe {
+    /// Softmax gate → top-k (id, weight) pairs.
+    pub fn route(&self, h: &[f32]) -> Vec<(usize, f32)> {
+        let n = self.n_experts.min(self.gate.rows());
+        let mut logits = vec![0.0f32; n];
+        for i in 0..n {
+            let row = &self.gate.data[i * self.hidden..(i + 1) * self.hidden];
+            let mut s = 0.0f32;
+            for (a, b) in row.iter().zip(h.iter()) {
+                s += a * b;
+            }
+            logits[i] = s;
+        }
+        // partial top-k
+        let k = self.top_k.min(n).max(1);
+        let mut idx: Vec<usize> = (0..n).collect();
+        idx.sort_by(|&a, &b| {
+            logits[b]
+                .partial_cmp(&logits[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        idx.truncate(k);
+        // softmax over selected logits
+        let max_l = idx
+            .iter()
+            .map(|&i| logits[i])
+            .fold(f32::NEG_INFINITY, f32::max);
+        let mut weights: Vec<f32> = idx.iter().map(|&i| (logits[i] - max_l).exp()).collect();
+        let sum: f32 = weights.iter().sum::<f32>().max(1e-9);
+        for w in &mut weights {
+            *w /= sum;
+        }
+        idx.into_iter().zip(weights).collect()
+    }
+
+    /// Load/dequant one expert (cached).
+    pub fn expert(&self, id: usize) -> Result<ExpertF32> {
+        {
+            let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(e) = cache.get(&id) {
+                return Ok(e.clone());
+            }
+        }
+        let mut cat = SafetensorCatalog::open(&self.model_dir)?;
+        let e = load_fp4_expert(&mut cat, 0, id)?;
+        {
+            let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            if cache.len() >= self.cache_cap {
+                // Drop an arbitrary entry (simple cap, not true LRU).
+                if let Some(k) = cache.keys().next().copied() {
+                    cache.remove(&k);
+                }
+            }
+            cache.insert(id, e.clone());
+        }
+        Ok(e)
+    }
+}
+
+fn load_fp4_expert(cat: &mut SafetensorCatalog, layer: usize, id: usize) -> Result<ExpertF32> {
+    let w1 = cat.load_fp4_block_scaled(
+        &format!("layers.{layer}.ffn.experts.{id}.w1.weight"),
+        32,
+    )?;
+    let w2 = cat.load_fp4_block_scaled(
+        &format!("layers.{layer}.ffn.experts.{id}.w2.weight"),
+        32,
+    )?;
+    let w3 = cat.load_fp4_block_scaled(
+        &format!("layers.{layer}.ffn.experts.{id}.w3.weight"),
+        32,
+    )?;
+    Ok(ExpertF32 { w1, w2, w3 })
+}
+
+/// Load layer-0 routed MoE gate (experts dequantized lazily).
+pub fn load_layer0_routed_moe(model_dir: &Path) -> Result<Layer0RoutedMoe> {
+    let mut cat = SafetensorCatalog::open(model_dir)?;
+    if !cat.has("layers.0.ffn.gate.weight") {
+        return Err(TrajectError::Other(
+            "layers.0.ffn.gate.weight not found".into(),
+        ));
+    }
+    let gate = cat.load_f32("layers.0.ffn.gate.weight")?;
+    if gate.shape.len() != 2 {
+        return Err(TrajectError::Other(format!(
+            "gate shape {:?} want [n_experts, hidden]",
+            gate.shape
+        )));
+    }
+    let n_experts = gate.rows();
+    let hidden = gate.cols();
+
+    // Probe expert 0 for intermediate size.
+    let e0 = load_fp4_expert(&mut cat, 0, 0)?;
+    if e0.w1.cols() != hidden || e0.w3.cols() != hidden {
+        return Err(TrajectError::Other(format!(
+            "expert0 in_features mismatch: hidden={hidden} w1={:?} w3={:?}",
+            e0.w1.shape, e0.w3.shape
+        )));
+    }
+    let intermediate = e0.w1.rows();
+    if e0.w2.rows() != hidden || e0.w2.cols() != intermediate {
+        return Err(TrajectError::Other(format!(
+            "expert0 w2 shape {:?} want [{hidden}, {intermediate}]",
+            e0.w2.shape
+        )));
+    }
+
+    let (top_k, route_scale) = {
+        use crate::weights::HfModelConfig;
+        match HfModelConfig::load(model_dir) {
+            Ok(cfg) => (
+                cfg.num_experts_per_tok.unwrap_or(6) as usize,
+                cfg.routed_scaling_factor.unwrap_or(1.5),
+            ),
+            Err(_) => (6, 1.5),
+        }
+    };
+
+    // Seed cache with expert 0 (already loaded).
+    let mut cache = std::collections::HashMap::new();
+    cache.insert(0, e0);
+
+    info!(
+        dir = %model_dir.display(),
+        n_experts,
+        top_k,
+        route_scale,
+        hidden,
+        intermediate,
+        "loaded layer-0 routed MoE gate (FP4 experts lazy)"
+    );
+
+    Ok(Layer0RoutedMoe {
+        model_dir: model_dir.to_path_buf(),
+        gate,
+        n_experts,
+        top_k,
+        route_scale,
+        hidden,
+        intermediate,
+        cache: std::sync::Mutex::new(cache),
+        cache_cap: 32,
     })
 }
 

@@ -197,6 +197,8 @@ struct ModelWeights {
     layer0: Option<crate::weights::Layer0AttnWeights>,
     /// Optional layer-0 shared-expert SwiGLU FFN.
     layer0_ffn: Option<crate::weights::Layer0SharedFfn>,
+    /// Optional layer-0 routed MoE (gate + lazy FP4 experts).
+    layer0_moe: Option<crate::weights::Layer0RoutedMoe>,
     source: String,
     eos_token_id: Option<u32>,
 }
@@ -225,6 +227,7 @@ impl ModelWeights {
             w_up,
             layer0: None,
             layer0_ffn: None,
+            layer0_moe: None,
             source: "toy".into(),
             eos_token_id: Some(1),
         }
@@ -236,7 +239,8 @@ impl ModelWeights {
         attn_dim_per_head: u32,
     ) -> Result<Self> {
         use crate::weights::{
-            load_embed_head_norm, load_layer0_attn, load_layer0_shared_ffn, HfModelConfig,
+            load_embed_head_norm, load_layer0_attn, load_layer0_routed_moe, load_layer0_shared_ffn,
+            HfModelConfig,
         };
 
         let cfg = HfModelConfig::load(model_dir).ok();
@@ -279,6 +283,13 @@ impl ModelWeights {
                 None
             }
         };
+        let layer0_moe = match load_layer0_routed_moe(model_dir) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                warn!(error = %e, "layer-0 routed MoE not loaded");
+                None
+            }
+        };
         let (w_down, w_up) = random_projections(hidden, attn_dim, 7);
         let norm = norm_t.map(|t| t.data);
         let eos = cfg.as_ref().and_then(|c| c.eos_token_id);
@@ -290,6 +301,7 @@ impl ModelWeights {
             has_norm = norm.is_some(),
             has_layer0 = layer0.is_some(),
             has_layer0_ffn = layer0_ffn.is_some(),
+            has_layer0_moe = layer0_moe.is_some(),
             attn_dim,
             model_type = ?cfg.as_ref().and_then(|c| c.model_type.clone()),
             "loaded real safetensors embed/head for local runner"
@@ -305,6 +317,7 @@ impl ModelWeights {
             w_up,
             layer0,
             layer0_ffn,
+            layer0_moe,
             source: format!("safetensors:{}", model_dir.display()),
             eos_token_id: eos.or(Some(1)),
         })
@@ -416,19 +429,58 @@ impl ModelWeights {
             return h.to_vec();
         };
         let n = self.rms_norm_with(h, Some(&ffn.ffn_norm));
-        let u = matvec(&ffn.w1.data, ffn.intermediate, ffn.hidden, &n);
-        let g = matvec(&ffn.w3.data, ffn.intermediate, ffn.hidden, &n);
-        let mut gated = vec![0.0f32; ffn.intermediate];
-        for i in 0..ffn.intermediate {
-            // silu(u) = u * sigmoid(u)
-            let ui = u[i];
-            let silu = ui / (1.0 + (-ui).exp());
-            gated[i] = silu * g[i];
-        }
-        let delta = matvec(&ffn.w2.data, ffn.hidden, ffn.intermediate, &gated);
+        let delta = swiglu_delta(
+            &n,
+            &ffn.w1.data,
+            &ffn.w2.data,
+            &ffn.w3.data,
+            ffn.hidden,
+            ffn.intermediate,
+        );
         let mut out = h.to_vec();
         for (o, d) in out.iter_mut().zip(delta.iter()) {
             *o += *d;
+        }
+        out
+    }
+
+    /// Routed MoE residual: `h + route_scale * Σ w_i * expert_i(ffn_norm(h))`.
+    fn routed_moe_residual(&self, h: &[f32]) -> Vec<f32> {
+        let Some(moe) = &self.layer0_moe else {
+            return h.to_vec();
+        };
+        // Reuse shared ffn_norm when present; else bare h.
+        let n = if let Some(ffn) = &self.layer0_ffn {
+            self.rms_norm_with(h, Some(&ffn.ffn_norm))
+        } else {
+            h.to_vec()
+        };
+        let routes = moe.route(&n);
+        let mut delta = vec![0.0f32; moe.hidden];
+        for (eid, w) in routes {
+            match moe.expert(eid) {
+                Ok(ex) => {
+                    let d = swiglu_delta(
+                        &n,
+                        &ex.w1.data,
+                        &ex.w2.data,
+                        &ex.w3.data,
+                        moe.hidden,
+                        moe.intermediate,
+                    );
+                    for (o, x) in delta.iter_mut().zip(d.iter()) {
+                        *o += w * *x;
+                    }
+                }
+                Err(e) => {
+                    warn!(expert = eid, error = %e, "routed expert load failed; skip");
+                }
+            }
+        }
+        let scale = moe.route_scale;
+        let mut out = h.to_vec();
+        for (o, d) in out.iter_mut().zip(delta.iter()) {
+            *o += scale * *d;
         }
         out
     }
@@ -439,6 +491,10 @@ impl ModelWeights {
 
     fn has_layer0_ffn(&self) -> bool {
         self.layer0_ffn.is_some()
+    }
+
+    fn has_layer0_moe(&self) -> bool {
+        self.layer0_moe.is_some()
     }
 
     fn logits(&self, h: &[f32]) -> Vec<f32> {
@@ -488,6 +544,26 @@ fn matvec(w: &[f32], out_dim: usize, in_dim: usize, x: &[f32]) -> Vec<f32> {
         y[i] = s;
     }
     y
+}
+
+/// SwiGLU: `w2( silu(w1 x) ⊙ w3 x )`.
+fn swiglu_delta(
+    x: &[f32],
+    w1: &[f32],
+    w2: &[f32],
+    w3: &[f32],
+    hidden: usize,
+    intermediate: usize,
+) -> Vec<f32> {
+    let u = matvec(w1, intermediate, hidden, x);
+    let g = matvec(w3, intermediate, hidden, x);
+    let mut gated = vec![0.0f32; intermediate];
+    for i in 0..intermediate {
+        let ui = u[i];
+        let silu = ui / (1.0 + (-ui).exp());
+        gated[i] = silu * g[i];
+    }
+    matvec(w2, hidden, intermediate, &gated)
 }
 
 /// Mean-pool multi-head Q `[n_heads * head_dim]` down to `attn_dim` (= head_dim for MQA KV).
@@ -703,6 +779,11 @@ impl LocalWeightRunner {
             .unwrap_or(false)
     }
 
+    /// Whether routed MoE gate was loaded.
+    pub fn has_layer0_moe(&self) -> bool {
+        self.weights.has_layer0_moe()
+    }
+
     /// Name of the active attention kernel (`cpu-ref` or `flashinfer-py`).
     pub fn kernel_name(&self) -> &str {
         self.kernel.name()
@@ -873,8 +954,9 @@ impl InferenceBackend for LocalWeightRunner {
                     *a = 0.5 * *a + 0.5 * *b;
                 }
             }
-            // Real shared-expert SwiGLU when loaded (routed MoE still absent).
+            // Shared expert + routed MoE (FP4 top-k) residuals.
             h = self.weights.shared_ffn_residual(&h);
+            h = self.weights.routed_moe_residual(&h);
             let logits = self.weights.logits(&h);
             let sampled = self
                 .kernel
@@ -942,6 +1024,7 @@ impl InferenceBackend for LocalWeightRunner {
                 .as_ref()
                 .map(|l| l.has_o_proj())
                 .unwrap_or(false),
+            has_moe = self.weights.has_layer0_moe(),
             kernel = self.kernel.name(),
             "local weight runner chunk"
         );
