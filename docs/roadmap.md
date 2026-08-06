@@ -22,6 +22,7 @@
 - [x] In-process `KernelBackend` + FlashInfer decode smoke (`--features flashinfer`)
 - [x] Vendored Zene agent crates (`crates/zene-*`) + TrajectLlmProvider session path
 - [x] Vendored sglang-lite (`third_party/sglang-lite`) with trajectory/session/prefix fields
+- 执行计划文档：[merge-zene-sglite.md](merge-zene-sglite.md)
 - [ ] Full in-process model runner (weights + paged KV owned by MemoryManager)
 - [ ] Tool latency-aware pin TTL from histograms
 - [ ] Prefetch on predicted next Generate
