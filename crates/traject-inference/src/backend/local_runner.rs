@@ -175,34 +175,105 @@ impl PagedKvPool {
     }
 }
 
-/// Toy embedding + output projection (in-process "weights").
-struct ToyWeights {
+/// In-process model weights (toy or real safetensors embed/head/norm).
+struct ModelWeights {
     vocab: u32,
+    /// Model hidden size (e.g. 4096 for DeepSeek-V4).
     hidden: usize,
-    /// vocab * hidden
+    /// Attention projection size = num_heads * head_dim (may be << hidden).
+    attn_dim: usize,
+    /// [vocab, hidden] row-major
     embed: Vec<f32>,
-    /// hidden * vocab (output)
-    unembed: Vec<f32>,
+    /// [vocab, hidden] row-major (lm head)
+    head: Vec<f32>,
+    /// Optional RMSNorm weights [hidden]
+    norm: Option<Vec<f32>>,
+    /// Fixed down-projection hidden → attn_dim (not from MoE; adapter until full layers land)
+    w_down: Vec<f32>,
+    /// Up-projection attn_dim → hidden
+    w_up: Vec<f32>,
+    source: String,
+    eos_token_id: Option<u32>,
 }
 
-impl ToyWeights {
-    fn new(vocab: u32, hidden: usize) -> Self {
+impl ModelWeights {
+    fn toy(vocab: u32, hidden: usize, attn_dim: usize) -> Self {
         let v = vocab as usize;
         let mut embed = Vec::with_capacity(v * hidden);
-        let mut unembed = Vec::with_capacity(v * hidden);
+        let mut head = Vec::with_capacity(v * hidden);
         for i in 0..v {
             for j in 0..hidden {
                 let e = (((i * 131 + j * 17) % 1000) as f32) * 0.001 - 0.5;
                 embed.push(e);
-                unembed.push(e * 0.5);
+                head.push(e * 0.5);
             }
         }
+        let (w_down, w_up) = random_projections(hidden, attn_dim, 42);
         Self {
             vocab,
             hidden,
+            attn_dim,
             embed,
-            unembed,
+            head,
+            norm: None,
+            w_down,
+            w_up,
+            source: "toy".into(),
+            eos_token_id: Some(1),
         }
+    }
+
+    fn from_safetensors(
+        model_dir: &std::path::Path,
+        attn_heads: u32,
+        attn_dim_per_head: u32,
+    ) -> Result<Self> {
+        use crate::weights::{load_embed_head_norm, HfModelConfig};
+
+        let cfg = HfModelConfig::load(model_dir).ok();
+        let (embed_t, head_t, norm_t, embed_key) = load_embed_head_norm(model_dir)?;
+        if embed_t.shape.len() != 2 {
+            return Err(TrajectError::Other(format!(
+                "embed shape {:?} want [vocab, hidden]",
+                embed_t.shape
+            )));
+        }
+        let vocab = embed_t.shape[0] as u32;
+        let hidden = embed_t.shape[1];
+        if head_t.shape != embed_t.shape && !(head_t.shape.len() == 2 && head_t.shape[1] == hidden) {
+            // head may be [vocab, hidden] same as embed
+            if head_t.rows() != vocab as usize || head_t.cols() != hidden {
+                return Err(TrajectError::Other(format!(
+                    "head shape {:?} incompatible with embed {:?}",
+                    head_t.shape, embed_t.shape
+                )));
+            }
+        }
+        let attn_dim = (attn_heads * attn_dim_per_head) as usize;
+        let (w_down, w_up) = random_projections(hidden, attn_dim, 7);
+        let norm = norm_t.map(|t| t.data);
+        let eos = cfg.as_ref().and_then(|c| c.eos_token_id);
+        info!(
+            dir = %model_dir.display(),
+            vocab,
+            hidden,
+            embed_key = %embed_key,
+            has_norm = norm.is_some(),
+            model_type = ?cfg.as_ref().and_then(|c| c.model_type.clone()),
+            "loaded real safetensors embed/head for local runner"
+        );
+        Ok(Self {
+            vocab: cfg.as_ref().map(|c| c.vocab_size).unwrap_or(vocab).max(vocab),
+            hidden,
+            attn_dim,
+            embed: embed_t.data,
+            head: head_t.data,
+            norm,
+            w_down,
+            w_up,
+            source: format!("safetensors:{}", model_dir.display()),
+            eos_token_id: eos.or(Some(1)),
+        })
     }
 
     fn embed_token(&self, tid: u32) -> Vec<f32> {
@@ -211,11 +282,38 @@ impl ToyWeights {
         self.embed[s..s + self.hidden].to_vec()
     }
 
+    fn rms_norm(&self, x: &[f32]) -> Vec<f32> {
+        let mut ss = 0.0f32;
+        for v in x {
+            ss += v * v;
+        }
+        let scale = (ss / x.len() as f32 + 1e-6).sqrt().recip();
+        let mut out: Vec<f32> = x.iter().map(|v| v * scale).collect();
+        if let Some(w) = &self.norm {
+            for (o, wi) in out.iter_mut().zip(w.iter()) {
+                *o *= *wi;
+            }
+        }
+        out
+    }
+
+    /// Project model hidden → attention dim.
+    fn down(&self, h: &[f32]) -> Vec<f32> {
+        matvec(&self.w_down, self.attn_dim, self.hidden, h)
+    }
+
+    /// Project attention dim → model hidden.
+    fn up(&self, a: &[f32]) -> Vec<f32> {
+        matvec(&self.w_up, self.hidden, self.attn_dim, a)
+    }
+
     fn logits(&self, h: &[f32]) -> Vec<f32> {
+        let h = self.rms_norm(h);
         let v = self.vocab as usize;
         let mut out = vec![0.0f32; v];
+        // head is [vocab, hidden] — logits[i] = dot(head[i], h)
         for i in 0..v {
-            let row = &self.unembed[i * self.hidden..(i + 1) * self.hidden];
+            let row = &self.head[i * self.hidden..(i + 1) * self.hidden];
             let mut s = 0.0;
             for (a, b) in h.iter().zip(row.iter()) {
                 s += a * b;
@@ -226,6 +324,38 @@ impl ToyWeights {
     }
 }
 
+fn random_projections(hidden: usize, attn_dim: usize, seed: u64) -> (Vec<f32>, Vec<f32>) {
+    let mut state = seed;
+    let mut rnd = || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1);
+        ((state >> 33) as f32 / u32::MAX as f32) * 0.02 - 0.01
+    };
+    let mut w_down = Vec::with_capacity(attn_dim * hidden);
+    for _ in 0..attn_dim * hidden {
+        w_down.push(rnd());
+    }
+    let mut w_up = Vec::with_capacity(hidden * attn_dim);
+    for _ in 0..hidden * attn_dim {
+        w_up.push(rnd());
+    }
+    (w_down, w_up)
+}
+
+fn matvec(w: &[f32], out_dim: usize, in_dim: usize, x: &[f32]) -> Vec<f32> {
+    let mut y = vec![0.0f32; out_dim];
+    for i in 0..out_dim {
+        let row = &w[i * in_dim..(i + 1) * in_dim];
+        let mut s = 0.0;
+        for (a, b) in row.iter().zip(x.iter()) {
+            s += a * b;
+        }
+        y[i] = s;
+    }
+    y
+}
+
 #[derive(Debug, Clone)]
 pub struct LocalWeightConfig {
     pub vocab_size: u32,
@@ -233,6 +363,8 @@ pub struct LocalWeightConfig {
     pub head_dim: u32,
     pub page_tokens: usize,
     pub max_new_tokens_default: u32,
+    /// HF model directory with config.json + sharded safetensors.
+    pub model_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for LocalWeightConfig {
@@ -243,37 +375,70 @@ impl Default for LocalWeightConfig {
             head_dim: 32,
             page_tokens: 16,
             max_new_tokens_default: 32,
+            model_dir: None,
         }
     }
 }
 
-/// In-process runner: physical KV + toy weights + KernelBackend attention.
+/// In-process runner: physical KV + weights (toy or real safetensors) + KernelBackend.
 pub struct LocalWeightRunner {
     kernel: Arc<dyn KernelBackend>,
-    weights: ToyWeights,
+    weights: ModelWeights,
     kv: Mutex<PagedKvPool>,
     cfg: LocalWeightConfig,
 }
 
 impl LocalWeightRunner {
     pub fn new(cfg: LocalWeightConfig) -> Self {
-        let hidden = (cfg.num_heads * cfg.head_dim) as usize;
+        let attn_dim = (cfg.num_heads * cfg.head_dim) as usize;
+        let weights = if let Some(dir) = &cfg.model_dir {
+            match ModelWeights::from_safetensors(dir, cfg.num_heads, cfg.head_dim) {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::warn!(error = %e, "safetensors load failed; falling back to toy weights");
+                    ModelWeights::toy(cfg.vocab_size, attn_dim.max(64), attn_dim)
+                }
+            }
+        } else {
+            ModelWeights::toy(cfg.vocab_size, attn_dim, attn_dim)
+        };
+        // KV pool uses attention dim (projected), not full model hidden.
+        let pool_dim = weights.attn_dim / cfg.num_heads.max(1) as usize;
+        let pool_dim = pool_dim.max(1);
         Self {
             kernel: Arc::new(CpuRefKernel),
-            weights: ToyWeights::new(cfg.vocab_size, hidden),
+            weights,
             kv: Mutex::new(PagedKvPool::new(
                 cfg.page_tokens,
                 cfg.num_heads as usize,
-                cfg.head_dim as usize,
+                pool_dim,
             )),
             cfg,
         }
+    }
+
+    /// Load real embed/head/norm from a HuggingFace model directory.
+    pub fn from_model_dir(model_dir: impl Into<std::path::PathBuf>) -> Result<Self> {
+        let model_dir = model_dir.into();
+        let mut cfg = LocalWeightConfig::default();
+        if let Ok(hc) = crate::weights::HfModelConfig::load(&model_dir) {
+            cfg.vocab_size = hc.vocab_size;
+            // Keep small attention dims for CPU path; full 64*512 is huge.
+            cfg.num_heads = 8;
+            cfg.head_dim = 64;
+        }
+        cfg.model_dir = Some(model_dir);
+        Ok(Self::new(cfg))
     }
 
     pub fn with_kernel(cfg: LocalWeightConfig, kernel: Arc<dyn KernelBackend>) -> Self {
         let mut s = Self::new(cfg);
         s.kernel = kernel;
         s
+    }
+
+    pub fn weight_source(&self) -> &str {
+        &self.weights.source
     }
 
     pub fn pages_allocated(&self) -> usize {
@@ -284,22 +449,21 @@ impl LocalWeightRunner {
         if text.is_empty() {
             return vec![1];
         }
-        text.bytes()
-            .map(|b| (b as u32) % vocab.max(2))
+        // Placeholder until DeepSeek encoding is wired; still drives real embed rows.
+        text.chars()
+            .map(|c| (c as u32) % vocab.max(2))
             .collect()
     }
 
     fn detokenize(ids: &[u32]) -> String {
-        ids.iter()
-            .filter_map(|t| {
-                let b = (*t).min(255) as u8;
-                if (32..127).contains(&b) {
-                    Some(b as char)
-                } else {
-                    Some('.')
-                }
-            })
-            .collect()
+        // Without official tokenizer, print token ids for real-weight runs.
+        format!(
+            "[{}]",
+            ids.iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        )
     }
 }
 
@@ -326,33 +490,43 @@ impl InferenceBackend for LocalWeightRunner {
             kv.bind_prefix(req.trajectory_id, prefix.clone());
         }
 
-        // Prefill: embed each prompt token and append to physical KV.
+        // Prefill: real embed → down-project to attn dim → store physical KV.
         let heads = self.cfg.num_heads as usize;
-        let dim = self.cfg.head_dim as usize;
-        let hidden = heads * dim;
+        let dim = self.weights.attn_dim / heads.max(1);
+        let dim = dim.max(1);
+        let attn_dim = heads * dim;
 
         if req.decoded_so_far == 0 {
             for &tid in &prompt_ids {
                 let emb = self.weights.embed_token(tid);
-                // Toy: use embedding as K and V projection.
-                let k = emb.clone();
-                let v = emb.iter().map(|x| x * 0.5).collect::<Vec<_>>();
-                self.kv.lock().append_kv(&prefix, &k[..hidden], &v[..hidden]);
+                let a = self.weights.down(&emb);
+                let k = a.clone();
+                let v = a.iter().map(|x| x * 0.5).collect::<Vec<_>>();
+                let k = &k[..attn_dim.min(k.len())];
+                let v = &v[..attn_dim.min(v.len())];
+                // pad if needed
+                let mut kk = k.to_vec();
+                let mut vv = v.to_vec();
+                kk.resize(attn_dim, 0.0);
+                vv.resize(attn_dim, 0.0);
+                self.kv.lock().append_kv(&prefix, &kk, &vv);
             }
-            // Prefill attention smoke on last token Q.
             if let Some(&last) = prompt_ids.last() {
-                let q = self.weights.embed_token(last);
+                let emb = self.weights.embed_token(last);
+                let q = self.weights.down(&emb);
+                let mut qq = q;
+                qq.resize(attn_dim, 0.0);
                 let (k_cache, v_cache, seq_len) = self.kv.lock().materialize_kv(&prefix);
                 if seq_len > 0 {
                     let _ = self
                         .kernel
                         .prefill(PrefillRequest {
-                            q: q[..hidden].to_vec(),
-                            k: k_cache.clone(),
-                            v: v_cache.clone(),
+                            q: qq,
+                            k: k_cache,
+                            v: v_cache,
                             num_tokens: 1,
                             num_heads: self.cfg.num_heads,
-                            head_dim: self.cfg.head_dim,
+                            head_dim: dim as u32,
                             layout: KvLayout::Nhd,
                         })
                         .await;
@@ -360,7 +534,7 @@ impl InferenceBackend for LocalWeightRunner {
             }
         }
 
-        // Decode one (or few) tokens for this chunk.
+        // Decode tokens for this chunk.
         let budget = req
             .chunk_tokens
             .min(req.max_tokens.saturating_sub(req.decoded_so_far))
@@ -368,34 +542,45 @@ impl InferenceBackend for LocalWeightRunner {
             .min(8);
         let mut out_ids = Vec::new();
         let mut out_text = String::new();
+        let eos = self.weights.eos_token_id;
 
         for _ in 0..budget {
             let (k_cache, v_cache, seq_len) = self.kv.lock().materialize_kv(&prefix);
             if seq_len == 0 {
                 break;
             }
-            // Q from last token embedding (approx).
             let last_tid = out_ids
                 .last()
                 .copied()
                 .or_else(|| prompt_ids.last().copied())
                 .unwrap_or(1);
-            let q = self.weights.embed_token(last_tid);
+            let emb = self.weights.embed_token(last_tid);
+            let mut q = self.weights.down(&emb);
+            q.resize(attn_dim, 0.0);
             let dec = self
                 .kernel
                 .decode(DecodeRequest {
-                    q: q[..hidden].to_vec(),
+                    q,
                     k_cache,
                     v_cache,
                     seq_len,
                     num_heads: self.cfg.num_heads,
-                    head_dim: self.cfg.head_dim,
+                    head_dim: dim as u32,
                     layout: KvLayout::Nhd,
                 })
                 .await
                 .map_err(|e| TrajectError::Inference(format!("local decode: {e}")))?;
 
-            let logits = self.weights.logits(&dec.o);
+            // Map attention output back to model hidden, then real lm_head.
+            let mut attn_o = dec.o;
+            attn_o.resize(attn_dim, 0.0);
+            let hidden = self.weights.up(&attn_o);
+            // residual with last embed for stability
+            let mut h = emb;
+            for (a, b) in h.iter_mut().zip(hidden.iter()) {
+                *a = 0.5 * *a + 0.5 * *b;
+            }
+            let logits = self.weights.logits(&h);
             let sampled = self
                 .kernel
                 .sample(SampleRequest {
@@ -405,32 +590,46 @@ impl InferenceBackend for LocalWeightRunner {
                 })
                 .await?;
 
-            let tid = sampled.token_id % self.cfg.vocab_size;
-            // Append new KV for generated token.
-            let emb = self.weights.embed_token(tid);
-            let k = emb.clone();
-            let v = emb.iter().map(|x| x * 0.5).collect::<Vec<_>>();
-            self.kv.lock().append_kv(&prefix, &k[..hidden], &v[..hidden]);
+            let tid = sampled.token_id % self.weights.vocab;
+            let emb_n = self.weights.embed_token(tid);
+            let mut a = self.weights.down(&emb_n);
+            a.resize(attn_dim, 0.0);
+            let k = a.clone();
+            let v = a.iter().map(|x| x * 0.5).collect::<Vec<_>>();
+            self.kv.lock().append_kv(&prefix, &k, &v);
 
             out_ids.push(tid);
-            out_text.push_str(&Self::detokenize(&[tid]));
+            if self.weights.source.starts_with("safetensors") {
+                // keep compact; full detok needs official encoding
+            } else {
+                out_text.push_str(&Self::detokenize(&[tid]));
+            }
 
-            // Stop on printable period-ish toy EOS.
-            if tid % 97 == 0 && !out_ids.is_empty() {
+            if eos == Some(tid) {
                 break;
             }
+            if !self.weights.source.starts_with("safetensors") && tid % 97 == 0 {
+                break;
+            }
+        }
+
+        if self.weights.source.starts_with("safetensors") {
+            out_text = Self::detokenize(&out_ids);
         }
 
         let produced = out_ids.len() as u32;
         let finished = req.decoded_so_far + produced >= req.max_tokens
             || produced < budget
-            || req.decoded_so_far + produced >= req.chunk_tokens;
+            || req.decoded_so_far + produced >= req.chunk_tokens
+            || out_ids.last().copied() == eos;
 
         info!(
             trajectory = %req.trajectory_id,
             prefix = %prefix,
             produced,
             pages = self.pages_allocated(),
+            source = %self.weights.source,
+            vocab = self.weights.vocab,
             "local weight runner chunk"
         );
 

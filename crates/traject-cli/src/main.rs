@@ -84,12 +84,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .with_policy(std::sync::Arc::new(policy));
 
     driver = if local_runner {
-        use traject_inference::LocalWeightConfig;
-        tracing::info!("using in-process LocalWeightRunner (physical paged KV + toy weights)");
-        driver.with_local_weight_runner(LocalWeightConfig {
-            max_new_tokens_default: max_tokens,
-            ..LocalWeightConfig::default()
-        })
+        use std::path::PathBuf;
+        use traject_inference::{LocalWeightConfig, LocalWeightRunner};
+        let model_path = PathBuf::from(&model);
+        if model_path.is_dir()
+            && (model_path.join("config.json").exists()
+                || model_path.join("model.safetensors.index.json").exists()
+                || model_path.join("model.safetensors").exists())
+        {
+            tracing::info!(
+                model = %model_path.display(),
+                "using in-process LocalWeightRunner with REAL safetensors embed/head"
+            );
+            match LocalWeightRunner::from_model_dir(&model_path) {
+                Ok(runner) => {
+                    tracing::info!(source = %runner.weight_source(), "weights ready");
+                    driver.with_backend(runner)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "safetensors load failed; toy weights");
+                    driver.with_local_weight_runner(LocalWeightConfig {
+                        max_new_tokens_default: max_tokens,
+                        model_dir: None,
+                        ..LocalWeightConfig::default()
+                    })
+                }
+            }
+        } else {
+            tracing::info!(
+                "using in-process LocalWeightRunner (toy weights; pass HF model dir via --model for safetensors)"
+            );
+            driver.with_local_weight_runner(LocalWeightConfig {
+                max_new_tokens_default: max_tokens,
+                model_dir: None,
+                ..LocalWeightConfig::default()
+            })
+        }
     } else if flashinfer || kernel {
         #[cfg(feature = "flashinfer")]
         {

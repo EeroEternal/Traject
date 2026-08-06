@@ -55,9 +55,28 @@ bash scripts/start_engine.sh
 cargo run -p traject-cli --release -- --engine-url http://127.0.0.1:9001 ...
 ```
 
+## Real safetensors (embed / head)
+
+```bash
+# Loads embed.weight + head.weight (+ norm.weight) from HF shard index.
+# DeepSeek-V4: ~1GB embed + ~1GB head as f32 in RAM; middle MoE layers still proxy.
+cargo run -p traject-cli --release -- \
+  --local-runner \
+  --model /home/bodesi/models/ds-v4-flash \
+  --max-tokens 16 \
+  "hello"
+```
+
+Loaded tensors (V4 naming): `embed.weight`, `head.weight`, `norm.weight` via
+`model.safetensors.index.json`. Full 43-layer MoE/FP8/MLA forward remains in
+sglang-lite; local runner uses real embed→(proxy attention)→real lm_head so
+logits live in the true 129280-way vocab.
+
 ## Status
 
 - [x] Physical free path for sglang radix pages + V4 GPU slot clear  
 - [x] In-process `LocalWeightRunner` with paged KV free  
-- [ ] Load real MoE safetensors into LocalWeightRunner (still sglang for production MoE)  
-- [ ] FlashInfer kernel wired as default attention for LocalWeightRunner when feature on  
+- [x] Load real **embed + lm head (+ norm)** safetensors (sharded HF)  
+- [ ] Full MoE / MLA layer stack in-process (still sglang for production MoE)  
+- [ ] Official DeepSeek tokenizer (encoding_dsv4) wired for text↔ids  
+- [ ] FlashInfer as default attention for LocalWeightRunner when feature on  

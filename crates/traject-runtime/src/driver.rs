@@ -146,6 +146,15 @@ impl Driver {
         self.with_backend(LocalWeightRunner::new(cfg))
     }
 
+    /// In-process runner loading real safetensors embed/head from `model_dir`.
+    pub fn with_local_weight_runner_from_dir(
+        self,
+        model_dir: impl Into<std::path::PathBuf>,
+    ) -> Result<Self> {
+        let runner = LocalWeightRunner::from_model_dir(model_dir.into())?;
+        Ok(self.with_backend(runner))
+    }
+
     pub fn with_stub_mode(mut self, mode: StubMode) -> Self {
         let backend = match mode {
             StubMode::AlwaysStop => StubBackend::always_stop(),
