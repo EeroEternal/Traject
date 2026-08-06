@@ -110,8 +110,8 @@ cargo run -p traject-cli --release -- \
 ```
 
 Routed MoE keeps a **live `SafetensorCatalog`** (mmap reuse) and an **LRU** of
-dequantized experts (`TRAJECT_MOE_CACHE`, default 32). Chunk logs report
-`moe_cache=(hits, misses)`.
+**packed FP4** experts (`TRAJECT_MOE_CACHE`, default 32). SwiGLU uses **fused
+FP4 matvec** (no full f32 expand). Chunk logs report `moe_cache=(hits, misses)`.
 
 ## Status
 
@@ -127,4 +127,5 @@ dequantized experts (`TRAJECT_MOE_CACHE`, default 32). Chunk logs report
 - [x] Layer-0 routed MoE (gate top-k + lazy FP4 experts)  
 - [x] Multi-layer stack (`TRAJECT_LOCAL_LAYERS`, per-layer KV)  
 - [x] MoE kept-open catalog + true LRU expert cache  
+- [x] Packed FP4 experts + fused matvec (no full f32 dequant)  
 - [ ] Full 43-layer production parity (still sglang for prod MoE)  

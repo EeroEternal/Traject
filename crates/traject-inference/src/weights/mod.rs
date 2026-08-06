@@ -7,6 +7,7 @@ mod hf_config;
 pub use catalog::{
     load_embed_head_norm, load_layer0_attn, load_layer0_routed_moe, load_layer0_shared_ffn,
     load_layer_attn, load_layer_routed_moe, load_layer_shared_ffn, load_layer_stack, ExpertF32,
-    Layer0AttnWeights, Layer0RoutedMoe, Layer0SharedFfn, LayerBlock, SafetensorCatalog, TensorF32,
+    ExpertPacked, Layer0AttnWeights, Layer0RoutedMoe, Layer0SharedFfn, LayerBlock, PackedFp4Mat,
+    SafetensorCatalog, TensorF32,
 };
 pub use hf_config::HfModelConfig;

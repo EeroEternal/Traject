@@ -10,7 +10,9 @@ use serde::Deserialize;
 use tracing::{info, warn};
 use traject_core::{Result, TrajectError};
 
-use super::dtype::{bytes_to_f32_vec, dequant_fp4_block_scaled, dequant_fp8_block_scaled};
+use super::dtype::{
+    bytes_to_f32_vec, dequant_fp4_block_scaled, dequant_fp8_block_scaled, matvec_fp4_block_scaled,
+};
 
 #[derive(Debug, Deserialize)]
 struct IndexFile {
@@ -228,6 +230,45 @@ impl SafetensorCatalog {
         Ok(TensorF32 {
             data,
             shape: logical,
+        })
+    }
+
+    /// Load packed FP4 weight + scale **without** expanding to f32.
+    pub fn load_fp4_packed(&mut self, weight_name: &str, block_k: usize) -> Result<PackedFp4Mat> {
+        let scale_name = if weight_name.ends_with(".weight") {
+            format!("{}.scale", weight_name.trim_end_matches(".weight"))
+        } else {
+            format!("{weight_name}.scale")
+        };
+        if !self.has(&scale_name) {
+            return Err(TrajectError::Other(format!(
+                "no scale for FP4 `{weight_name}` (expected `{scale_name}`)"
+            )));
+        }
+        let (w_bytes, w_shape, w_dtype) = self.load_raw(weight_name)?;
+        let (s_bytes, s_shape, s_dtype) = self.load_raw(&scale_name)?;
+        if !matches!(w_dtype, safetensors::Dtype::I8 | safetensors::Dtype::U8) {
+            return Err(TrajectError::Other(format!(
+                "`{weight_name}` dtype {w_dtype:?}, expected I8/U8 packed FP4"
+            )));
+        }
+        if s_dtype != safetensors::Dtype::F8_E8M0 {
+            return Err(TrajectError::Other(format!(
+                "`{scale_name}` dtype {s_dtype:?}, expected F8_E8M0"
+            )));
+        }
+        if w_shape.len() != 2 || s_shape.len() != 2 {
+            return Err(TrajectError::Other(format!(
+                "fp4 packed wants 2D shapes, got weight={w_shape:?} scale={s_shape:?}"
+            )));
+        }
+        Ok(PackedFp4Mat {
+            packed: w_bytes,
+            rows: w_shape[0],
+            packed_cols: w_shape[1],
+            scale: s_bytes,
+            scale_cols: s_shape[1],
+            block_k: block_k.max(1),
         })
     }
 
@@ -550,17 +591,166 @@ pub fn load_layer_attn(model_dir: &Path, layer: usize) -> Result<Layer0AttnWeigh
     })
 }
 
-/// One routed expert after FP4→f32 dequant (SwiGLU w1/w2/w3).
+/// Packed FP4 matrix (I8 nibbles + e8m0 scales) for fused matvec.
 #[derive(Debug, Clone)]
-pub struct ExpertF32 {
-    pub w1: TensorF32,
-    pub w2: TensorF32,
-    pub w3: TensorF32,
+pub struct PackedFp4Mat {
+    pub packed: Vec<u8>,
+    pub rows: usize,
+    pub packed_cols: usize,
+    pub scale: Vec<u8>,
+    pub scale_cols: usize,
+    pub block_k: usize,
 }
 
-/// True LRU cache of dequantized FP4 experts.
+impl PackedFp4Mat {
+    pub fn logical_cols(&self) -> usize {
+        self.packed_cols.saturating_mul(2)
+    }
+
+    pub fn matvec(&self, x: &[f32]) -> Result<Vec<f32>> {
+        matvec_fp4_block_scaled(
+            &self.packed,
+            self.rows,
+            self.packed_cols,
+            &self.scale,
+            self.scale_cols,
+            self.block_k,
+            x,
+        )
+        .map_err(|e| TrajectError::Other(e))
+    }
+}
+
+/// Dequantized f32 views of an expert (built lazily on first SwiGLU).
+#[derive(Debug, Clone)]
+struct ExpertF32Mats {
+    w1: Vec<f32>,
+    w1_rows: usize,
+    w1_cols: usize,
+    w2: Vec<f32>,
+    w2_rows: usize,
+    w2_cols: usize,
+    w3: Vec<f32>,
+    w3_rows: usize,
+    w3_cols: usize,
+}
+
+/// One routed expert: packed FP4 on load; f32 expanded once on first use.
+#[derive(Debug)]
+pub struct ExpertPacked {
+    pub w1: PackedFp4Mat,
+    pub w2: PackedFp4Mat,
+    pub w3: PackedFp4Mat,
+    /// Lazy full dequant for repeated SwiGLU (OnceLock is not Clone).
+    f32_once: std::sync::OnceLock<ExpertF32Mats>,
+}
+
+impl Clone for ExpertPacked {
+    fn clone(&self) -> Self {
+        // Fresh OnceLock — clone keeps packed bytes; f32 rebuilds on next use.
+        Self {
+            w1: self.w1.clone(),
+            w2: self.w2.clone(),
+            w3: self.w3.clone(),
+            f32_once: std::sync::OnceLock::new(),
+        }
+    }
+}
+
+impl ExpertPacked {
+    fn ensure_f32(&self) -> Result<&ExpertF32Mats> {
+        if let Some(m) = self.f32_once.get() {
+            return Ok(m);
+        }
+        let w1 = dequant_fp4_block_scaled(
+            &self.w1.packed,
+            &[self.w1.rows, self.w1.packed_cols],
+            &self.w1.scale,
+            &[self.w1.rows, self.w1.scale_cols],
+            self.w1.block_k,
+        )
+        .map_err(|e| TrajectError::Other(e))?;
+        let w2 = dequant_fp4_block_scaled(
+            &self.w2.packed,
+            &[self.w2.rows, self.w2.packed_cols],
+            &self.w2.scale,
+            &[self.w2.rows, self.w2.scale_cols],
+            self.w2.block_k,
+        )
+        .map_err(|e| TrajectError::Other(e))?;
+        let w3 = dequant_fp4_block_scaled(
+            &self.w3.packed,
+            &[self.w3.rows, self.w3.packed_cols],
+            &self.w3.scale,
+            &[self.w3.rows, self.w3.scale_cols],
+            self.w3.block_k,
+        )
+        .map_err(|e| TrajectError::Other(e))?;
+        let mats = ExpertF32Mats {
+            w1_rows: self.w1.rows,
+            w1_cols: self.w1.logical_cols(),
+            w1,
+            w2_rows: self.w2.rows,
+            w2_cols: self.w2.logical_cols(),
+            w2,
+            w3_rows: self.w3.rows,
+            w3_cols: self.w3.logical_cols(),
+            w3,
+        };
+        let _ = self.f32_once.set(mats);
+        Ok(self.f32_once.get().expect("just set"))
+    }
+
+    /// SwiGLU via lazy f32 expand (first call dequants; later calls are pure GEMV).
+    pub fn swiglu(&self, x: &[f32]) -> Result<Vec<f32>> {
+        let m = self.ensure_f32()?;
+        // Prefer f32 matvec after expand.
+        let u = matvec_f32(&m.w1, m.w1_rows, m.w1_cols, x);
+        let g = matvec_f32(&m.w3, m.w3_rows, m.w3_cols, x);
+        let inter = u.len().min(g.len());
+        let mut gated = vec![0.0f32; inter];
+        for i in 0..inter {
+            let ui = u[i];
+            let silu = ui / (1.0 + (-ui).exp());
+            gated[i] = silu * g[i];
+        }
+        Ok(matvec_f32(&m.w2, m.w2_rows, m.w2_cols, &gated))
+    }
+
+    /// One-shot fused path without caching f32 (used in unit tests / tiny mats).
+    pub fn swiglu_fused(&self, x: &[f32]) -> Result<Vec<f32>> {
+        let u = self.w1.matvec(x)?;
+        let g = self.w3.matvec(x)?;
+        let inter = u.len().min(g.len());
+        let mut gated = vec![0.0f32; inter];
+        for i in 0..inter {
+            let ui = u[i];
+            let silu = ui / (1.0 + (-ui).exp());
+            gated[i] = silu * g[i];
+        }
+        self.w2.matvec(&gated)
+    }
+}
+
+fn matvec_f32(w: &[f32], out_dim: usize, in_dim: usize, x: &[f32]) -> Vec<f32> {
+    let mut y = vec![0.0f32; out_dim];
+    for i in 0..out_dim {
+        let row = &w[i * in_dim..(i + 1) * in_dim];
+        let mut s = 0.0f32;
+        for (a, b) in row.iter().zip(x.iter()) {
+            s += a * b;
+        }
+        y[i] = s;
+    }
+    y
+}
+
+/// Backward-compat alias: experts are packed, not fully dequantized.
+pub type ExpertF32 = ExpertPacked;
+
+/// True LRU cache of packed FP4 experts (`Arc` so OnceLock f32 expand is shared).
 struct ExpertLru {
-    map: HashMap<usize, ExpertF32>,
+    map: HashMap<usize, std::sync::Arc<ExpertPacked>>,
     /// Front = oldest, back = newest.
     order: std::collections::VecDeque<usize>,
     cap: usize,
@@ -579,21 +769,20 @@ impl ExpertLru {
         }
     }
 
-    fn get(&mut self, id: usize) -> Option<ExpertF32> {
+    fn get(&mut self, id: usize) -> Option<std::sync::Arc<ExpertPacked>> {
         if let Some(e) = self.map.get(&id) {
             self.hits += 1;
-            // move to newest
             if let Some(pos) = self.order.iter().position(|&x| x == id) {
                 self.order.remove(pos);
             }
             self.order.push_back(id);
-            return Some(e.clone());
+            return Some(std::sync::Arc::clone(e));
         }
         self.misses += 1;
         None
     }
 
-    fn put(&mut self, id: usize, e: ExpertF32) {
+    fn put(&mut self, id: usize, e: std::sync::Arc<ExpertPacked>) {
         if self.map.contains_key(&id) {
             self.map.insert(id, e);
             if let Some(pos) = self.order.iter().position(|&x| x == id) {
@@ -618,42 +807,42 @@ impl ExpertLru {
 mod expert_lru_tests {
     use super::*;
 
-    fn dummy_expert(tag: f32) -> ExpertF32 {
-        ExpertF32 {
-            w1: TensorF32 {
-                data: vec![tag],
-                shape: vec![1, 1],
-            },
-            w2: TensorF32 {
-                data: vec![tag],
-                shape: vec![1, 1],
-            },
-            w3: TensorF32 {
-                data: vec![tag],
-                shape: vec![1, 1],
-            },
+    fn dummy_expert(tag: u8) -> ExpertPacked {
+        let mat = PackedFp4Mat {
+            packed: vec![tag],
+            rows: 1,
+            packed_cols: 1,
+            scale: vec![127],
+            scale_cols: 1,
+            block_k: 2,
+        };
+        ExpertPacked {
+            w1: mat.clone(),
+            w2: mat.clone(),
+            w3: mat,
+            f32_once: std::sync::OnceLock::new(),
         }
     }
 
     #[test]
     fn lru_evicts_oldest() {
+        use std::sync::Arc;
         let mut c = ExpertLru::new(2);
-        c.put(1, dummy_expert(1.0));
-        c.put(2, dummy_expert(2.0));
-        assert!(c.get(1).is_some()); // hit; 1 newest, 2 oldest
-        c.put(3, dummy_expert(3.0)); // evict 2
-        assert!(c.get(2).is_none()); // miss
-        assert!(c.get(1).is_some()); // hit
-        assert!(c.get(3).is_some()); // hit
+        c.put(1, Arc::new(dummy_expert(1)));
+        c.put(2, Arc::new(dummy_expert(2)));
+        assert!(c.get(1).is_some());
+        c.put(3, Arc::new(dummy_expert(3)));
+        assert!(c.get(2).is_none());
+        assert!(c.get(1).is_some());
+        assert!(c.get(3).is_some());
         assert_eq!(c.hits, 3);
         assert_eq!(c.misses, 1);
     }
 }
 
-/// Routed MoE: gate + lazy FP4 expert cache with a **kept-open** safetensors catalog.
+/// Routed MoE: gate + lazy **packed FP4** expert cache (kept-open catalog + LRU).
 ///
-/// Experts are dequantized on demand into an LRU (default cap 32). The catalog
-/// mmaps shards once and reuses them across expert loads (no reopen per miss).
+/// Expert miss loads packed weights only (~12MB); matvec dequants on the fly.
 pub struct Layer0RoutedMoe {
     pub model_dir: PathBuf,
     pub layer: usize,
@@ -754,8 +943,10 @@ impl Layer0RoutedMoe {
             .unwrap_or((0, 0))
     }
 
-    /// Load/dequant one expert (LRU + kept-open catalog).
-    pub fn expert(&self, id: usize) -> Result<ExpertF32> {
+    /// Load one packed expert (LRU + kept-open catalog).
+    ///
+    /// Returns `Arc` so lazy f32 expand (`OnceLock`) is shared across uses.
+    pub fn expert(&self, id: usize) -> Result<std::sync::Arc<ExpertPacked>> {
         {
             let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(e) = cache.get(id) {
@@ -764,33 +955,42 @@ impl Layer0RoutedMoe {
         }
         let e = {
             let mut cat = self.catalog.lock().unwrap_or_else(|e| e.into_inner());
-            load_fp4_expert(&mut cat, self.layer, id)?
+            std::sync::Arc::new(load_fp4_expert_packed(&mut cat, self.layer, id)?)
         };
         {
             let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-            cache.put(id, e.clone());
+            cache.put(id, std::sync::Arc::clone(&e));
         }
         Ok(e)
     }
 }
 
-fn load_fp4_expert(cat: &mut SafetensorCatalog, layer: usize, id: usize) -> Result<ExpertF32> {
-    let w1 = cat.load_fp4_block_scaled(
+fn load_fp4_expert_packed(
+    cat: &mut SafetensorCatalog,
+    layer: usize,
+    id: usize,
+) -> Result<ExpertPacked> {
+    let w1 = cat.load_fp4_packed(
         &format!("layers.{layer}.ffn.experts.{id}.w1.weight"),
         32,
     )?;
-    let w2 = cat.load_fp4_block_scaled(
+    let w2 = cat.load_fp4_packed(
         &format!("layers.{layer}.ffn.experts.{id}.w2.weight"),
         32,
     )?;
-    let w3 = cat.load_fp4_block_scaled(
+    let w3 = cat.load_fp4_packed(
         &format!("layers.{layer}.ffn.experts.{id}.w3.weight"),
         32,
     )?;
-    Ok(ExpertF32 { w1, w2, w3 })
+    Ok(ExpertPacked {
+        w1,
+        w2,
+        w3,
+        f32_once: std::sync::OnceLock::new(),
+    })
 }
 
-/// Load routed MoE gate for `layers.{layer}` (experts dequantized lazily).
+/// Load routed MoE gate for `layers.{layer}` (packed FP4 experts, lazy LRU).
 pub fn load_layer_routed_moe(model_dir: &Path, layer: usize) -> Result<Layer0RoutedMoe> {
     let mut cat = SafetensorCatalog::open(model_dir)?;
     let gate_name = format!("layers.{layer}.ffn.gate.weight");
@@ -809,19 +1009,21 @@ pub fn load_layer_routed_moe(model_dir: &Path, layer: usize) -> Result<Layer0Rou
     let n_experts = gate.rows();
     let hidden = gate.cols();
 
-    // Probe expert 0 for intermediate size.
-    let e0 = load_fp4_expert(&mut cat, layer, 0)?;
-    if e0.w1.cols() != hidden || e0.w3.cols() != hidden {
+    // Probe expert 0 (packed only) for intermediate size.
+    let e0 = load_fp4_expert_packed(&mut cat, layer, 0)?;
+    if e0.w1.logical_cols() != hidden || e0.w3.logical_cols() != hidden {
         return Err(TrajectError::Other(format!(
-            "expert0 in_features mismatch: hidden={hidden} w1={:?} w3={:?}",
-            e0.w1.shape, e0.w3.shape
+            "expert0 in_features mismatch: hidden={hidden} w1_cols={} w3_cols={}",
+            e0.w1.logical_cols(),
+            e0.w3.logical_cols()
         )));
     }
-    let intermediate = e0.w1.rows();
-    if e0.w2.rows() != hidden || e0.w2.cols() != intermediate {
+    let intermediate = e0.w1.rows;
+    if e0.w2.rows != hidden || e0.w2.logical_cols() != intermediate {
         return Err(TrajectError::Other(format!(
-            "expert0 w2 shape {:?} want [{hidden}, {intermediate}]",
-            e0.w2.shape
+            "expert0 w2 shape [{}, {}] want [{hidden}, {intermediate}]",
+            e0.w2.rows,
+            e0.w2.logical_cols()
         )));
     }
 
@@ -842,7 +1044,7 @@ pub fn load_layer_routed_moe(model_dir: &Path, layer: usize) -> Result<Layer0Rou
         .unwrap_or(32usize)
         .max(1);
     let mut lru = ExpertLru::new(cache_cap);
-    lru.put(0, e0);
+    lru.put(0, std::sync::Arc::new(e0));
 
     info!(
         dir = %model_dir.display(),
@@ -853,7 +1055,7 @@ pub fn load_layer_routed_moe(model_dir: &Path, layer: usize) -> Result<Layer0Rou
         intermediate,
         layer,
         cache_cap,
-        "loaded layer routed MoE gate (FP4 experts lazy, catalog kept open)"
+        "loaded layer routed MoE gate (packed FP4 experts, fused matvec, catalog kept open)"
     );
 
     Ok(Layer0RoutedMoe {

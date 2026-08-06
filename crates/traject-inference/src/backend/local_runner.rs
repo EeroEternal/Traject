@@ -447,22 +447,14 @@ impl ModelWeights {
         let routes = moe.route(&n);
         let mut delta = vec![0.0f32; moe.hidden];
         for (eid, w) in routes {
-            match moe.expert(eid) {
-                Ok(ex) => {
-                    let d = swiglu_delta(
-                        &n,
-                        &ex.w1.data,
-                        &ex.w2.data,
-                        &ex.w3.data,
-                        moe.hidden,
-                        moe.intermediate,
-                    );
+            match moe.expert(eid).and_then(|ex| ex.swiglu(&n)) {
+                Ok(d) => {
                     for (o, x) in delta.iter_mut().zip(d.iter()) {
                         *o += w * *x;
                     }
                 }
                 Err(e) => {
-                    warn!(expert = eid, error = %e, "routed expert load failed; skip");
+                    warn!(expert = eid, error = %e, "routed expert load/swiglu failed; skip");
                 }
             }
         }
