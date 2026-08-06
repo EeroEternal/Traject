@@ -66,4 +66,24 @@ impl EnginePrefixClient {
             }
         }
     }
+
+    /// MemoryManager eviction: drop pin + V4 snapshot for this handle.
+    pub async fn free(&self, prefix_id: &str, session_id: Option<&str>) {
+        let url = format!("{}/v1/prefix/free", self.base_url);
+        let body = json!({
+            "prefix_id": prefix_id,
+            "session_id": session_id,
+        });
+        match self.client.post(&url).json(&body).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                debug!(%prefix_id, "engine prefix freed");
+            }
+            Ok(resp) => {
+                warn!(%prefix_id, status = %resp.status(), "engine prefix free rejected");
+            }
+            Err(e) => {
+                debug!(%prefix_id, error = %e, "engine prefix free skipped");
+            }
+        }
+    }
 }

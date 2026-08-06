@@ -278,33 +278,49 @@ impl MemoryManager {
         self.sessions.remove(&traj);
     }
 
-    /// Evict unreferenced, unpinned nodes under pressure. Returns freed node count.
-    pub fn maybe_evict(&mut self, now_ms: u64, pressure_threshold: f32) -> usize {
+    /// Evict unreferenced, unpinned nodes under pressure.
+    /// Returns `(node_count, engine_handles_to_free)`.
+    pub fn maybe_evict(
+        &mut self,
+        now_ms: u64,
+        pressure_threshold: f32,
+    ) -> (usize, Vec<String>) {
         if self.gpu.pressure() < pressure_threshold {
-            return 0;
+            return (0, Vec::new());
         }
         let mut freed = 0;
+        let mut handles = Vec::new();
         while self.gpu.pressure() >= pressure_threshold {
             let candidates: Vec<_> = self.tree.nodes().cloned().collect();
             let Some(pick) = self.eviction.pick(candidates.iter(), now_ms) else {
                 break;
             };
-            if !self.free_node(pick.node_id, now_ms) {
-                break;
+            match self.free_node(pick.node_id, now_ms) {
+                Some(h) => {
+                    freed += 1;
+                    if let Some(handle) = h {
+                        handles.push(handle);
+                    }
+                }
+                None => break,
             }
-            freed += 1;
         }
         if freed > 0 {
-            debug!(freed, pressure = self.gpu.pressure(), "evicted prefix nodes");
+            debug!(
+                freed,
+                engine_frees = handles.len(),
+                pressure = self.gpu.pressure(),
+                "evicted prefix nodes"
+            );
         }
-        freed
+        (freed, handles)
     }
 
     fn ensure_capacity(&mut self, need: usize, now_ms: u64) -> Result<()> {
         if self.pool.allocated() + need <= self.pool.capacity() {
             return Ok(());
         }
-        self.maybe_evict(now_ms, 0.85);
+        let _ = self.maybe_evict(now_ms, 0.85);
         if self.pool.allocated() + need <= self.pool.capacity() {
             Ok(())
         } else {
@@ -316,25 +332,31 @@ impl MemoryManager {
         }
     }
 
-    fn free_node(&mut self, id: PrefixNodeId, now_ms: u64) -> bool {
+    /// Free a node. Returns `Some(engine_handle)` if freed, `None` if not eligible.
+    ///
+    /// Eligible when unpinned and either ref_count==0 or no remaining owners
+    /// (refcounts can lag after trajectory release).
+    fn free_node(&mut self, id: PrefixNodeId, now_ms: u64) -> Option<Option<String>> {
         if id == self.tree.root_id() {
-            return false;
+            return None;
         }
-        let Some(node) = self.tree.get(id).cloned() else {
-            return false;
-        };
-        if node.ref_count > 0 || node.pin.is_pinned(now_ms) {
-            return false;
+        let node = self.tree.get(id).cloned()?;
+        if node.pin.is_pinned(now_ms) {
+            return None;
+        }
+        if node.ref_count > 0 && !node.owners.is_empty() {
+            return None;
         }
         for b in &node.blocks {
             self.pool.free(*b);
         }
         self.gpu.used_blocks = self.pool.allocated();
-        if let Some(handle) = &node.engine_handle {
-            debug!(%id, %handle, "evicted engine-aligned prefix node");
+        let handle = node.engine_handle.clone();
+        if let Some(ref h) = handle {
+            debug!(%id, handle = %h, "evicted engine-aligned prefix node");
         }
         self.tree.remove_node(id);
-        true
+        Some(handle)
     }
 }
 
@@ -393,8 +415,29 @@ mod tests {
         .unwrap();
         // Release binding so ref_count can drop, but pin should block free.
         mem.release_trajectory(t);
-        let freed = mem.maybe_evict(0, 0.0);
+        let (freed, handles) = mem.maybe_evict(0, 0.0);
         // Root + pinned path may still free other nodes; pinned node must remain.
-        assert!(mem.tree.get(n).is_some(), "pinned node must survive, freed={freed}");
+        assert!(
+            mem.tree.get(n).is_some(),
+            "pinned node must survive, freed={freed} handles={handles:?}"
+        );
+    }
+
+    #[test]
+    fn eviction_returns_engine_handles() {
+        let mut mem = MemoryManager::new(1);
+        let t = TrajectoryId::new();
+        mem.bind_trajectory(t, mem.root_id()).unwrap();
+        let n = mem.append_tokens(t, vec![1, 2, 3]).unwrap();
+        mem.set_engine_handle(t, "eng-h-1").unwrap();
+        assert_eq!(mem.tree.engine_handle(n), Some("eng-h-1"));
+        mem.release_trajectory(t);
+        // Force pressure by lowering capacity accounting: pool already full.
+        let (freed, handles) = mem.maybe_evict(0, 0.0);
+        assert!(freed >= 1, "expected free, got {freed}");
+        assert!(
+            handles.iter().any(|h| h == "eng-h-1"),
+            "handles={handles:?}"
+        );
     }
 }

@@ -27,13 +27,14 @@ impl Default for EvictionPolicy {
 }
 
 impl EvictionPolicy {
-    /// Lower score = better eviction candidate. Pinned nodes are skipped.
+    /// Lower score = better eviction candidate. Pinned / owned nodes are skipped.
     /// Prefer cold (low last_access) and low-share nodes.
     pub fn score(&self, node: &PrefixNode, now_ms: u64) -> Option<f32> {
         if node.pin.is_pinned(now_ms) {
             return None;
         }
-        if node.ref_count > 0 {
+        // Still owned by a live trajectory — keep.
+        if !node.owners.is_empty() {
             return None;
         }
         let age_ms = now_ms.saturating_sub(node.last_access_ms) as f32;

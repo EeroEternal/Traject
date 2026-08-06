@@ -29,9 +29,10 @@
 - [ ] Full in-process model runner (weights + paged KV owned by MemoryManager)
 - [x] Tool latency-aware pin TTL from histograms (`ToolLatencyTracker` p95)
 - [x] Prefetch pin after tool return (`PinReason::Prefetch`)
-- [x] Engine `/v1/prefix/pin|unpin` + Driver client (logical alignment; soft-fail if offline)
+- [x] Engine `/v1/prefix/pin|unpin|free` + Driver client (soft-fail if offline)
 - [x] V4 prefix save fix (save by prompt ids after prefill/finish)
-- [ ] Engine-side physical KV free when MemoryManager evicts (still soft bookkeeping)
+- [x] Engine-side V4 snapshot drop on MemoryManager eviction (`/v1/prefix/free` + `drop_exact`)
+- [x] Session `prompt_lcp` floors `cache_hit_tokens` when V4 snapshot misses
 
 ## Phase 2 – Production
 

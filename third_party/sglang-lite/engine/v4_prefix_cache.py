@@ -174,3 +174,27 @@ class V4PrefixCache:
                 best_len = elen
                 best = e
         return best_len, best
+
+    def drop_exact(self, token_ids: List[int]) -> int:
+        """Remove entries whose token key exactly matches ``token_ids``. Returns count dropped."""
+        if not token_ids:
+            return 0
+        before = len(self._entries)
+        self._entries = [e for e in self._entries if e.token_ids != list(token_ids)]
+        return before - len(self._entries)
+
+    def drop_prefix(self, token_ids: List[int]) -> int:
+        """Remove entries that are equal to or extend ``token_ids`` (subtree free)."""
+        if not token_ids:
+            return 0
+        before = len(self._entries)
+        key = list(token_ids)
+        kept = []
+        for e in self._entries:
+            if e.token_ids == key or (
+                len(e.token_ids) >= len(key) and e.token_ids[: len(key)] == key
+            ):
+                continue
+            kept.append(e)
+        self._entries = kept
+        return before - len(self._entries)

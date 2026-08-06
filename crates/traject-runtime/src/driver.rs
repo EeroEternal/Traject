@@ -561,6 +561,11 @@ impl Driver {
     }
 
     fn cleanup_trajectory(&mut self, id: TrajectoryId) {
+        // Best-effort free of the leaf engine handle when the trajectory ends.
+        if let Some(handle) = self.memory.engine_prefix_hint(id) {
+            let session = self.memory.session_id(id).map(|s| s.to_string());
+            self.spawn_engine_free(&handle, session);
+        }
         self.memory.release_trajectory(id);
         self.live.remove(&id);
         self.external.remove(&id);
@@ -927,7 +932,22 @@ impl Driver {
                 }
             }
         }
-        self.memory.maybe_evict(now, self.config.eviction_pressure);
+        let (_n, handles) = self
+            .memory
+            .maybe_evict(now, self.config.eviction_pressure);
+        for h in handles {
+            self.spawn_engine_free(&h, None);
+        }
+    }
+
+    fn spawn_engine_free(&self, prefix_id: &str, session_id: Option<String>) {
+        let Some(client) = self.engine_prefix.clone() else {
+            return;
+        };
+        let prefix_id = prefix_id.to_string();
+        tokio::spawn(async move {
+            client.free(&prefix_id, session_id.as_deref()).await;
+        });
     }
 }
 
