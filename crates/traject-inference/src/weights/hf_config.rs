@@ -26,6 +26,12 @@ pub struct HfModelConfig {
     pub model_type: Option<String>,
     #[serde(default)]
     pub architectures: Option<Vec<String>>,
+    /// DeepSeek-V4 o_proj grouping (e.g. 8).
+    #[serde(default)]
+    pub o_groups: Option<u32>,
+    /// DeepSeek-V4 o_proj LoRA rank per group (e.g. 1024).
+    #[serde(default)]
+    pub o_lora_rank: Option<u32>,
 }
 
 fn default_vocab() -> u32 {

@@ -215,9 +215,9 @@ impl SafetensorCatalog {
     }
 }
 
-/// Layer-0 attention projections (DeepSeek-V4 MLA compressed + optional Q expand).
+/// Layer-0 attention projections (DeepSeek-V4 MLA compressed + Q expand + o_proj).
 ///
-/// Routed MoE experts / full `wo_*` output are **not** loaded here.
+/// Routed MoE experts are **not** loaded here.
 #[derive(Debug, Clone)]
 pub struct Layer0AttnWeights {
     /// RMSNorm γ before attention, shape [hidden].
@@ -235,6 +235,14 @@ pub struct Layer0AttnWeights {
     pub wq_b: Option<TensorF32>,
     /// Head count implied by `wq_b` rows / `kv_lora` (when present).
     pub n_heads: Option<usize>,
+    /// Optional `wo_a`: [o_groups * o_lora, hidden] — residual-side factor (V4).
+    pub wo_a: Option<TensorF32>,
+    /// Optional `wo_b`: [hidden, o_groups * o_lora] — maps o-intermediate → hidden.
+    pub wo_b: Option<TensorF32>,
+    /// `o_groups` (default 8 for V4 Flash).
+    pub o_groups: usize,
+    /// `o_lora_rank` per group (default 1024).
+    pub o_lora_rank: usize,
 }
 
 impl Layer0AttnWeights {
@@ -247,9 +255,15 @@ impl Layer0AttnWeights {
     pub fn has_q_expand(&self) -> bool {
         self.wq_b.is_some()
     }
+    pub fn has_o_proj(&self) -> bool {
+        self.wo_b.is_some()
+    }
     /// Full Q width after `wq_b` (e.g. 32768), if loaded.
     pub fn q_full_dim(&self) -> Option<usize> {
         self.wq_b.as_ref().map(|t| t.rows())
+    }
+    pub fn o_intermediate(&self) -> usize {
+        self.o_groups.saturating_mul(self.o_lora_rank).max(1)
     }
 }
 
@@ -420,6 +434,56 @@ pub fn load_layer0_attn(model_dir: &Path) -> Result<Layer0AttnWeights> {
         }
     }
 
+    // o_proj factors (V4 Flash defaults: o_groups=8, o_lora_rank=1024 → 8192).
+    let (o_groups, o_lora_rank) = {
+        use crate::weights::HfModelConfig;
+        match HfModelConfig::load(model_dir) {
+            Ok(cfg) => (
+                cfg.o_groups.unwrap_or(8) as usize,
+                cfg.o_lora_rank.unwrap_or(1024) as usize,
+            ),
+            Err(_) => (8, 1024),
+        }
+    };
+    let o_inter = o_groups * o_lora_rank;
+
+    let wo_a = match load_weight_fp8_or_f32(
+        &mut cat,
+        &[
+            "layers.0.attn.wo_a.weight",
+            "layers.0.attn.wo_a",
+            "model.layers.0.self_attn.o_a_proj.weight",
+        ],
+    ) {
+        Ok(t) if t.shape == [o_inter, hidden] => Some(t),
+        Ok(t) => {
+            warn!(shape = ?t.shape, want = ?[o_inter, hidden], "wo_a shape mismatch; skip");
+            None
+        }
+        Err(e) => {
+            warn!(error = %e, "wo_a not loaded");
+            None
+        }
+    };
+    let wo_b = match load_weight_fp8_or_f32(
+        &mut cat,
+        &[
+            "layers.0.attn.wo_b.weight",
+            "layers.0.attn.wo_b",
+            "model.layers.0.self_attn.o_b_proj.weight",
+        ],
+    ) {
+        Ok(t) if t.shape == [hidden, o_inter] => Some(t),
+        Ok(t) => {
+            warn!(shape = ?t.shape, want = ?[hidden, o_inter], "wo_b shape mismatch; skip");
+            None
+        }
+        Err(e) => {
+            warn!(error = %e, "wo_b not loaded");
+            None
+        }
+    };
+
     info!(
         dir = %model_dir.display(),
         hidden,
@@ -428,9 +492,13 @@ pub fn load_layer0_attn(model_dir: &Path) -> Result<Layer0AttnWeights> {
         has_q_norm = q_norm.is_some(),
         has_kv_norm = kv_norm.is_some(),
         has_wq_b = wq_b.is_some(),
+        has_wo_a = wo_a.is_some(),
+        has_wo_b = wo_b.is_some(),
         q_full = wq_b.as_ref().map(|t| t.rows()),
         n_heads = ?n_heads,
-        "loaded layer-0 attention projections (MLA Q path)"
+        o_groups,
+        o_lora_rank,
+        "loaded layer-0 attention projections (MLA Q + o_proj)"
     );
 
     Ok(Layer0AttnWeights {
@@ -442,6 +510,10 @@ pub fn load_layer0_attn(model_dir: &Path) -> Result<Layer0AttnWeights> {
         kv_norm,
         wq_b,
         n_heads,
+        wo_a,
+        wo_b,
+        o_groups,
+        o_lora_rank,
     })
 }
 

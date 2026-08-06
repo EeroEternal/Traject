@@ -374,9 +374,40 @@ impl ModelWeights {
         (a, v)
     }
 
-    /// Project attention dim → model hidden (still adapter; full wo_a/wo_b later).
-    fn up(&self, a: &[f32]) -> Vec<f32> {
-        matvec(&self.w_up, self.hidden, self.attn_dim, a)
+    /// Project KernelBackend attention output → model hidden.
+    ///
+    /// With `wo_b`: inject pooled attn into `o_groups × o_lora` intermediate,
+    /// optionally add `wo_a @ h_resid`, then `wo_b @ mid`. Falls back to random `w_up`.
+    fn attn_to_hidden(&self, attn_o: &[f32], h_resid: &[f32]) -> Vec<f32> {
+        if let Some(l0) = &self.layer0 {
+            if let Some(ref wo_b) = l0.wo_b {
+                let inter = l0.o_intermediate();
+                let mut mid = vec![0.0f32; inter];
+                // Inject pooled attention into each o-group's leading dims.
+                let g = l0.o_groups.max(1);
+                let lor = l0.o_lora_rank.max(1);
+                let take = attn_o.len().min(lor);
+                let scale = 1.0 / (g as f32).sqrt();
+                for gi in 0..g {
+                    let base = gi * lor;
+                    for d in 0..take {
+                        mid[base + d] += attn_o[d] * scale;
+                    }
+                }
+                // Residual-side factor when present: mid += wo_a @ h_resid
+                if let Some(ref wo_a) = l0.wo_a {
+                    if wo_a.rows() == inter && wo_a.cols() == l0.hidden && h_resid.len() == l0.hidden
+                    {
+                        let add = matvec(&wo_a.data, inter, l0.hidden, h_resid);
+                        for (m, a) in mid.iter_mut().zip(add.iter()) {
+                            *m += *a;
+                        }
+                    }
+                }
+                return matvec(&wo_b.data, l0.hidden, inter, &mid);
+            }
+        }
+        matvec(&self.w_up, self.hidden, self.attn_dim, attn_o)
     }
 
     /// Shared-expert SwiGLU residual: `h + w2(silu(w1·n) ⊙ w3·n)`.
@@ -663,6 +694,15 @@ impl LocalWeightRunner {
             .unwrap_or(false)
     }
 
+    /// Whether real `wo_b` output projection was loaded.
+    pub fn has_layer0_o_proj(&self) -> bool {
+        self.weights
+            .layer0
+            .as_ref()
+            .map(|l| l.has_o_proj())
+            .unwrap_or(false)
+    }
+
     /// Name of the active attention kernel (`cpu-ref` or `flashinfer-py`).
     pub fn kernel_name(&self) -> &str {
         self.kernel.name()
@@ -812,15 +852,26 @@ impl InferenceBackend for LocalWeightRunner {
                 .await
                 .map_err(|e| TrajectError::Inference(format!("local decode: {e}")))?;
 
-            // Map attention output back to model hidden, then real lm_head.
-            // Full wo_a/wo_b not loaded yet — residual adapter via w_up.
+            // Map attention output → hidden via real wo_* when present, else w_up.
             let mut attn_o = dec.o;
             attn_o.resize(attn_dim, 0.0);
-            let attn_h = self.weights.up(&attn_o);
-            // residual with last embed for stability
-            let mut h = emb;
-            for (a, b) in h.iter_mut().zip(attn_h.iter()) {
-                *a = 0.5 * *a + 0.5 * *b;
+            let attn_h = self.weights.attn_to_hidden(&attn_o, &emb);
+            // residual: h = emb + attn_delta (standard transformer; was 0.5 blend before wo)
+            let mut h = emb.clone();
+            if self
+                .weights
+                .layer0
+                .as_ref()
+                .map(|l| l.has_o_proj())
+                .unwrap_or(false)
+            {
+                for (a, b) in h.iter_mut().zip(attn_h.iter()) {
+                    *a += *b;
+                }
+            } else {
+                for (a, b) in h.iter_mut().zip(attn_h.iter()) {
+                    *a = 0.5 * *a + 0.5 * *b;
+                }
             }
             // Real shared-expert SwiGLU when loaded (routed MoE still absent).
             h = self.weights.shared_ffn_residual(&h);
@@ -884,6 +935,12 @@ impl InferenceBackend for LocalWeightRunner {
                 .layer0
                 .as_ref()
                 .map(|l| l.has_q_expand())
+                .unwrap_or(false),
+            has_o_proj = self
+                .weights
+                .layer0
+                .as_ref()
+                .map(|l| l.has_o_proj())
                 .unwrap_or(false),
             kernel = self.kernel.name(),
             "local weight runner chunk"
