@@ -1,0 +1,26 @@
+[package]
+name = "traject-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Traject CLI entrypoint"
+
+[[bin]]
+name = "traject"
+path = "src/main.rs"
+
+[features]
+default = []
+flashinfer = ["traject-inference/flashinfer"]
+
+[dependencies]
+traject-core = { workspace = true }
+traject-runtime = { workspace = true }
+traject-policy = { workspace = true }
+traject-inference = { workspace = true }
+traject-api = { workspace = true }
+traject-zene = { workspace = true }
+traject-scheduler = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

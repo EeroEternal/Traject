@@ -1,0 +1,19 @@
+[package]
+name = "traject-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native Trajectory API and OpenAI-compatible surface"
+
+[dependencies]
+traject-core = { workspace = true }
+traject-runtime = { workspace = true }
+traject-policy = { workspace = true }
+traject-inference = { workspace = true }
+serde = { workspace = true }
+serde_json = "1"
+async-trait = "0.1"
+axum = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { workspace = true }
+tracing = { workspace = true }

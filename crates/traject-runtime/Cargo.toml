@@ -1,0 +1,23 @@
+[package]
+name = "traject-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Trajectory manager and main driver loop"
+
+[dependencies]
+traject-core = { workspace = true }
+traject-scheduler = { workspace = true }
+traject-memory = { workspace = true }
+traject-inference = { workspace = true }
+traject-tool = { workspace = true }
+traject-policy = { workspace = true }
+async-trait = "0.1"
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+dashmap = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }

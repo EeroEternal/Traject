@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/traject-core",
+    "crates/traject-scheduler",
+    "crates/traject-memory",
+    "crates/traject-inference",
+    "crates/traject-tool",
+    "crates/traject-runtime",
+    "crates/traject-policy",
+    "crates/traject-api",
+    "crates/traject-cli",
+    "crates/traject-zene",
+]
+default-members = ["crates/traject-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/xinference/Traject"
+rust-version = "1.75"
+
+[workspace.dependencies]
+traject-core = { path = "crates/traject-core" }
+traject-scheduler = { path = "crates/traject-scheduler" }
+traject-memory = { path = "crates/traject-memory" }
+traject-inference = { path = "crates/traject-inference" }
+traject-tool = { path = "crates/traject-tool" }
+traject-runtime = { path = "crates/traject-runtime" }
+traject-policy = { path = "crates/traject-policy" }
+traject-api = { path = "crates/traject-api" }
+traject-zene = { path = "crates/traject-zene" }
+
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tracing = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+parking_lot = "0.12"
+dashmap = "6"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

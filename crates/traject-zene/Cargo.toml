@@ -1,0 +1,26 @@
+[package]
+name = "traject-zene"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Zene coding-agent integrated as Traject Trajectory runner"
+
+[dependencies]
+traject-core = { workspace = true }
+traject-runtime = { workspace = true }
+traject-policy = { workspace = true }
+anyhow = "1"
+async-trait = "0.1"
+serde = { workspace = true }
+serde_json = "1"
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+# Full Zene agent stack (sibling checkout: ../zene)
+zene-config = { path = "../../../zene/crates/config" }
+zene-core = { path = "../../../zene/crates/core" }
+zene-sandbox = { path = "../../../zene/crates/sandbox" }
+zene-session = { path = "../../../zene/crates/session" }
+zene-tools = { path = "../../../zene/crates/tools" }
+zene-llm = { path = "../../../zene/crates/llm" }

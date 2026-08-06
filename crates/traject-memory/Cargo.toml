@@ -1,0 +1,13 @@
+[package]
+name = "traject-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Prefix tree and hierarchical memory for Traject"
+
+[dependencies]
+traject-core = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+uuid = { workspace = true }
