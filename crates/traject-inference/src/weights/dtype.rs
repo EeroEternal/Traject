@@ -150,6 +150,57 @@ pub fn dequant_fp4_block_scaled(
     Ok(out)
 }
 
+/// Fused `y = W x` for packed FP4 row-major weights (no full dequant buffer).
+///
+/// `x.len() >= packed_cols * 2`, `y.len() == rows`.
+pub fn matvec_fp4_block_scaled(
+    packed: &[u8],
+    rows: usize,
+    packed_cols: usize,
+    scale_e8m0: &[u8],
+    scale_cols: usize,
+    block_k: usize,
+    x: &[f32],
+) -> Result<Vec<f32>, String> {
+    let cols = packed_cols.saturating_mul(2);
+    let block_k = block_k.max(1);
+    if x.len() < cols {
+        return Err(format!("fp4 matvec x len {} < cols {cols}", x.len()));
+    }
+    if packed.len() != rows * packed_cols {
+        return Err(format!(
+            "fp4 matvec packed len {} != rows*packed_cols {}",
+            packed.len(),
+            rows * packed_cols
+        ));
+    }
+    if scale_e8m0.len() < rows * scale_cols {
+        return Err(format!(
+            "fp4 matvec scale len {} < rows*scale_cols {}",
+            scale_e8m0.len(),
+            rows * scale_cols
+        ));
+    }
+    let mut y = vec![0.0f32; rows];
+    for i in 0..rows {
+        let mut acc = 0.0f32;
+        let row_off = i * packed_cols;
+        let scale_row = i * scale_cols;
+        for jb in 0..packed_cols {
+            let b = packed[row_off + jb];
+            let j0 = jb * 2;
+            let j1 = j0 + 1;
+            let s0 = e8m0_bits_to_f32(scale_e8m0[scale_row + j0 / block_k]);
+            let s1 = e8m0_bits_to_f32(scale_e8m0[scale_row + j1 / block_k]);
+            let w0 = e2m1_nibble_to_f32(b & 0x0f) * s0;
+            let w1 = e2m1_nibble_to_f32(b >> 4) * s1;
+            acc += w0 * x[j0] + w1 * x[j1];
+        }
+        y[i] = acc;
+    }
+    Ok(y)
+}
+
 pub fn bytes_to_f32_vec(data: &[u8], dtype: safetensors::Dtype) -> Result<Vec<f32>, String> {
     match dtype {
         safetensors::Dtype::F32 => {
@@ -311,5 +362,32 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert!((out[0] - 1.0).abs() < 1e-5);
         assert!((out[1] - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn fp4_matvec_matches_dequant() {
+        // 2 rows × 4 cols (2 packed cols), block_k=2, scale [2, 2]
+        let packed = [
+            2u8 | (2 << 4), // row0: 1,1
+            2u8 | (2 << 4),
+            4u8 | (0 << 4), // row1: 2,0
+            1u8 | (2 << 4), // 0.5, 1
+        ];
+        let scale = [127u8, 127, 127, 127]; // all 1.0
+        let w = dequant_fp4_block_scaled(&packed, &[2, 2], &scale, &[2, 2], 2).unwrap();
+        let x = vec![1.0f32, 2.0, 3.0, 4.0];
+        let y_ref = {
+            let mut y = vec![0.0f32; 2];
+            for i in 0..2 {
+                for j in 0..4 {
+                    y[i] += w[i * 4 + j] * x[j];
+                }
+            }
+            y
+        };
+        let y = matvec_fp4_block_scaled(&packed, 2, 2, &scale, 2, 2, &x).unwrap();
+        for (a, b) in y.iter().zip(y_ref.iter()) {
+            assert!((a - b).abs() < 1e-5, "{a} vs {b}");
+        }
     }
 }
