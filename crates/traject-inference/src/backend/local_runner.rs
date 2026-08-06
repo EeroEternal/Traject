@@ -671,6 +671,8 @@ fn swiglu_delta(
 }
 
 /// Mean-pool multi-head Q `[n_heads * head_dim]` down to `attn_dim` (= head_dim for MQA KV).
+/// Mean-pool multi-head Q → single attn vector (legacy / unit tests).
+#[cfg_attr(not(test), allow(dead_code))]
 fn pool_heads_to_attn(q_full: &[f32], n_heads: Option<usize>, attn_dim: usize) -> Vec<f32> {
     let n = q_full.len();
     if n == 0 {
