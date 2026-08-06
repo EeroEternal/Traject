@@ -217,7 +217,7 @@ impl SafetensorCatalog {
 
 /// Layer-0 attention projections (DeepSeek-V4 MLA compressed form).
 ///
-/// FFN / MoE experts are **not** loaded here — that remains sglang-lite.
+/// Routed MoE experts are **not** loaded here — that remains sglang-lite.
 #[derive(Debug, Clone)]
 pub struct Layer0AttnWeights {
     /// RMSNorm γ before attention, shape [hidden].
@@ -236,6 +236,57 @@ impl Layer0AttnWeights {
     pub fn kv_dim(&self) -> usize {
         self.wkv.rows()
     }
+}
+
+/// Layer-0 **shared** expert SwiGLU FFN (not the 256 routed experts).
+///
+/// `y = w2( silu(w1 x) ⊙ (w3 x) )` after `ffn_norm`.
+#[derive(Debug, Clone)]
+pub struct Layer0SharedFfn {
+    pub ffn_norm: Vec<f32>,
+    pub hidden: usize,
+    pub intermediate: usize,
+    /// [intermediate, hidden]
+    pub w1: TensorF32,
+    /// [hidden, intermediate]
+    pub w2: TensorF32,
+    /// [intermediate, hidden]
+    pub w3: TensorF32,
+}
+
+fn load_weight_fp8_or_f32(cat: &mut SafetensorCatalog, names: &[&str]) -> Result<TensorF32> {
+    for n in names {
+        if !cat.has(n) {
+            continue;
+        }
+        let key = if n.ends_with(".weight") {
+            (*n).to_string()
+        } else if cat.has(&format!("{n}.weight")) {
+            format!("{n}.weight")
+        } else {
+            (*n).to_string()
+        };
+        // Prefer FP8 block-scaled when a sibling `.scale` exists.
+        let scale = if key.ends_with(".weight") {
+            format!("{}.scale", key.trim_end_matches(".weight"))
+        } else {
+            format!("{key}.scale")
+        };
+        if cat.has(&scale) {
+            if let Ok(t) = cat.load_fp8_block_scaled(&key, 128) {
+                return Ok(t);
+            }
+        }
+        if let Ok(t) = cat.load_f32(&key) {
+            return Ok(t);
+        }
+        if let Ok(t) = cat.load_f32(n) {
+            return Ok(t);
+        }
+    }
+    Err(TrajectError::Other(format!(
+        "none of {names:?} found/loadable"
+    )))
 }
 
 /// Load layer-0 attention norms + FP8 `wq_a` / `wkv` (block-scaled).
@@ -259,68 +310,22 @@ pub fn load_layer0_attn(model_dir: &Path) -> Result<Layer0AttnWeights> {
         ))
     })?;
 
-    let wq_names = [
-        "layers.0.attn.wq_a.weight",
-        "layers.0.attn.wq_a",
-        "model.layers.0.self_attn.q_a_proj.weight",
-    ];
-    let mut wq_a = None;
-    for n in wq_names {
-        if cat.has(n) {
-            // Prefer FP8 block path; fall back to plain f32/bf16.
-            wq_a = Some(if n.ends_with(".weight") || cat.has(&format!("{n}.scale")) {
-                let key = if n.ends_with(".weight") {
-                    n.to_string()
-                } else {
-                    format!("{n}.weight")
-                };
-                match cat.load_fp8_block_scaled(&key, 128) {
-                    Ok(t) => t,
-                    Err(_) => cat.load_f32(n).or_else(|_| cat.load_f32(&key))?,
-                }
-            } else {
-                cat.load_f32(n)?
-            });
-            break;
-        }
-    }
-    let wq_a = wq_a.ok_or_else(|| {
-        TrajectError::Other(format!(
-            "layer-0 wq_a not found in {}",
-            model_dir.display()
-        ))
-    })?;
-
-    let wkv_names = [
-        "layers.0.attn.wkv.weight",
-        "layers.0.attn.wkv",
-        "model.layers.0.self_attn.kv_a_proj_with_mqa.weight",
-    ];
-    let mut wkv = None;
-    for n in wkv_names {
-        if cat.has(n) {
-            wkv = Some(if n.ends_with(".weight") || cat.has(&format!("{n}.scale")) {
-                let key = if n.ends_with(".weight") {
-                    n.to_string()
-                } else {
-                    format!("{n}.weight")
-                };
-                match cat.load_fp8_block_scaled(&key, 128) {
-                    Ok(t) => t,
-                    Err(_) => cat.load_f32(n).or_else(|_| cat.load_f32(&key))?,
-                }
-            } else {
-                cat.load_f32(n)?
-            });
-            break;
-        }
-    }
-    let wkv = wkv.ok_or_else(|| {
-        TrajectError::Other(format!(
-            "layer-0 wkv not found in {}",
-            model_dir.display()
-        ))
-    })?;
+    let wq_a = load_weight_fp8_or_f32(
+        &mut cat,
+        &[
+            "layers.0.attn.wq_a.weight",
+            "layers.0.attn.wq_a",
+            "model.layers.0.self_attn.q_a_proj.weight",
+        ],
+    )?;
+    let wkv = load_weight_fp8_or_f32(
+        &mut cat,
+        &[
+            "layers.0.attn.wkv.weight",
+            "layers.0.attn.wkv",
+            "model.layers.0.self_attn.kv_a_proj_with_mqa.weight",
+        ],
+    )?;
 
     if wq_a.shape.len() != 2 || wkv.shape.len() != 2 {
         return Err(TrajectError::Other(format!(
@@ -341,7 +346,7 @@ pub fn load_layer0_attn(model_dir: &Path) -> Result<Layer0AttnWeights> {
         hidden,
         q_lora = wq_a.rows(),
         kv_lora = wkv.rows(),
-        "loaded layer-0 attention projections (no MoE FFN)"
+        "loaded layer-0 attention projections"
     );
 
     Ok(Layer0AttnWeights {
@@ -349,6 +354,91 @@ pub fn load_layer0_attn(model_dir: &Path) -> Result<Layer0AttnWeights> {
         hidden,
         wq_a,
         wkv,
+    })
+}
+
+/// Load layer-0 shared-expert SwiGLU (`ffn_norm` + `w1`/`w2`/`w3`).
+///
+/// Does **not** load the 256 routed experts.
+pub fn load_layer0_shared_ffn(model_dir: &Path) -> Result<Layer0SharedFfn> {
+    let mut cat = SafetensorCatalog::open(model_dir)?;
+    let mut ffn_norm = None;
+    for n in [
+        "layers.0.ffn_norm.weight",
+        "model.layers.0.post_attention_layernorm.weight",
+    ] {
+        if let Ok(t) = cat.load_f32(n) {
+            ffn_norm = Some(t);
+            break;
+        }
+    }
+    let ffn_norm = ffn_norm.ok_or_else(|| {
+        TrajectError::Other(format!(
+            "layer-0 ffn_norm not found in {}",
+            model_dir.display()
+        ))
+    })?;
+
+    let w1 = load_weight_fp8_or_f32(
+        &mut cat,
+        &[
+            "layers.0.ffn.shared_experts.w1.weight",
+            "layers.0.ffn.shared_experts.w1",
+            "layers.0.mlp.shared_experts.gate_proj.weight",
+        ],
+    )?;
+    let w2 = load_weight_fp8_or_f32(
+        &mut cat,
+        &[
+            "layers.0.ffn.shared_experts.w2.weight",
+            "layers.0.ffn.shared_experts.w2",
+            "layers.0.mlp.shared_experts.down_proj.weight",
+        ],
+    )?;
+    let w3 = load_weight_fp8_or_f32(
+        &mut cat,
+        &[
+            "layers.0.ffn.shared_experts.w3.weight",
+            "layers.0.ffn.shared_experts.w3",
+            "layers.0.mlp.shared_experts.up_proj.weight",
+        ],
+    )?;
+
+    if w1.shape.len() != 2 || w2.shape.len() != 2 || w3.shape.len() != 2 {
+        return Err(TrajectError::Other(format!(
+            "shared ffn weights must be 2D: w1={:?} w2={:?} w3={:?}",
+            w1.shape, w2.shape, w3.shape
+        )));
+    }
+    let hidden = ffn_norm.data.len();
+    let intermediate = w1.rows();
+    if w1.cols() != hidden || w3.cols() != hidden || w3.rows() != intermediate {
+        return Err(TrajectError::Other(format!(
+            "shared ffn shape mismatch: hidden={hidden} w1={:?} w3={:?}",
+            w1.shape, w3.shape
+        )));
+    }
+    if w2.rows() != hidden || w2.cols() != intermediate {
+        return Err(TrajectError::Other(format!(
+            "shared ffn w2 shape {:?} want [{hidden}, {intermediate}]",
+            w2.shape
+        )));
+    }
+
+    info!(
+        dir = %model_dir.display(),
+        hidden,
+        intermediate,
+        "loaded layer-0 shared expert FFN (no routed MoE)"
+    );
+
+    Ok(Layer0SharedFfn {
+        ffn_norm: ffn_norm.data,
+        hidden,
+        intermediate,
+        w1,
+        w2,
+        w3,
     })
 }
 
