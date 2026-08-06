@@ -357,6 +357,24 @@ fn matvec(w: &[f32], out_dim: usize, in_dim: usize, x: &[f32]) -> Vec<f32> {
     y
 }
 
+/// Pick FlashInfer when feature + prefer + import succeed; otherwise CPU ref.
+fn select_kernel(prefer_flashinfer: bool) -> Arc<dyn KernelBackend> {
+    #[cfg(feature = "flashinfer")]
+    {
+        if prefer_flashinfer {
+            use crate::kernel::{FlashInferKernel, FlashInferKernelConfig};
+            if let Some(k) = FlashInferKernel::try_new(FlashInferKernelConfig::default()) {
+                return Arc::new(k);
+            }
+        }
+    }
+    #[cfg(not(feature = "flashinfer"))]
+    {
+        let _ = prefer_flashinfer;
+    }
+    Arc::new(CpuRefKernel)
+}
+
 #[derive(Debug, Clone)]
 pub struct LocalWeightConfig {
     pub vocab_size: u32,
@@ -366,6 +384,9 @@ pub struct LocalWeightConfig {
     pub max_new_tokens_default: u32,
     /// HF model directory with config.json + sharded safetensors.
     pub model_dir: Option<std::path::PathBuf>,
+    /// Prefer FlashInfer when the `flashinfer` cargo feature is enabled.
+    /// Default true; set false to force CPU ref (tests / no GPU).
+    pub prefer_flashinfer: bool,
 }
 
 impl Default for LocalWeightConfig {
@@ -377,6 +398,7 @@ impl Default for LocalWeightConfig {
             page_tokens: 16,
             max_new_tokens_default: 32,
             model_dir: None,
+            prefer_flashinfer: true,
         }
     }
 }
@@ -425,8 +447,10 @@ impl LocalWeightRunner {
         // KV pool uses attention dim (projected), not full model hidden.
         let pool_dim = weights.attn_dim / cfg.num_heads.max(1) as usize;
         let pool_dim = pool_dim.max(1);
+        let kernel = select_kernel(cfg.prefer_flashinfer);
+        info!(kernel = kernel.name(), "LocalWeightRunner attention kernel");
         Self {
-            kernel: Arc::new(CpuRefKernel),
+            kernel,
             weights,
             kv: Mutex::new(PagedKvPool::new(
                 cfg.page_tokens,
@@ -453,8 +477,12 @@ impl LocalWeightRunner {
     }
 
     pub fn with_kernel(cfg: LocalWeightConfig, kernel: Arc<dyn KernelBackend>) -> Self {
-        let mut s = Self::new(cfg);
+        let mut s = Self::new(LocalWeightConfig {
+            prefer_flashinfer: false,
+            ..cfg
+        });
         s.kernel = kernel;
+        info!(kernel = s.kernel.name(), "LocalWeightRunner using explicit kernel");
         s
     }
 
@@ -465,6 +493,11 @@ impl LocalWeightRunner {
     /// Whether an official HF tokenizer was loaded.
     pub fn has_tokenizer(&self) -> bool {
         self.tokenizer.is_some()
+    }
+
+    /// Name of the active attention kernel (`cpu-ref` or `flashinfer-py`).
+    pub fn kernel_name(&self) -> &str {
+        self.kernel.name()
     }
 
     pub fn pages_allocated(&self) -> usize {
@@ -678,6 +711,7 @@ impl InferenceBackend for LocalWeightRunner {
             source = %self.weights.source,
             vocab = self.weights.vocab,
             has_tokenizer = self.tokenizer.is_some(),
+            kernel = self.kernel.name(),
             "local weight runner chunk"
         );
 
@@ -716,7 +750,12 @@ mod tests {
 
     #[tokio::test]
     async fn local_runner_generate_and_free() {
-        let runner = LocalWeightRunner::new(LocalWeightConfig::default());
+        // Force CPU so CI / macOS unit tests never need CUDA/Python FlashInfer.
+        let runner = LocalWeightRunner::new(LocalWeightConfig {
+            prefer_flashinfer: false,
+            ..LocalWeightConfig::default()
+        });
+        assert_eq!(runner.kernel_name(), "cpu-ref");
         let traj = TrajectoryId::new();
         let prefix = "pfx-local-1".to_string();
         let req = ChunkRequest {

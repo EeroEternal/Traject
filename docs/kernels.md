@@ -20,8 +20,10 @@ Traject schedules **Trajectory Steps**. Generate ultimately needs device ops:
 - `CpuRefKernel` — pure Rust reference (tests / no GPU)
 - `FlashInferKernel` (`--features flashinfer`) — embed CPython, call FlashInfer CUDA in-process
 - `KernelSmokeBackend` — InferenceBackend over KernelBackend (synthetic QKV)
-- **`LocalWeightRunner`** — in-process “weights + KV” runner (`PagedKvPool`)
+- **`LocalWeightRunner`** — in-process “weights + KV” runner (`PagedKvPool`); with `--features flashinfer` auto-picks `FlashInferKernel` for prefill/decode (soft-fail → `CpuRefKernel`)
 - **`InferenceBackend::free_prefix`** — physical free for local pages **and** sglang `/v1/prefix/free`
+
+Env for FlashInfer site-packages discovery: `TRAJECT_FLASHINFER_SITE`, `SGLANG_VENV`, or well-known pro6000 paths.
 
 ## MemoryManager handoff
 
@@ -41,14 +43,21 @@ Traject schedules **Trajectory Steps**. Generate ultimately needs device ops:
 ## Run
 
 ```bash
-# In-process local runner (physical KV + toy weights)
+# In-process local runner (physical KV + toy weights; CPU attention)
 cargo run -p traject-cli -- --local-runner --max-tokens 16 "hello"
 
-# CPU kernel smoke
+# CPU kernel smoke (no weights)
 cargo run -p traject-cli -- --kernel-smoke "hi"
 
-# FlashInfer in-process
+# FlashInfer kernel smoke (synthetic QKV only)
 cargo run -p traject-cli --release --features flashinfer -- --flashinfer "hi"
+
+# LocalWeightRunner + FlashInfer attention (default when feature is on)
+# Needs CUDA + flashinfer/torch in site-packages (see TRAJECT_FLASHINFER_SITE / SGLANG_VENV)
+export SGLANG_VENV=/home/bodesi/venvs/sglang-lite
+cargo run -p traject-cli --release --features flashinfer -- \
+  --local-runner --model /home/bodesi/models/ds-v4-flash \
+  --max-tokens 8 "hello"
 
 # Full MoE (subprocess)
 bash scripts/start_engine.sh
@@ -83,5 +92,5 @@ toy char-hash encode and id-list decode.
 - [x] In-process `LocalWeightRunner` with paged KV free  
 - [x] Load real **embed + lm head (+ norm)** safetensors (sharded HF)  
 - [x] Official HF `tokenizer.json` via `tokenizers` crate (`HfTokenizer`; text↔ids)  
+- [x] FlashInfer as default attention for LocalWeightRunner when `--features flashinfer`  
 - [ ] Full MoE / MLA layer stack in-process (still sglang for production MoE)  
-- [ ] FlashInfer as default attention for LocalWeightRunner when feature on  

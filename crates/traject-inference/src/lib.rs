@@ -29,4 +29,4 @@ pub use kernel::{
     PrefillResult, SampleRequest, SampleResult,
 };
 #[cfg(feature = "flashinfer")]
-pub use kernel::{FlashInferKernel, FlashInferKernelConfig};
+pub use kernel::{discover_site_packages, FlashInferKernel, FlashInferKernelConfig};
