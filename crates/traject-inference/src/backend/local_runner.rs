@@ -1118,6 +1118,9 @@ impl InferenceBackend for LocalWeightRunner {
                 .unwrap_or(false),
             has_moe = self.weights.has_layer0_moe(),
             n_layers = self.weights.n_layers(),
+            moe_cache = ?self.weights.layers.first().and_then(|l| {
+                l.moe.as_ref().map(|m| m.cache_stats())
+            }),
             kernel = self.kernel.name(),
             "local weight runner chunk"
         );

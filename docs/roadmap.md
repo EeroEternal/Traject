@@ -36,6 +36,7 @@
 - [x] Layer-0 o_proj (`wo_a`/`wo_b`; group-inject pooled attn → hidden)
 - [x] Layer-0 routed MoE (gate top-k + lazy FP4 e2m1 expert dequant)
 - [x] Multi-layer local stack (`TRAJECT_LOCAL_LAYERS`, default 2; per-layer KV)
+- [x] MoE kept-open safetensors catalog + LRU expert dequant cache
 - [ ] Full 43-layer production parity in-process (prod MoE remains sglang-lite)
 - [x] Tool latency-aware pin TTL from histograms (`ToolLatencyTracker` p95)
 - [x] Prefetch pin after tool return (`PinReason::Prefetch`)
