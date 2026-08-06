@@ -86,20 +86,27 @@ Also loads `tokenizer.json` via the HuggingFace `tokenizers` crate
 template helper, not the BPE vocab.) Without `tokenizer.json`, falls back to
 toy char-hash encode and id-list decode.
 
-### Layer-0 (in progress)
+### Layer stack (in-process)
 
-When present, loads DeepSeek-V4:
+Loads the first **N** DeepSeek-V4 blocks (`TRAJECT_LOCAL_LAYERS`, default **2**,
+max 8). Each layer:
 
 1. **Attention:** `attn_norm` + FP8 `wq_a` / `wkv` + `q_norm` / `kv_norm`  
-   + FP8 `wq_b` (full multi-head Q, mean-pooled to `kv_lora` for KernelBackend)
-2. **o_proj:** FP8 `wo_a` / `wo_b` (`o_groups=8 × o_lora=1024`). Pooled attn is
-   injected into each group; `mid += wo_a @ h`, then `h += wo_b @ mid`.
-3. **Shared expert FFN:** `ffn_norm` + FP8 `shared_experts.w1/w2/w3` SwiGLU residual
-4. **Routed MoE:** gate top-k (default 6) + lazy FP4 e2m1 expert dequant  
-   (`h += route_scale * Σ w_i expert_i(n)`); experts cached (cap 32)
+   + FP8 `wq_b` (mean-pooled to `kv_lora` for KernelBackend)
+2. **o_proj:** FP8 `wo_a` / `wo_b` (group inject + residual)
+3. **Shared expert FFN:** SwiGLU residual
+4. **Routed MoE:** gate top-k + lazy FP4 experts
 
-**Not loaded yet:** layers 1–42, full multi-head attention without mean-pool
-(KernelBackend still uses compressed `kv_lora` width).
+Per-layer KV is keyed `{prefix}:L{i}`. Free drops base + all layer keys.
+
+**Not loaded yet:** full 43-layer production stack (memory), true multi-head
+attention without mean-pool, expert-cache catalog reuse.
+
+```bash
+export TRAJECT_LOCAL_LAYERS=2   # or 1..8
+cargo run -p traject-cli --release -- \
+  --local-runner --model /path/to/ds-v4-flash --max-tokens 4 "hello"
+```
 
 ## Status
 
@@ -113,4 +120,5 @@ When present, loads DeepSeek-V4:
 - [x] Layer-0 MLA Q expand (`q_norm`/`kv_norm`/`wq_b`, head mean-pool)  
 - [x] Layer-0 o_proj (`wo_a`/`wo_b` group inject + residual)  
 - [x] Layer-0 routed MoE (gate top-k + lazy FP4 experts)  
-- [ ] Full MoE / MLA layer stack in-process (still sglang for production MoE)  
+- [x] Multi-layer stack (`TRAJECT_LOCAL_LAYERS`, per-layer KV)  
+- [ ] Full 43-layer production parity (still sglang for prod MoE)  

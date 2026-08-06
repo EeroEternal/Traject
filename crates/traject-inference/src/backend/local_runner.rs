@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 use traject_core::{FinishReason, Result, TrajectError, TrajectoryId};
 
 use crate::kernel::{
-    CpuRefKernel, DecodeRequest, KernelBackend, KvLayout, PrefillRequest, SampleRequest,
+    CpuRefKernel, DecodeRequest, KernelBackend, KvLayout, SampleRequest,
 };
 use crate::tokenizer::HfTokenizer;
 use crate::{ChunkRequest, ChunkResult, InferenceBackend};
@@ -176,7 +176,7 @@ impl PagedKvPool {
     }
 }
 
-/// In-process model weights (toy or real safetensors embed/head/norm + optional layer-0).
+/// In-process model weights (toy or real safetensors + optional layer stack).
 struct ModelWeights {
     vocab: u32,
     /// Model hidden size (e.g. 4096 for DeepSeek-V4).
@@ -189,16 +189,12 @@ struct ModelWeights {
     head: Vec<f32>,
     /// Optional final RMSNorm weights [hidden]
     norm: Option<Vec<f32>>,
-    /// Fixed down-projection hidden → attn_dim (fallback when no layer-0)
+    /// Fixed down-projection hidden → attn_dim (fallback when no layers)
     w_down: Vec<f32>,
     /// Up-projection attn_dim → hidden
     w_up: Vec<f32>,
-    /// Optional real layer-0 attn projections (FP8 dequantized).
-    layer0: Option<crate::weights::Layer0AttnWeights>,
-    /// Optional layer-0 shared-expert SwiGLU FFN.
-    layer0_ffn: Option<crate::weights::Layer0SharedFfn>,
-    /// Optional layer-0 routed MoE (gate + lazy FP4 experts).
-    layer0_moe: Option<crate::weights::Layer0RoutedMoe>,
+    /// Loaded transformer blocks (layer 0..N-1).
+    layers: Vec<crate::weights::LayerBlock>,
     source: String,
     eos_token_id: Option<u32>,
 }
@@ -225,9 +221,7 @@ impl ModelWeights {
             norm: None,
             w_down,
             w_up,
-            layer0: None,
-            layer0_ffn: None,
-            layer0_moe: None,
+            layers: Vec::new(),
             source: "toy".into(),
             eos_token_id: Some(1),
         }
@@ -238,10 +232,7 @@ impl ModelWeights {
         attn_heads: u32,
         attn_dim_per_head: u32,
     ) -> Result<Self> {
-        use crate::weights::{
-            load_embed_head_norm, load_layer0_attn, load_layer0_routed_moe, load_layer0_shared_ffn,
-            HfModelConfig,
-        };
+        use crate::weights::{load_embed_head_norm, load_layer_stack, HfModelConfig};
 
         let cfg = HfModelConfig::load(model_dir).ok();
         let (embed_t, head_t, norm_t, embed_key) = load_embed_head_norm(model_dir)?;
@@ -254,7 +245,6 @@ impl ModelWeights {
         let vocab = embed_t.shape[0] as u32;
         let hidden = embed_t.shape[1];
         if head_t.shape != embed_t.shape && !(head_t.shape.len() == 2 && head_t.shape[1] == hidden) {
-            // head may be [vocab, hidden] same as embed
             if head_t.rows() != vocab as usize || head_t.cols() != hidden {
                 return Err(TrajectError::Other(format!(
                     "head shape {:?} incompatible with embed {:?}",
@@ -263,31 +253,19 @@ impl ModelWeights {
             }
         }
         let mut attn_dim = (attn_heads * attn_dim_per_head) as usize;
-        let layer0 = match load_layer0_attn(model_dir) {
-            Ok(l0) => {
-                // Match KernelBackend dim to compressed KV width when possible.
-                if l0.kv_dim() > 0 {
-                    attn_dim = l0.kv_dim();
+        let n_layers = local_layer_count(cfg.as_ref());
+        let layers = match load_layer_stack(model_dir, n_layers) {
+            Ok(stack) => {
+                if let Some(first) = stack.first() {
+                    if first.attn.kv_dim() > 0 {
+                        attn_dim = first.attn.kv_dim();
+                    }
                 }
-                Some(l0)
+                stack
             }
             Err(e) => {
-                warn!(error = %e, "layer-0 attn not loaded; using random projections");
-                None
-            }
-        };
-        let layer0_ffn = match load_layer0_shared_ffn(model_dir) {
-            Ok(f) => Some(f),
-            Err(e) => {
-                warn!(error = %e, "layer-0 shared FFN not loaded");
-                None
-            }
-        };
-        let layer0_moe = match load_layer0_routed_moe(model_dir) {
-            Ok(m) => Some(m),
-            Err(e) => {
-                warn!(error = %e, "layer-0 routed MoE not loaded");
-                None
+                warn!(error = %e, "layer stack not loaded; using random projections");
+                Vec::new()
             }
         };
         let (w_down, w_up) = random_projections(hidden, attn_dim, 7);
@@ -299,9 +277,10 @@ impl ModelWeights {
             hidden,
             embed_key = %embed_key,
             has_norm = norm.is_some(),
-            has_layer0 = layer0.is_some(),
-            has_layer0_ffn = layer0_ffn.is_some(),
-            has_layer0_moe = layer0_moe.is_some(),
+            n_layers = layers.len(),
+            has_layer0 = !layers.is_empty(),
+            has_layer0_ffn = layers.first().and_then(|l| l.ffn.as_ref()).is_some(),
+            has_layer0_moe = layers.first().and_then(|l| l.moe.as_ref()).is_some(),
             attn_dim,
             model_type = ?cfg.as_ref().and_then(|c| c.model_type.clone()),
             "loaded real safetensors embed/head for local runner"
@@ -315,9 +294,7 @@ impl ModelWeights {
             norm,
             w_down,
             w_up,
-            layer0,
-            layer0_ffn,
-            layer0_moe,
+            layers,
             source: format!("safetensors:{}", model_dir.display()),
             eos_token_id: eos.or(Some(1)),
         })
@@ -348,86 +325,98 @@ impl ModelWeights {
         self.rms_norm_with(x, self.norm.as_deref())
     }
 
-    /// Hidden → Q vector in attention space.
-    ///
-    /// With layer-0: `attn_norm → wq_a → q_norm → [wq_b] → pool to attn_dim`.
+    /// Hidden → Q vector for a specific layer (or toy down if no layers).
+    fn project_q_layer(&self, layer: &crate::weights::Layer0AttnWeights, h: &[f32]) -> Vec<f32> {
+        let hn = self.rms_norm_with(h, Some(&layer.attn_norm));
+        let mut q = matvec(&layer.wq_a.data, layer.q_lora_dim(), layer.hidden, &hn);
+        if let Some(ref qn) = layer.q_norm {
+            q = self.rms_norm_with(&q, Some(qn));
+        }
+        if let Some(ref wq_b) = layer.wq_b {
+            let q_full = matvec(&wq_b.data, wq_b.rows(), wq_b.cols(), &q);
+            return pool_heads_to_attn(&q_full, layer.n_heads, self.attn_dim);
+        }
+        let mut out = q;
+        out.resize(self.attn_dim, 0.0);
+        out
+    }
+
+    fn project_kv_layer(
+        &self,
+        layer: &crate::weights::Layer0AttnWeights,
+        h: &[f32],
+    ) -> (Vec<f32>, Vec<f32>) {
+        let hn = self.rms_norm_with(h, Some(&layer.attn_norm));
+        let mut kv = matvec(&layer.wkv.data, layer.kv_dim(), layer.hidden, &hn);
+        if let Some(ref kn) = layer.kv_norm {
+            kv = self.rms_norm_with(&kv, Some(kn));
+        }
+        kv.resize(self.attn_dim, 0.0);
+        let v = kv.iter().map(|x| x * 0.5).collect();
+        (kv, v)
+    }
+
     fn project_q(&self, h: &[f32]) -> Vec<f32> {
-        if let Some(l0) = &self.layer0 {
-            let hn = self.rms_norm_with(h, Some(&l0.attn_norm));
-            let mut q = matvec(&l0.wq_a.data, l0.q_lora_dim(), l0.hidden, &hn);
-            if let Some(ref qn) = l0.q_norm {
-                q = self.rms_norm_with(&q, Some(qn));
-            }
-            if let Some(ref wq_b) = l0.wq_b {
-                // Full MLA Q: [n_heads * head_dim], then mean-pool heads → attn_dim.
-                let q_full = matvec(&wq_b.data, wq_b.rows(), wq_b.cols(), &q);
-                return pool_heads_to_attn(&q_full, l0.n_heads, self.attn_dim);
-            }
-            let mut out = q;
-            out.resize(self.attn_dim, 0.0);
-            return out;
+        if let Some(block) = self.layers.first() {
+            return self.project_q_layer(&block.attn, h);
         }
         matvec(&self.w_down, self.attn_dim, self.hidden, h)
     }
 
-    /// Hidden → compressed K/V (real wkv + optional kv_norm).
     fn project_kv(&self, h: &[f32]) -> (Vec<f32>, Vec<f32>) {
-        if let Some(l0) = &self.layer0 {
-            let hn = self.rms_norm_with(h, Some(&l0.attn_norm));
-            let mut kv = matvec(&l0.wkv.data, l0.kv_dim(), l0.hidden, &hn);
-            if let Some(ref kn) = l0.kv_norm {
-                kv = self.rms_norm_with(&kv, Some(kn));
-            }
-            kv.resize(self.attn_dim, 0.0);
-            let v = kv.iter().map(|x| x * 0.5).collect();
-            return (kv, v);
+        if let Some(block) = self.layers.first() {
+            return self.project_kv_layer(&block.attn, h);
         }
         let a = matvec(&self.w_down, self.attn_dim, self.hidden, h);
         let v = a.iter().map(|x| x * 0.5).collect();
         (a, v)
     }
 
-    /// Project KernelBackend attention output → model hidden.
-    ///
-    /// With `wo_b`: inject pooled attn into `o_groups × o_lora` intermediate,
-    /// optionally add `wo_a @ h_resid`, then `wo_b @ mid`. Falls back to random `w_up`.
-    fn attn_to_hidden(&self, attn_o: &[f32], h_resid: &[f32]) -> Vec<f32> {
-        if let Some(l0) = &self.layer0 {
-            if let Some(ref wo_b) = l0.wo_b {
-                let inter = l0.o_intermediate();
-                let mut mid = vec![0.0f32; inter];
-                // Inject pooled attention into each o-group's leading dims.
-                let g = l0.o_groups.max(1);
-                let lor = l0.o_lora_rank.max(1);
-                let take = attn_o.len().min(lor);
-                let scale = 1.0 / (g as f32).sqrt();
-                for gi in 0..g {
-                    let base = gi * lor;
-                    for d in 0..take {
-                        mid[base + d] += attn_o[d] * scale;
-                    }
+    fn attn_to_hidden_layer(
+        &self,
+        layer: &crate::weights::Layer0AttnWeights,
+        attn_o: &[f32],
+        h_resid: &[f32],
+    ) -> Vec<f32> {
+        if let Some(ref wo_b) = layer.wo_b {
+            let inter = layer.o_intermediate();
+            let mut mid = vec![0.0f32; inter];
+            let g = layer.o_groups.max(1);
+            let lor = layer.o_lora_rank.max(1);
+            let take = attn_o.len().min(lor);
+            let scale = 1.0 / (g as f32).sqrt();
+            for gi in 0..g {
+                let base = gi * lor;
+                for d in 0..take {
+                    mid[base + d] += attn_o[d] * scale;
                 }
-                // Residual-side factor when present: mid += wo_a @ h_resid
-                if let Some(ref wo_a) = l0.wo_a {
-                    if wo_a.rows() == inter && wo_a.cols() == l0.hidden && h_resid.len() == l0.hidden
-                    {
-                        let add = matvec(&wo_a.data, inter, l0.hidden, h_resid);
-                        for (m, a) in mid.iter_mut().zip(add.iter()) {
-                            *m += *a;
-                        }
-                    }
-                }
-                return matvec(&wo_b.data, l0.hidden, inter, &mid);
             }
+            if let Some(ref wo_a) = layer.wo_a {
+                if wo_a.rows() == inter && wo_a.cols() == layer.hidden && h_resid.len() == layer.hidden
+                {
+                    let add = matvec(&wo_a.data, inter, layer.hidden, h_resid);
+                    for (m, a) in mid.iter_mut().zip(add.iter()) {
+                        *m += *a;
+                    }
+                }
+            }
+            return matvec(&wo_b.data, layer.hidden, inter, &mid);
         }
         matvec(&self.w_up, self.hidden, self.attn_dim, attn_o)
     }
 
-    /// Shared-expert SwiGLU residual: `h + w2(silu(w1·n) ⊙ w3·n)`.
-    fn shared_ffn_residual(&self, h: &[f32]) -> Vec<f32> {
-        let Some(ffn) = &self.layer0_ffn else {
-            return h.to_vec();
-        };
+    fn attn_to_hidden(&self, attn_o: &[f32], h_resid: &[f32]) -> Vec<f32> {
+        if let Some(block) = self.layers.first() {
+            return self.attn_to_hidden_layer(&block.attn, attn_o, h_resid);
+        }
+        matvec(&self.w_up, self.hidden, self.attn_dim, attn_o)
+    }
+
+    fn shared_ffn_residual_block(
+        &self,
+        ffn: &crate::weights::Layer0SharedFfn,
+        h: &[f32],
+    ) -> Vec<f32> {
         let n = self.rms_norm_with(h, Some(&ffn.ffn_norm));
         let delta = swiglu_delta(
             &n,
@@ -444,14 +433,14 @@ impl ModelWeights {
         out
     }
 
-    /// Routed MoE residual: `h + route_scale * Σ w_i * expert_i(ffn_norm(h))`.
-    fn routed_moe_residual(&self, h: &[f32]) -> Vec<f32> {
-        let Some(moe) = &self.layer0_moe else {
-            return h.to_vec();
-        };
-        // Reuse shared ffn_norm when present; else bare h.
-        let n = if let Some(ffn) = &self.layer0_ffn {
-            self.rms_norm_with(h, Some(&ffn.ffn_norm))
+    fn routed_moe_residual_block(
+        &self,
+        moe: &crate::weights::Layer0RoutedMoe,
+        ffn_norm: Option<&[f32]>,
+        h: &[f32],
+    ) -> Vec<f32> {
+        let n = if let Some(g) = ffn_norm {
+            self.rms_norm_with(h, Some(g))
         } else {
             h.to_vec()
         };
@@ -486,15 +475,19 @@ impl ModelWeights {
     }
 
     fn has_layer0(&self) -> bool {
-        self.layer0.is_some()
+        !self.layers.is_empty()
     }
 
     fn has_layer0_ffn(&self) -> bool {
-        self.layer0_ffn.is_some()
+        self.layers.first().and_then(|l| l.ffn.as_ref()).is_some()
     }
 
     fn has_layer0_moe(&self) -> bool {
-        self.layer0_moe.is_some()
+        self.layers.first().and_then(|l| l.moe.as_ref()).is_some()
+    }
+
+    fn n_layers(&self) -> usize {
+        self.layers.len()
     }
 
     fn logits(&self, h: &[f32]) -> Vec<f32> {
@@ -531,6 +524,22 @@ fn random_projections(hidden: usize, attn_dim: usize, seed: u64) -> (Vec<f32>, V
         w_up.push(rnd());
     }
     (w_down, w_up)
+}
+
+
+/// How many transformer layers to load for the local runner.
+///
+/// `TRAJECT_LOCAL_LAYERS` env (default 2, min 1, max 8 for memory safety).
+fn local_layer_count(cfg: Option<&crate::weights::HfModelConfig>) -> usize {
+    let env = std::env::var("TRAJECT_LOCAL_LAYERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok());
+    let n = env.unwrap_or(2).max(1);
+    let max_model = cfg
+        .and_then(|c| c.num_hidden_layers)
+        .map(|x| x as usize)
+        .unwrap_or(43);
+    n.min(max_model).min(8)
 }
 
 fn matvec(w: &[f32], out_dim: usize, in_dim: usize, x: &[f32]) -> Vec<f32> {
@@ -764,19 +773,23 @@ impl LocalWeightRunner {
     /// Whether MLA Q expand (`wq_b`) was loaded.
     pub fn has_layer0_q_expand(&self) -> bool {
         self.weights
-            .layer0
-            .as_ref()
-            .map(|l| l.has_q_expand())
+            .layers
+            .first()
+            .map(|l| l.attn.has_q_expand())
             .unwrap_or(false)
     }
 
     /// Whether real `wo_b` output projection was loaded.
     pub fn has_layer0_o_proj(&self) -> bool {
         self.weights
-            .layer0
-            .as_ref()
-            .map(|l| l.has_o_proj())
+            .layers
+            .first()
+            .map(|l| l.attn.has_o_proj())
             .unwrap_or(false)
+    }
+
+    pub fn n_layers(&self) -> usize {
+        self.weights.n_layers()
     }
 
     /// Whether routed MoE gate was loaded.
@@ -856,47 +869,72 @@ impl InferenceBackend for LocalWeightRunner {
             kv.bind_prefix(req.trajectory_id, prefix.clone());
         }
 
-        // Prefill: embed → (layer-0 wq_a/wkv or toy down) → physical KV.
         let heads = self.cfg.num_heads as usize;
-        let dim = self.weights.attn_dim / heads.max(1);
-        let dim = dim.max(1);
-        let attn_dim = heads * dim;
-        // Prefer weight-side dim when layer-0 fixed kv_lora width.
-        let attn_dim = self.weights.attn_dim.max(attn_dim);
-        let dim = attn_dim / heads.max(1);
-        let dim = dim.max(1);
+        let attn_dim = self.weights.attn_dim.max(1);
+        let dim = (attn_dim / heads.max(1)).max(1);
+        let n_layers = self.weights.n_layers().max(1);
 
+        // Prefill prompt through the full layer stack (per-layer KV under prefix:L{i}).
         if req.decoded_so_far == 0 {
             for &tid in &prompt_ids {
-                let emb = self.weights.embed_token(tid);
-                let (mut kk, mut vv) = self.weights.project_kv(&emb);
-                kk.resize(attn_dim, 0.0);
-                vv.resize(attn_dim, 0.0);
-                self.kv.lock().append_kv(&prefix, &kk, &vv);
-            }
-            if let Some(&last) = prompt_ids.last() {
-                let emb = self.weights.embed_token(last);
-                let mut qq = self.weights.project_q(&emb);
-                qq.resize(attn_dim, 0.0);
-                let (k_cache, v_cache, seq_len) = self.kv.lock().materialize_kv(&prefix);
-                if seq_len > 0 {
-                    let _ = self
-                        .kernel
-                        .prefill(PrefillRequest {
-                            q: qq,
-                            k: k_cache,
-                            v: v_cache,
-                            num_tokens: 1,
-                            num_heads: self.cfg.num_heads,
-                            head_dim: dim as u32,
-                            layout: KvLayout::Nhd,
-                        })
-                        .await;
+                let mut h = self.weights.embed_token(tid);
+                if self.weights.layers.is_empty() {
+                    let (mut kk, mut vv) = self.weights.project_kv(&h);
+                    kk.resize(attn_dim, 0.0);
+                    vv.resize(attn_dim, 0.0);
+                    self.kv.lock().append_kv(&prefix, &kk, &vv);
+                } else {
+                    for (li, block) in self.weights.layers.iter().enumerate() {
+                        let pfx = format!("{prefix}:L{li}");
+                        let (mut kk, mut vv) = self.weights.project_kv_layer(&block.attn, &h);
+                        kk.resize(attn_dim, 0.0);
+                        vv.resize(attn_dim, 0.0);
+                        self.kv.lock().append_kv(&pfx, &kk, &vv);
+                        let mut qq = self.weights.project_q_layer(&block.attn, &h);
+                        qq.resize(attn_dim, 0.0);
+                        let (k_cache, v_cache, seq_len) = self.kv.lock().materialize_kv(&pfx);
+                        if seq_len > 0 {
+                            if let Ok(dec) = self
+                                .kernel
+                                .decode(DecodeRequest {
+                                    q: qq,
+                                    k_cache,
+                                    v_cache,
+                                    seq_len,
+                                    num_heads: self.cfg.num_heads,
+                                    head_dim: dim as u32,
+                                    layout: KvLayout::Nhd,
+                                })
+                                .await
+                            {
+                                let mut attn_o = dec.o;
+                                attn_o.resize(attn_dim, 0.0);
+                                let delta =
+                                    self.weights.attn_to_hidden_layer(&block.attn, &attn_o, &h);
+                                if block.attn.has_o_proj() {
+                                    for (a, b) in h.iter_mut().zip(delta.iter()) {
+                                        *a += *b;
+                                    }
+                                } else {
+                                    for (a, b) in h.iter_mut().zip(delta.iter()) {
+                                        *a = 0.5 * *a + 0.5 * *b;
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(ref ffn) = block.ffn {
+                            h = self.weights.shared_ffn_residual_block(ffn, &h);
+                        }
+                        if let Some(ref moe) = block.moe {
+                            let norm = block.ffn.as_ref().map(|f| f.ffn_norm.as_slice());
+                            h = self.weights.routed_moe_residual_block(moe, norm, &h);
+                        }
+                    }
                 }
             }
         }
 
-        // Decode tokens for this chunk.
+        // Decode tokens for this chunk (one new token at a time through stack).
         let budget = req
             .chunk_tokens
             .min(req.max_tokens.saturating_sub(req.decoded_so_far))
@@ -907,56 +945,91 @@ impl InferenceBackend for LocalWeightRunner {
         let eos = self.weights.eos_token_id;
 
         for _ in 0..budget {
-            let (k_cache, v_cache, seq_len) = self.kv.lock().materialize_kv(&prefix);
-            if seq_len == 0 {
-                break;
-            }
             let last_tid = out_ids
                 .last()
                 .copied()
                 .or_else(|| prompt_ids.last().copied())
                 .unwrap_or(1);
-            let emb = self.weights.embed_token(last_tid);
-            let mut q = self.weights.project_q(&emb);
-            q.resize(attn_dim, 0.0);
-            let dec = self
-                .kernel
-                .decode(DecodeRequest {
-                    q,
-                    k_cache,
-                    v_cache,
-                    seq_len,
-                    num_heads: self.cfg.num_heads,
-                    head_dim: dim as u32,
-                    layout: KvLayout::Nhd,
-                })
-                .await
-                .map_err(|e| TrajectError::Inference(format!("local decode: {e}")))?;
+            let mut h = self.weights.embed_token(last_tid);
 
-            // Map attention output → hidden via real wo_* when present, else w_up.
-            let mut attn_o = dec.o;
-            attn_o.resize(attn_dim, 0.0);
-            let attn_h = self.weights.attn_to_hidden(&attn_o, &emb);
-            // residual: h = emb + attn_delta (standard transformer; was 0.5 blend before wo)
-            let mut h = emb.clone();
-            if self
-                .weights
-                .layer0
-                .as_ref()
-                .map(|l| l.has_o_proj())
-                .unwrap_or(false)
-            {
-                for (a, b) in h.iter_mut().zip(attn_h.iter()) {
-                    *a += *b;
+            if self.weights.layers.is_empty() {
+                let (k_cache, v_cache, seq_len) = self.kv.lock().materialize_kv(&prefix);
+                if seq_len == 0 {
+                    break;
                 }
-            } else {
+                let mut q = self.weights.project_q(&h);
+                q.resize(attn_dim, 0.0);
+                let dec = self
+                    .kernel
+                    .decode(DecodeRequest {
+                        q,
+                        k_cache,
+                        v_cache,
+                        seq_len,
+                        num_heads: self.cfg.num_heads,
+                        head_dim: dim as u32,
+                        layout: KvLayout::Nhd,
+                    })
+                    .await
+                    .map_err(|e| TrajectError::Inference(format!("local decode: {e}")))?;
+                let mut attn_o = dec.o;
+                attn_o.resize(attn_dim, 0.0);
+                let attn_h = self.weights.attn_to_hidden(&attn_o, &h);
                 for (a, b) in h.iter_mut().zip(attn_h.iter()) {
                     *a = 0.5 * *a + 0.5 * *b;
                 }
+            } else {
+                for (li, block) in self.weights.layers.iter().enumerate() {
+                    let pfx = format!("{prefix}:L{li}");
+                    // Append this token's KV for the layer before attending (decode step).
+                    // On first decode after prefill, prompt KVs already exist; we still
+                    // attend with current h as Q without re-appending prompt tokens.
+                    let mut qq = self.weights.project_q_layer(&block.attn, &h);
+                    qq.resize(attn_dim, 0.0);
+                    let (k_cache, v_cache, seq_len) = self.kv.lock().materialize_kv(&pfx);
+                    if seq_len == 0 {
+                        // No cache yet — seed with this token.
+                        let (mut kk, mut vv) = self.weights.project_kv_layer(&block.attn, &h);
+                        kk.resize(attn_dim, 0.0);
+                        vv.resize(attn_dim, 0.0);
+                        self.kv.lock().append_kv(&pfx, &kk, &vv);
+                        continue;
+                    }
+                    let dec = self
+                        .kernel
+                        .decode(DecodeRequest {
+                            q: qq,
+                            k_cache,
+                            v_cache,
+                            seq_len,
+                            num_heads: self.cfg.num_heads,
+                            head_dim: dim as u32,
+                            layout: KvLayout::Nhd,
+                        })
+                        .await
+                        .map_err(|e| TrajectError::Inference(format!("local decode L{li}: {e}")))?;
+                    let mut attn_o = dec.o;
+                    attn_o.resize(attn_dim, 0.0);
+                    let delta = self.weights.attn_to_hidden_layer(&block.attn, &attn_o, &h);
+                    if block.attn.has_o_proj() {
+                        for (a, b) in h.iter_mut().zip(delta.iter()) {
+                            *a += *b;
+                        }
+                    } else {
+                        for (a, b) in h.iter_mut().zip(delta.iter()) {
+                            *a = 0.5 * *a + 0.5 * *b;
+                        }
+                    }
+                    if let Some(ref ffn) = block.ffn {
+                        h = self.weights.shared_ffn_residual_block(ffn, &h);
+                    }
+                    if let Some(ref moe) = block.moe {
+                        let norm = block.ffn.as_ref().map(|f| f.ffn_norm.as_slice());
+                        h = self.weights.routed_moe_residual_block(moe, norm, &h);
+                    }
+                }
             }
-            // Shared expert + routed MoE (FP4 top-k) residuals.
-            h = self.weights.shared_ffn_residual(&h);
-            h = self.weights.routed_moe_residual(&h);
+
             let logits = self.weights.logits(&h);
             let sampled = self
                 .kernel
@@ -968,11 +1041,30 @@ impl InferenceBackend for LocalWeightRunner {
                 .await?;
 
             let tid = sampled.token_id % self.weights.vocab;
+            // Append new-token KV for every layer after sampling (for next step).
             let emb_n = self.weights.embed_token(tid);
-            let (mut k, mut v) = self.weights.project_kv(&emb_n);
-            k.resize(attn_dim, 0.0);
-            v.resize(attn_dim, 0.0);
-            self.kv.lock().append_kv(&prefix, &k, &v);
+            if self.weights.layers.is_empty() {
+                let (mut k, mut v) = self.weights.project_kv(&emb_n);
+                k.resize(attn_dim, 0.0);
+                v.resize(attn_dim, 0.0);
+                self.kv.lock().append_kv(&prefix, &k, &v);
+            } else {
+                // Run the new token embedding through layers only to write KV
+                // (cheap path: project from emb_n at each layer without full FFN).
+                let mut hh = emb_n;
+                for (li, block) in self.weights.layers.iter().enumerate() {
+                    let pfx = format!("{prefix}:L{li}");
+                    let (mut k, mut v) = self.weights.project_kv_layer(&block.attn, &hh);
+                    k.resize(attn_dim, 0.0);
+                    v.resize(attn_dim, 0.0);
+                    self.kv.lock().append_kv(&pfx, &k, &v);
+                    // Advance residual lightly so deeper layers see something non-constant.
+                    if let Some(ref ffn) = block.ffn {
+                        hh = self.weights.shared_ffn_residual_block(ffn, &hh);
+                    }
+                }
+            }
+            let _ = n_layers; // used in logs
 
             out_ids.push(tid);
             if self.tokenizer.is_some() {
@@ -1014,17 +1106,18 @@ impl InferenceBackend for LocalWeightRunner {
             has_layer0_ffn = self.weights.has_layer0_ffn(),
             has_q_expand = self
                 .weights
-                .layer0
-                .as_ref()
-                .map(|l| l.has_q_expand())
+                .layers
+                .first()
+                .map(|l| l.attn.has_q_expand())
                 .unwrap_or(false),
             has_o_proj = self
                 .weights
-                .layer0
-                .as_ref()
-                .map(|l| l.has_o_proj())
+                .layers
+                .first()
+                .map(|l| l.attn.has_o_proj())
                 .unwrap_or(false),
             has_moe = self.weights.has_layer0_moe(),
+            n_layers = self.weights.n_layers(),
             kernel = self.kernel.name(),
             "local weight runner chunk"
         );
@@ -1050,8 +1143,14 @@ impl InferenceBackend for LocalWeightRunner {
     }
 
     async fn free_prefix(&self, prefix_id: &str, _session_id: Option<&str>) -> Result<()> {
-        let n = self.kv.lock().free_prefix(prefix_id);
-        info!(%prefix_id, pages_zeroed = n, "local runner physical KV free");
+        let mut total = 0;
+        total += self.kv.lock().free_prefix(prefix_id);
+        // Per-layer KV keys used by multi-layer stack.
+        for li in 0..self.weights.n_layers().max(1) {
+            let pfx = format!("{prefix_id}:L{li}");
+            total += self.kv.lock().free_prefix(&pfx);
+        }
+        info!(%prefix_id, pages_zeroed = total, "local runner physical KV free");
         Ok(())
     }
 }
