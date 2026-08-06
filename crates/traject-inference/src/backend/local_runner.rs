@@ -1,7 +1,7 @@
 //! In-process weight runner with **physical paged KV** owned by Traject.
 //!
 //! This is the Phase-1 endgame shape (not full MoE parity yet):
-//! - Tokenize (byte-hash toy or caller-provided ids)
+//! - Tokenize via HF `tokenizer.json` (or byte-hash toy fallback)
 //! - Embed + single-layer attention via [`KernelBackend`]
 //! - Sample next token
 //! - Store K/V in [`PagedKvPool`] keyed by MemoryManager-style prefix handles
@@ -15,12 +15,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use traject_core::{FinishReason, Result, TrajectError, TrajectoryId};
 
 use crate::kernel::{
     CpuRefKernel, DecodeRequest, KernelBackend, KvLayout, PrefillRequest, SampleRequest,
 };
+use crate::tokenizer::HfTokenizer;
 use crate::{ChunkRequest, ChunkResult, InferenceBackend};
 
 /// One physical KV page (mirrors engine block_size pages).
@@ -386,14 +387,33 @@ pub struct LocalWeightRunner {
     weights: ModelWeights,
     kv: Mutex<PagedKvPool>,
     cfg: LocalWeightConfig,
+    /// Official HF tokenizer when `model_dir/tokenizer.json` is present.
+    tokenizer: Option<HfTokenizer>,
 }
 
 impl LocalWeightRunner {
     pub fn new(cfg: LocalWeightConfig) -> Self {
         let attn_dim = (cfg.num_heads * cfg.head_dim) as usize;
+        let tokenizer = cfg.model_dir.as_ref().and_then(|dir| {
+            match HfTokenizer::from_model_dir(dir) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    warn!(error = %e, dir = %dir.display(), "HF tokenizer not loaded; using toy encode");
+                    None
+                }
+            }
+        });
         let weights = if let Some(dir) = &cfg.model_dir {
             match ModelWeights::from_safetensors(dir, cfg.num_heads, cfg.head_dim) {
-                Ok(w) => w,
+                Ok(mut w) => {
+                    // Prefer tokenizer EOS when weights config lacked it.
+                    if w.eos_token_id.is_none() {
+                        if let Some(t) = &tokenizer {
+                            w.eos_token_id = t.eos_token_id();
+                        }
+                    }
+                    w
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "safetensors load failed; falling back to toy weights");
                     ModelWeights::toy(cfg.vocab_size, attn_dim.max(64), attn_dim)
@@ -414,10 +434,11 @@ impl LocalWeightRunner {
                 pool_dim,
             )),
             cfg,
+            tokenizer,
         }
     }
 
-    /// Load real embed/head/norm from a HuggingFace model directory.
+    /// Load real embed/head/norm (+ tokenizer) from a HuggingFace model directory.
     pub fn from_model_dir(model_dir: impl Into<std::path::PathBuf>) -> Result<Self> {
         let model_dir = model_dir.into();
         let mut cfg = LocalWeightConfig::default();
@@ -441,22 +462,39 @@ impl LocalWeightRunner {
         &self.weights.source
     }
 
+    /// Whether an official HF tokenizer was loaded.
+    pub fn has_tokenizer(&self) -> bool {
+        self.tokenizer.is_some()
+    }
+
     pub fn pages_allocated(&self) -> usize {
         self.kv.lock().pages_allocated()
     }
 
-    fn tokenize(text: &str, vocab: u32) -> Vec<u32> {
-        if text.is_empty() {
-            return vec![1];
+    fn tokenize(&self, text: &str) -> Vec<u32> {
+        if let Some(tok) = &self.tokenizer {
+            match tok.encode(text, false) {
+                Ok(ids) if !ids.is_empty() => return ids,
+                Ok(_) => {
+                    warn!("tokenizer returned empty ids; falling back");
+                }
+                Err(e) => {
+                    warn!(error = %e, "tokenizer encode failed; falling back to toy");
+                }
+            }
         }
-        // Placeholder until DeepSeek encoding is wired; still drives real embed rows.
-        text.chars()
-            .map(|c| (c as u32) % vocab.max(2))
-            .collect()
+        Self::toy_tokenize(text, self.weights.vocab.max(self.cfg.vocab_size))
     }
 
-    fn detokenize(ids: &[u32]) -> String {
-        // Without official tokenizer, print token ids for real-weight runs.
+    fn detokenize(&self, ids: &[u32]) -> String {
+        if let Some(tok) = &self.tokenizer {
+            match tok.decode(ids, true) {
+                Ok(s) => return s,
+                Err(e) => {
+                    warn!(error = %e, "tokenizer decode failed; printing ids");
+                }
+            }
+        }
         format!(
             "[{}]",
             ids.iter()
@@ -464,6 +502,15 @@ impl LocalWeightRunner {
                 .collect::<Vec<_>>()
                 .join(",")
         )
+    }
+
+    fn toy_tokenize(text: &str, vocab: u32) -> Vec<u32> {
+        if text.is_empty() {
+            return vec![1];
+        }
+        text.chars()
+            .map(|c| (c as u32) % vocab.max(2))
+            .collect()
     }
 }
 
@@ -479,10 +526,7 @@ impl InferenceBackend for LocalWeightRunner {
         let prompt_ids = if !req.delta.token_ids.is_empty() {
             req.delta.token_ids.clone()
         } else {
-            Self::tokenize(
-                req.delta.text.as_deref().unwrap_or("?"),
-                self.cfg.vocab_size,
-            )
+            self.tokenize(req.delta.text.as_deref().unwrap_or("?"))
         };
 
         {
@@ -599,22 +643,25 @@ impl InferenceBackend for LocalWeightRunner {
             self.kv.lock().append_kv(&prefix, &k, &v);
 
             out_ids.push(tid);
-            if self.weights.source.starts_with("safetensors") {
-                // keep compact; full detok needs official encoding
-            } else {
-                out_text.push_str(&Self::detokenize(&[tid]));
+            if self.tokenizer.is_some() {
+                // Decode full sequence at end for correct BPE boundaries.
+            } else if !self.weights.source.starts_with("safetensors") {
+                out_text.push_str(&self.detokenize(&[tid]));
             }
 
             if eos == Some(tid) {
                 break;
             }
-            if !self.weights.source.starts_with("safetensors") && tid % 97 == 0 {
+            if self.tokenizer.is_none()
+                && !self.weights.source.starts_with("safetensors")
+                && tid % 97 == 0
+            {
                 break;
             }
         }
 
-        if self.weights.source.starts_with("safetensors") {
-            out_text = Self::detokenize(&out_ids);
+        if self.tokenizer.is_some() || self.weights.source.starts_with("safetensors") {
+            out_text = self.detokenize(&out_ids);
         }
 
         let produced = out_ids.len() as u32;
@@ -630,6 +677,7 @@ impl InferenceBackend for LocalWeightRunner {
             pages = self.pages_allocated(),
             source = %self.weights.source,
             vocab = self.weights.vocab,
+            has_tokenizer = self.tokenizer.is_some(),
             "local weight runner chunk"
         );
 

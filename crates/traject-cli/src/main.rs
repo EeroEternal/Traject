@@ -98,7 +98,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             match LocalWeightRunner::from_model_dir(&model_path) {
                 Ok(runner) => {
-                    tracing::info!(source = %runner.weight_source(), "weights ready");
+                    tracing::info!(
+                        source = %runner.weight_source(),
+                        has_tokenizer = runner.has_tokenizer(),
+                        "weights ready"
+                    );
                     driver.with_backend(runner)
                 }
                 Err(e) => {

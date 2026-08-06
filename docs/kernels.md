@@ -72,11 +72,16 @@ Loaded tensors (V4 naming): `embed.weight`, `head.weight`, `norm.weight` via
 sglang-lite; local runner uses real embed→(proxy attention)→real lm_head so
 logits live in the true 129280-way vocab.
 
+Also loads `tokenizer.json` via the HuggingFace `tokenizers` crate
+(`HfTokenizer`) for real BPE text↔ids. (Model-repo `encoding_dsv4` is a chat
+template helper, not the BPE vocab.) Without `tokenizer.json`, falls back to
+toy char-hash encode and id-list decode.
+
 ## Status
 
 - [x] Physical free path for sglang radix pages + V4 GPU slot clear  
 - [x] In-process `LocalWeightRunner` with paged KV free  
 - [x] Load real **embed + lm head (+ norm)** safetensors (sharded HF)  
+- [x] Official HF `tokenizer.json` via `tokenizers` crate (`HfTokenizer`; text↔ids)  
 - [ ] Full MoE / MLA layer stack in-process (still sglang for production MoE)  
-- [ ] Official DeepSeek tokenizer (encoding_dsv4) wired for text↔ids  
 - [ ] FlashInfer as default attention for LocalWeightRunner when feature on  

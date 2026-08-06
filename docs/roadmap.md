@@ -28,6 +28,7 @@
 - 执行计划：[merge-zene-sglite.md](merge-zene-sglite.md)
 - [x] In-process `LocalWeightRunner` (toy weights + physical `PagedKvPool`; CLI `--local-runner`)
 - [x] Load real **embed + head (+ norm)** safetensors (HF sharded index; V4 `embed.weight`/`head.weight`)
+- [x] Official HF `tokenizer.json` wired into `LocalWeightRunner` (`HfTokenizer` / `tokenizers` crate)
 - [ ] Full MoE/MLA layer stack in-process (prod MoE remains sglang-lite)
 - [x] Tool latency-aware pin TTL from histograms (`ToolLatencyTracker` p95)
 - [x] Prefetch pin after tool return (`PinReason::Prefetch`)
