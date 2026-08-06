@@ -30,6 +30,7 @@
 - [x] Load real **embed + head (+ norm)** safetensors (HF sharded index; V4 `embed.weight`/`head.weight`)
 - [x] Official HF `tokenizer.json` wired into `LocalWeightRunner` (`HfTokenizer` / `tokenizers` crate)
 - [x] FlashInfer default attention for `LocalWeightRunner` (`--features flashinfer`, soft-fail CPU)
+- [x] Layer-0 real attn projections (FP8 block dequant `wq_a`/`wkv` + `attn_norm`)
 - [ ] Full MoE/MLA layer stack in-process (prod MoE remains sglang-lite)
 - [x] Tool latency-aware pin TTL from histograms (`ToolLatencyTracker` p95)
 - [x] Prefetch pin after tool return (`PinReason::Prefetch`)

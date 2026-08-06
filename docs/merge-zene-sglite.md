@@ -88,6 +88,7 @@ flowchart LR
 - [x] 引擎 radix / KV 与 Traject `MemoryManager` 对齐（`engine_handle`、pin / 复用 / cache-hit / 淘汰评分）
 - [x] Zene 每步完整走 `Driver` / `Scheduler`（`run_generate_step` / `run_external_tool_step`）
 - [x] `--legacy-http` / tool-bridge 降为非默认兼容路径
-- [ ] 引擎侧 pin/free RPC（MemoryManager 淘汰时回收物理 KV）
-- [ ] 同进程权重 runner（见 [kernels.md](kernels.md)）
+- [x] 引擎侧 pin/free RPC + 物理 KV free（local `PagedKvPool` + sglang radix/V4）
+- [x] 同进程权重 runner：embed/head + tokenizer + FlashInfer + **layer-0 attn**（见 [kernels.md](kernels.md)）
+- [ ] 全层 MoE/MLA 同进程（生产仍 sglang-lite）
 - [ ] 移除 legacy 路径

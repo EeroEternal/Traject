@@ -21,7 +21,8 @@ tokio = { workspace = true }
 parking_lot = { workspace = true }
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
-safetensors = "0.4"
+# 0.8+: F8_E4M3 + F8_E8M0 for DeepSeek-V4 block-scaled weights
+safetensors = "0.8"
 memmap2 = "0.9"
 # HF tokenizer.json (BPE etc.) — DeepSeek-V4-Flash and other HF models.
 # fancy-regex avoids onig_sys (native) for easier cross-machine builds.
