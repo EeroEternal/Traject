@@ -1,0 +1,30 @@
+[package]
+name = "traject-zene"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Zene coding-agent integrated as Traject Trajectory runner"
+
+[dependencies]
+traject-core = { workspace = true }
+traject-runtime = { workspace = true }
+traject-policy = { workspace = true }
+traject-inference = { workspace = true }
+traject-memory = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+futures = { workspace = true }
+
+# Vendored Zene agent stack (in-tree)
+zene-config = { workspace = true }
+zene-core = { workspace = true }
+zene-sandbox = { workspace = true }
+zene-session = { workspace = true }
+zene-tools = { workspace = true }
+zene-llm = { workspace = true }

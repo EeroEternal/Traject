@@ -1,0 +1,89 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/traject-core",
+    "crates/traject-scheduler",
+    "crates/traject-memory",
+    "crates/traject-inference",
+    "crates/traject-tool",
+    "crates/traject-runtime",
+    "crates/traject-policy",
+    "crates/traject-api",
+    "crates/traject-cli",
+    "crates/traject-zene",
+    # Vendored Zene agent stack (no cloud)
+    "crates/zene-config",
+    "crates/zene-core",
+    "crates/zene-llm",
+    "crates/zene-sandbox",
+    "crates/zene-session",
+    "crates/zene-tools",
+    "crates/zene-mcp",
+    # Vendored sglang-lite Rust control/serving
+    "third_party/sglang-lite/control",
+    "third_party/sglang-lite/serving",
+]
+default-members = ["crates/traject-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/xinference/Traject"
+rust-version = "1.85"
+
+[workspace.dependencies]
+traject-core = { path = "crates/traject-core" }
+traject-scheduler = { path = "crates/traject-scheduler" }
+traject-memory = { path = "crates/traject-memory" }
+traject-inference = { path = "crates/traject-inference" }
+traject-tool = { path = "crates/traject-tool" }
+traject-runtime = { path = "crates/traject-runtime" }
+traject-policy = { path = "crates/traject-policy" }
+traject-api = { path = "crates/traject-api" }
+traject-zene = { path = "crates/traject-zene" }
+
+# Vendored Zene
+zene-config = { path = "crates/zene-config" }
+zene-core = { path = "crates/zene-core" }
+zene-llm = { path = "crates/zene-llm" }
+zene-sandbox = { path = "crates/zene-sandbox" }
+zene-session = { path = "crates/zene-session" }
+zene-tools = { path = "crates/zene-tools" }
+zene-mcp = { path = "crates/zene-mcp" }
+
+# Vendored sglang-lite
+sglang-lite-control = { path = "third_party/sglang-lite/control" }
+sglang-lite-serving = { path = "third_party/sglang-lite/serving" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "full"] }
+tokio-util = "0.7"
+uuid = { version = "1", features = ["v4", "serde"] }
+parking_lot = "0.12"
+dashmap = "6"
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["macros"] }
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+futures = "0.3"
+tower-http = { version = "0.6", features = ["trace"] }
+jsonschema = "0.26"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+schemars = "0.8"
+toml = "0.8"
+walkdir = "2"
+unigateway-sdk = "=2.1.1"
+llm_providers = "0.12.0"
+tiktoken-rs = "0.12"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

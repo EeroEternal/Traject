@@ -1,0 +1,23 @@
+[package]
+name = "traject-inference"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pluggable inference core for Traject"
+
+[features]
+default = []
+# Embed CPython and call FlashInfer in-process (Linux + CUDA venv).
+flashinfer = ["pyo3"]
+
+[dependencies]
+traject-core = { workspace = true }
+async-trait = "0.1"
+serde = { workspace = true }
+serde_json = "1"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+pyo3 = { version = "0.22", features = ["auto-initialize"], optional = true }
