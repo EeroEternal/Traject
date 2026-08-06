@@ -23,4 +23,7 @@ futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 safetensors = "0.4"
 memmap2 = "0.9"
+# HF tokenizer.json (BPE etc.) — DeepSeek-V4-Flash and other HF models.
+# fancy-regex avoids onig_sys (native) for easier cross-machine builds.
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 pyo3 = { version = "0.22", features = ["auto-initialize"], optional = true }

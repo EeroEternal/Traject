@@ -9,9 +9,11 @@ mod chunked;
 mod engine;
 mod gpu;
 mod kernel;
+mod tokenizer;
 mod weights;
 
 pub use weights::{load_embed_head_norm, HfModelConfig, SafetensorCatalog, TensorF32};
+pub use tokenizer::HfTokenizer;
 
 pub use backend::{
     EnginePrefixClient, HttpOpenAiBackend, KernelSmokeBackend, LocalEngineConfig,
