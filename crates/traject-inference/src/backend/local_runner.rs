@@ -335,12 +335,21 @@ impl ModelWeights {
         self.rms_norm_with(x, self.norm.as_deref())
     }
 
-    /// Hidden → Q vector in attention space (real wq_a when layer-0 present).
+    /// Hidden → Q vector in attention space.
+    ///
+    /// With layer-0: `attn_norm → wq_a → q_norm → [wq_b] → pool to attn_dim`.
     fn project_q(&self, h: &[f32]) -> Vec<f32> {
         if let Some(l0) = &self.layer0 {
             let hn = self.rms_norm_with(h, Some(&l0.attn_norm));
-            let q = matvec(&l0.wq_a.data, l0.q_dim(), l0.hidden, &hn);
-            // Truncate / pad to attn_dim for KernelBackend.
+            let mut q = matvec(&l0.wq_a.data, l0.q_lora_dim(), l0.hidden, &hn);
+            if let Some(ref qn) = l0.q_norm {
+                q = self.rms_norm_with(&q, Some(qn));
+            }
+            if let Some(ref wq_b) = l0.wq_b {
+                // Full MLA Q: [n_heads * head_dim], then mean-pool heads → attn_dim.
+                let q_full = matvec(&wq_b.data, wq_b.rows(), wq_b.cols(), &q);
+                return pool_heads_to_attn(&q_full, l0.n_heads, self.attn_dim);
+            }
             let mut out = q;
             out.resize(self.attn_dim, 0.0);
             return out;
@@ -348,11 +357,14 @@ impl ModelWeights {
         matvec(&self.w_down, self.attn_dim, self.hidden, h)
     }
 
-    /// Hidden → compressed K/V (real wkv when layer-0 present).
+    /// Hidden → compressed K/V (real wkv + optional kv_norm).
     fn project_kv(&self, h: &[f32]) -> (Vec<f32>, Vec<f32>) {
         if let Some(l0) = &self.layer0 {
             let hn = self.rms_norm_with(h, Some(&l0.attn_norm));
             let mut kv = matvec(&l0.wkv.data, l0.kv_dim(), l0.hidden, &hn);
+            if let Some(ref kn) = l0.kv_norm {
+                kv = self.rms_norm_with(&kv, Some(kn));
+            }
             kv.resize(self.attn_dim, 0.0);
             let v = kv.iter().map(|x| x * 0.5).collect();
             return (kv, v);
@@ -445,6 +457,53 @@ fn matvec(w: &[f32], out_dim: usize, in_dim: usize, x: &[f32]) -> Vec<f32> {
         y[i] = s;
     }
     y
+}
+
+/// Mean-pool multi-head Q `[n_heads * head_dim]` down to `attn_dim` (= head_dim for MQA KV).
+fn pool_heads_to_attn(q_full: &[f32], n_heads: Option<usize>, attn_dim: usize) -> Vec<f32> {
+    let n = q_full.len();
+    if n == 0 {
+        return vec![0.0; attn_dim];
+    }
+    // Prefer explicit head count when rows % heads == 0 and head_dim == attn_dim.
+    if let Some(h) = n_heads {
+        if h > 0 && n % h == 0 {
+            let head_dim = n / h;
+            if head_dim == attn_dim {
+                let mut out = vec![0.0f32; attn_dim];
+                for hi in 0..h {
+                    let base = hi * head_dim;
+                    for d in 0..head_dim {
+                        out[d] += q_full[base + d];
+                    }
+                }
+                let inv = 1.0 / h as f32;
+                for x in &mut out {
+                    *x *= inv;
+                }
+                return out;
+            }
+        }
+    }
+    // Fallback: average successive chunks of attn_dim.
+    if n >= attn_dim && n % attn_dim == 0 {
+        let chunks = n / attn_dim;
+        let mut out = vec![0.0f32; attn_dim];
+        for c in 0..chunks {
+            let base = c * attn_dim;
+            for d in 0..attn_dim {
+                out[d] += q_full[base + d];
+            }
+        }
+        let inv = 1.0 / chunks as f32;
+        for x in &mut out {
+            *x *= inv;
+        }
+        return out;
+    }
+    let mut out = q_full.to_vec();
+    out.resize(attn_dim, 0.0);
+    out
 }
 
 /// Pick FlashInfer when feature + prefer + import succeed; otherwise CPU ref.
@@ -593,6 +652,15 @@ impl LocalWeightRunner {
     /// Whether layer-0 shared-expert FFN was loaded.
     pub fn has_layer0_ffn(&self) -> bool {
         self.weights.has_layer0_ffn()
+    }
+
+    /// Whether MLA Q expand (`wq_b`) was loaded.
+    pub fn has_layer0_q_expand(&self) -> bool {
+        self.weights
+            .layer0
+            .as_ref()
+            .map(|l| l.has_q_expand())
+            .unwrap_or(false)
     }
 
     /// Name of the active attention kernel (`cpu-ref` or `flashinfer-py`).
@@ -811,6 +879,12 @@ impl InferenceBackend for LocalWeightRunner {
             has_tokenizer = self.tokenizer.is_some(),
             has_layer0 = self.weights.has_layer0(),
             has_layer0_ffn = self.weights.has_layer0_ffn(),
+            has_q_expand = self
+                .weights
+                .layer0
+                .as_ref()
+                .map(|l| l.has_q_expand())
+                .unwrap_or(false),
             kernel = self.kernel.name(),
             "local weight runner chunk"
         );
@@ -875,5 +949,16 @@ mod tests {
         assert!(runner.pages_allocated() >= 1);
         runner.free_prefix(&prefix, None).await.unwrap();
         assert_eq!(runner.pages_allocated(), 0);
+    }
+
+    #[test]
+    fn pool_heads_mean() {
+        // 2 heads × 3 dims: head0=[1,2,3], head1=[3,4,5] → mean=[2,3,4]
+        let q = vec![1.0, 2.0, 3.0, 3.0, 4.0, 5.0];
+        let out = pool_heads_to_attn(&q, Some(2), 3);
+        assert_eq!(out.len(), 3);
+        assert!((out[0] - 2.0).abs() < 1e-5);
+        assert!((out[1] - 3.0).abs() < 1e-5);
+        assert!((out[2] - 4.0).abs() < 1e-5);
     }
 }

@@ -32,6 +32,7 @@
 - [x] FlashInfer default attention for `LocalWeightRunner` (`--features flashinfer`, soft-fail CPU)
 - [x] Layer-0 real attn projections (FP8 block dequant `wq_a`/`wkv` + `attn_norm`)
 - [x] Layer-0 shared-expert SwiGLU FFN (`ffn_norm` + `w1/w2/w3`; no routed MoE)
+- [x] Layer-0 MLA Q expand (`q_norm`/`kv_norm`/`wq_b` + head mean-pool)
 - [ ] Full MoE/MLA layer stack in-process (prod MoE remains sglang-lite)
 - [x] Tool latency-aware pin TTL from histograms (`ToolLatencyTracker` p95)
 - [x] Prefetch pin after tool return (`PinReason::Prefetch`)
