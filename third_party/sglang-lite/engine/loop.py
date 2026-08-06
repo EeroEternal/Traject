@@ -278,6 +278,16 @@ class EngineLoop:
             "cache_hit_tokens": int(getattr(seq, "cache_hit_tokens", 0) or 0),
         }
 
+    def _v4_save_on_finish(self, seq: Sequence) -> None:
+        """Persist V4 prompt snapshot so the next turn in a Traject session can hit."""
+        if not getattr(self.runner, "_v4_hybrid", False):
+            return
+        try:
+            self.runner.v4_save_prompt_prefix(seq, batch_slot=0)
+        except Exception as e:  # noqa: BLE001 — never fail the stream on cache bookkeeping
+            logger = __import__("logging").getLogger("sglang_lite.loop")
+            logger.debug("v4_save_on_finish failed: %s", e)
+
     def _apply_stop_and_limits(
         self, seq: Sequence, tok: int, prev_text: str
     ) -> tuple[bool, str, Optional[int]]:
@@ -388,6 +398,8 @@ class EngineLoop:
                 finished, delta_text, emit_tok = self._apply_stop_and_limits(seq, tok, prev)
                 self._prev_text[seq.request_id] = self.runner.detokenize(seq.output_ids)
 
+                if finished:
+                    self._v4_save_on_finish(seq)
                 payload = {
                     "text": delta_text,
                     "token": emit_tok,
@@ -455,6 +467,8 @@ class EngineLoop:
             finished, delta_text, emit_tok = self._apply_stop_and_limits(seq, tok, prev)
             self._prev_text[seq.request_id] = self.runner.detokenize(seq.output_ids)
 
+            if finished:
+                self._v4_save_on_finish(seq)
             payload = {
                 "text": delta_text,
                 "token": emit_tok,

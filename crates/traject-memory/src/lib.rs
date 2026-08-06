@@ -8,6 +8,6 @@ mod tier;
 
 pub use block_pool::{BlockId, BlockPool};
 pub use eviction::{EvictionCandidate, EvictionPolicy};
-pub use manager::{MemoryManager, MemoryStats};
+pub use manager::{MemoryManager, MemoryStats, SessionBinding};
 pub use prefix_tree::{PrefixNode, PrefixTree};
 pub use tier::{MemoryTier, TierId};

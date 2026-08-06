@@ -193,9 +193,14 @@ async fn run_zene_agent(mut args: Vec<String>) -> Result<(), Box<dyn std::error:
         {
             tracing::warn!(error = %e, "engine not ready; continuing anyway");
         }
+        // For MemoryManager → engine pin RPC from ZeneRunner.
+        std::env::set_var("TRAJECT_ENGINE_URL", &engine_url);
         runner = runner.with_backend(backend);
     } else {
-        // Compatibility: OpenAI control plane + in-process tool-bridge.
+        // Demoted compatibility path only — prefer --engine-url + Driver path.
+        tracing::warn!(
+            "using demoted --legacy-http / tool-bridge path; prefer --engine-url for Traject-owned Driver/Scheduler"
+        );
         let url = backend_url.unwrap_or_else(|| "http://127.0.0.1:8000/v1".into());
         let upstream = url
             .trim_end_matches('/')

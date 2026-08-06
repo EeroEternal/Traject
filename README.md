@@ -6,8 +6,10 @@ Agent-native Runtime：以 **Trajectory** 为调度单位，把 Agent 轨迹执�
 
 - **Zene agent 栈**：`crates/zene-*`（config/core/llm/tools/sandbox/session/mcp），无 cloud
 - **sglang-lite**：`third_party/sglang-lite/`（Python `engine/` + Rust `control`/`serving`）
-- Agent LLM 主路径：`TrajectLlmProvider` → Trajectory Generate/Tool 步 → 引擎 `:9001`（带 `trajectory_id`/`session_id`/`prefix_id`，回写 `cache_hit_tokens`）
+- Agent LLM 主路径：`TrajectLlmProvider` → **Driver / Scheduler** → Generate/Tool 步 → 引擎 `:9001`（`trajectory_id`/`session_id`/`prefix_id`，回写 `cache_hit_tokens` 到 MemoryManager）
+- MemoryManager 持有 prefix 句柄（pin / 复用 / 淘汰评分）；物理 KV 仍在 sglang-lite 进程
 - 执行计划：[docs/merge-zene-sglite.md](docs/merge-zene-sglite.md)
+- 真机 e2e 记录：[docs/e2e-pro6000.md](docs/e2e-pro6000.md)
 
 ## 远端真实推理
 

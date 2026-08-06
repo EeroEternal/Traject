@@ -1,17 +1,20 @@
 use std::sync::Arc;
 
 use traject_inference::{InferenceBackend, StubBackend};
+use traject_runtime::{Driver, DriverConfig};
 use traject_zene::{TrajectLlmProvider, TrajectSession, ZeneRunConfig, ZeneRunner};
 use zene_core::AgentEvent;
 use zene_llm::{ChatRequest, Message, Provider};
 
-#[tokio::test]
-async fn traject_provider_records_generate_steps() {
+fn session_with_stub() -> TrajectSession {
     let backend: Arc<dyn InferenceBackend> = Arc::new(StubBackend::always_stop());
-    let host = Arc::new(parking_lot::Mutex::new(TrajectSession::new(
-        Arc::clone(&backend),
-        "stub-model",
-    )));
+    let driver = Driver::new(DriverConfig::default()).with_backend_arc(backend);
+    TrajectSession::new(driver, "stub-model")
+}
+
+#[tokio::test]
+async fn traject_provider_records_generate_steps_via_driver() {
+    let host = Arc::new(tokio::sync::Mutex::new(session_with_stub()));
     let provider = TrajectLlmProvider::new(Arc::clone(&host));
 
     let resp = provider
@@ -40,19 +43,17 @@ async fn traject_provider_records_generate_steps() {
         .expect("chat2");
     assert!(resp2.message.content.is_some());
 
-    let s = host.lock();
+    let s = host.lock().await;
     assert_eq!(s.generate_steps, 2);
-    assert_eq!(s.trajectory.history.len(), 2);
-    assert!(s.memory.binding(s.trajectory.id).is_some());
+    let traj = s.driver.manager.get(s.trajectory_id).unwrap();
+    assert_eq!(traj.history.len(), 2);
+    assert!(s.driver.memory.binding(s.trajectory_id).is_some());
+    assert!(s.driver.is_external(s.trajectory_id));
 }
 
 #[tokio::test]
-async fn tool_events_append_tool_steps() {
-    let backend: Arc<dyn InferenceBackend> = Arc::new(StubBackend::always_stop());
-    let host = Arc::new(parking_lot::Mutex::new(TrajectSession::new(
-        Arc::clone(&backend),
-        "stub-model",
-    )));
+async fn tool_events_go_through_driver() {
+    let host = Arc::new(tokio::sync::Mutex::new(session_with_stub()));
     let handler = TrajectSession::event_handler(Arc::clone(&host));
     handler(AgentEvent::ToolCall {
         id: "call_1".into(),
@@ -66,9 +67,14 @@ async fn tool_events_append_tool_steps() {
         is_error: false,
         duration_ms: Some(1),
     });
-    let s = host.lock();
+    let s = host.lock().await;
     assert_eq!(s.tool_steps, 1);
-    assert_eq!(s.trajectory.history.len(), 1);
+    let traj = s.driver.manager.get(s.trajectory_id).unwrap();
+    assert_eq!(traj.history.len(), 1);
+    assert!(matches!(
+        traj.history[0].outcome,
+        Some(traject_core::StepOutcome::ToolDone { .. })
+    ));
 }
 
 #[tokio::test]

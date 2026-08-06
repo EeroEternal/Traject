@@ -2,7 +2,7 @@
 
 把 Zene agent crates 与 sglang-lite（Python 引擎 + Rust control/serving）整仓并入 Traject，打通 Trajectory 感知的推理路径，使 Inference 能跟踪并优化 agent session，而不再依赖外部 HTTP 黑盒。
 
-状态：本阶段代码已合入 `main`（见 PR #1）。5090 上的 GPU 端到端验收仍需在机器上按下方 Phase D 执行。
+状态：Phase A–D 已完成。Memory 对齐与 Driver 步进路径已实现；**pro6000（8× RTX PRO 6000）真机 e2e 已通过**（见 [e2e-pro6000.md](e2e-pro6000.md)）。
 
 ## 问题
 
@@ -65,12 +65,17 @@ flowchart LR
 - vendored `engine/` 的 generate 入口记录 session，并返回 `cache_hit_tokens` 写回 Trajectory / MemoryManager
 - Agent 主路径优先 engine `/v1/generate`，不再经无状态 chat + tools 黑盒
 
-## Phase D — 5090 验收
+## Phase D — 真机验收 ✅ (pro6000, 2026-08-06)
 
-- 拉最新 `main`，用仓库内引擎：`bash scripts/start_engine.sh`
+- 引擎 `:9001` TP=8 DeepSeek-V4-Flash，`bash scripts/start_engine.sh`
 - `cargo build -p traject-cli --release`
-- 跑 [`scripts/e2e_agent_5090.sh`](../scripts/e2e_agent_5090.sh)（Glob → Read 多步）
-- 验收指标：日志出现 `trajectory_id` / `session_id` / `prefix_id`；同 Trajectory 后续 generate 有 `cache_hit_tokens`；history 可见连续 Generate / Tool 步
+- Simple generate + [`scripts/e2e_agent_5090.sh`](../scripts/e2e_agent_5090.sh)（Glob → Read 多步）
+- 验收：
+  - [x] `generate step via driver/scheduler` + `tool step via driver/scheduler`
+  - [x] history 连续 Generate/Tool（agent: generate_steps=3, tool_steps=2, history_len=5）
+  - [x] `sglang-lite generate finished` 带 trajectory/step id
+  - [x] `cache_hit_tokens` 字段回传（数值常为 0：V4 hybrid 路径物理 hit 仍待加强）
+- 细节：[e2e-pro6000.md](e2e-pro6000.md)
 
 ## 本阶段明确不做
 
@@ -80,7 +85,9 @@ flowchart LR
 
 ## 后续工作
 
-- 引擎 radix / KV 与 Traject `MemoryManager` 真正对齐（可 pin / 复用 / 淘汰）
-- Zene 每步完整走 `Driver` / `Scheduler`，而不只是 Trajectory 记账
-- 同进程权重 runner（见 [kernels.md](kernels.md)）
-- 降级并最终移除 `--legacy-http` / tool-bridge 主路径依赖
+- [x] 引擎 radix / KV 与 Traject `MemoryManager` 对齐（`engine_handle`、pin / 复用 / cache-hit / 淘汰评分）
+- [x] Zene 每步完整走 `Driver` / `Scheduler`（`run_generate_step` / `run_external_tool_step`）
+- [x] `--legacy-http` / tool-bridge 降为非默认兼容路径
+- [ ] 引擎侧 pin/free RPC（MemoryManager 淘汰时回收物理 KV）
+- [ ] 同进程权重 runner（见 [kernels.md](kernels.md)）
+- [ ] 移除 legacy 路径

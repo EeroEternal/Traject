@@ -18,14 +18,20 @@
 - [x] HTTP OpenAI backend bridge (`--backend-url`)
 - [x] Native sglang-lite engine backend (`--engine-url` → `:9001`)
 - [x] Local engine supervisor (`LocalEngineHandle` / `scripts/start_engine.sh`)
-- [x] E2E real inference on 8×5090 (DeepSeek-V4-Flash)
+- [x] E2E real inference on multi-GPU (DeepSeek-V4-Flash @ pro6000 8×PRO 6000)
 - [x] In-process `KernelBackend` + FlashInfer decode smoke (`--features flashinfer`)
 - [x] Vendored Zene agent crates (`crates/zene-*`) + TrajectLlmProvider session path
 - [x] Vendored sglang-lite (`third_party/sglang-lite`) with trajectory/session/prefix fields
-- 执行计划文档：[merge-zene-sglite.md](merge-zene-sglite.md)
+- [x] MemoryManager ↔ engine prefix handles (pin / reuse / cache-hit / eviction scoring)
+- [x] Zene steps fully via Driver/Scheduler (`run_generate_step` / `run_external_tool_step`)
+- [x] `--legacy-http` / tool-bridge demoted to non-default path
+- 执行计划：[merge-zene-sglite.md](merge-zene-sglite.md)
 - [ ] Full in-process model runner (weights + paged KV owned by MemoryManager)
-- [ ] Tool latency-aware pin TTL from histograms
-- [ ] Prefetch on predicted next Generate
+- [x] Tool latency-aware pin TTL from histograms (`ToolLatencyTracker` p95)
+- [x] Prefetch pin after tool return (`PinReason::Prefetch`)
+- [x] Engine `/v1/prefix/pin|unpin` + Driver client (logical alignment; soft-fail if offline)
+- [x] V4 prefix save fix (save by prompt ids after prefill/finish)
+- [ ] Engine-side physical KV free when MemoryManager evicts (still soft bookkeeping)
 
 ## Phase 2 – Production
 

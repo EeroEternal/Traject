@@ -48,6 +48,9 @@ _TP_MODE = False
 # thread-affine; asyncio default executors break device binding).
 _TP_CUDA_Q: "queue.Queue" = None  # type: ignore[assignment]
 _TP_CUDA_THREAD: Optional[threading.Thread] = None
+# Traject MemoryManager alignment: pin/ref + last prompt tokens per session.
+_PREFIX_PINS: Dict[str, Dict[str, Any]] = {}
+_SESSION_LAST_IDS: Dict[str, List[int]] = {}
 
 
 class ChatMessage(BaseModel):
@@ -98,6 +101,20 @@ class GenerationRequest(BaseModel):
 
 class CancelRequest(BaseModel):
     request_id: str
+
+
+class PrefixPinRequest(BaseModel):
+    """Traject MemoryManager → engine pin for tool gaps / prefetch."""
+
+    prefix_id: str
+    session_id: Optional[str] = None
+    trajectory_id: Optional[str] = None
+    ttl_ms: int = 30_000
+    reason: str = "WaitingTool"
+
+
+class PrefixUnpinRequest(BaseModel):
+    prefix_id: str
 
 
 def _input_ids_from_req(req: GenerationRequest) -> List[int]:
@@ -213,6 +230,71 @@ async def cancel(req: CancelRequest):
     return {"ok": ok, "request_id": req.request_id, "tp": _TP_MODE}
 
 
+@app.post("/v1/prefix/pin")
+async def prefix_pin(req: PrefixPinRequest):
+    """Mark a prefix handle as pinned (Traject tool-wait / prefetch)."""
+    import time
+
+    until = time.time() + max(0.001, req.ttl_ms / 1000.0)
+    entry = _PREFIX_PINS.get(req.prefix_id) or {"refs": 0}
+    entry["refs"] = int(entry.get("refs", 0)) + 1
+    entry["until"] = max(float(entry.get("until", 0)), until)
+    entry["reason"] = req.reason
+    entry["session_id"] = req.session_id
+    entry["trajectory_id"] = req.trajectory_id
+    _PREFIX_PINS[req.prefix_id] = entry
+    logger.info(
+        "prefix pin id=%s refs=%s until=%.0f reason=%s session=%s",
+        req.prefix_id,
+        entry["refs"],
+        entry["until"],
+        req.reason,
+        req.session_id,
+    )
+    return {"ok": True, "prefix_id": req.prefix_id, "refs": entry["refs"]}
+
+
+@app.post("/v1/prefix/unpin")
+async def prefix_unpin(req: PrefixUnpinRequest):
+    entry = _PREFIX_PINS.get(req.prefix_id)
+    if not entry:
+        return {"ok": True, "prefix_id": req.prefix_id, "refs": 0}
+    entry["refs"] = max(0, int(entry.get("refs", 1)) - 1)
+    if entry["refs"] == 0:
+        _PREFIX_PINS.pop(req.prefix_id, None)
+    else:
+        _PREFIX_PINS[req.prefix_id] = entry
+    logger.info("prefix unpin id=%s refs=%s", req.prefix_id, entry["refs"])
+    return {"ok": True, "prefix_id": req.prefix_id, "refs": entry["refs"]}
+
+
+@app.get("/v1/prefix/stats")
+async def prefix_stats():
+    import time
+
+    now = time.time()
+    live = {
+        k: v
+        for k, v in _PREFIX_PINS.items()
+        if float(v.get("until", 0)) > now or int(v.get("refs", 0)) > 0
+    }
+    return {
+        "pinned": len(live),
+        "sessions_tracked": len(_SESSION_LAST_IDS),
+        "pins": {
+            k: {"refs": v.get("refs"), "reason": v.get("reason")} for k, v in list(live.items())[:32]
+        },
+    }
+
+
+def _common_prefix_len(a: List[int], b: List[int]) -> int:
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
+
 @app.post("/v1/generate")
 async def generate(req: GenerationRequest, request: Request):
     if LOOP is None or not READY:
@@ -229,6 +311,8 @@ async def generate(req: GenerationRequest, request: Request):
             req.step_id,
             req.request_id,
         )
+    if req.prefix_id and req.prefix_id in _PREFIX_PINS:
+        logger.info("prefix_id %s is pinned refs=%s", req.prefix_id, _PREFIX_PINS[req.prefix_id].get("refs"))
     if req.model and req.model != MODEL_NAME and req.model not in list_verified_models():
         return JSONResponse(
             {
@@ -254,6 +338,20 @@ async def generate(req: GenerationRequest, request: Request):
             {"error": {"message": "empty prompt after tokenization", "type": "invalid_request_error"}},
             status_code=400,
         )
+
+    # Session continuity: log LCP vs last turn (helps diagnose Traject multi-turn).
+    if req.session_id:
+        prev = _SESSION_LAST_IDS.get(req.session_id)
+        if prev:
+            lcp = _common_prefix_len(prev, input_ids)
+            logger.info(
+                "session %s prompt_lcp=%s prev_len=%s new_len=%s",
+                req.session_id,
+                lcp,
+                len(prev),
+                len(input_ids),
+            )
+        _SESSION_LAST_IDS[req.session_id] = list(input_ids)
 
     if _TP_MODE:
         return await _generate_tp(req, request, input_ids)

@@ -2,8 +2,9 @@
 //!
 //! Architecture:
 //! - Vendored Zene owns agent semantics (ReAct loop, tools, permissions, plan mode)
-//! - Traject owns Trajectory ledger, MemoryManager prefix tree, and inference
-//!   (`TrajectLlmProvider` → sglang-lite engine with session/prefix metadata)
+//! - Every LLM / Tool step goes through Traject `Driver` → `Scheduler` →
+//!   `MemoryManager` + `InferenceEngine` (sglang-lite with session/prefix metadata)
+//! - `--legacy-http` / tool-bridge remains a demoted compatibility path only
 
 mod provider;
 mod runner;

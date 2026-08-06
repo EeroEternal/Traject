@@ -11,6 +11,7 @@ traject-runtime = { workspace = true }
 traject-policy = { workspace = true }
 traject-inference = { workspace = true }
 traject-memory = { workspace = true }
+traject-scheduler = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 parking_lot = { workspace = true }

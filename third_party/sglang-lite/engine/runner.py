@@ -741,14 +741,31 @@ class ModelRunner:
         self.model_forward_count += 1
         self.last_model_forward_size = int(input_ids.shape[0])
         out = self.model(input_ids, start_pos=int(start_pos))
-        if isinstance(out, torch.Tensor):
-            logits = out
-        else:
-            logits = out.logits
+        logits = self._coerce_logits(out)
         # Official returns last-position logits [B, vocab]; accept [B, T, vocab] too.
         if logits.dim() == 3:
             logits = logits[:, -1, :]
+        elif logits.dim() == 1:
+            logits = logits.unsqueeze(0)
         return logits
+
+    @staticmethod
+    def _coerce_logits(out) -> torch.Tensor:
+        """Normalize model outputs: Tensor | ModelOutput | tuple/list of tensors."""
+        if isinstance(out, torch.Tensor):
+            return out
+        # Prefer named .logits when present (and not a bare tuple).
+        if not isinstance(out, (tuple, list)) and hasattr(out, "logits"):
+            lg = getattr(out, "logits")
+            if torch.is_tensor(lg):
+                return lg
+        if isinstance(out, (tuple, list)):
+            tensors = [x for x in out if torch.is_tensor(x) and x.dim() >= 1]
+            if not tensors:
+                raise TypeError(f"no tensor in model output tuple: {type(out)}")
+            # Vocab logits usually have the largest last dimension.
+            return max(tensors, key=lambda t: int(t.shape[-1]) if t.dim() >= 1 else 0)
+        raise TypeError(f"unexpected model output type: {type(out)}")
 
     def v4_match_prefix(self, token_ids: List[int]):
         """Match ``token_ids`` against the Hybrid V4 prefix snapshot store."""
@@ -792,11 +809,18 @@ class ModelRunner:
         seq._v4_slot_prepared = False
 
     def _v4_maybe_save_prefix(self, seq: Sequence, *, batch_slot: int = 0) -> None:
-        """Snapshot official KV after a completed prompt prefill."""
+        """Snapshot official KV after a completed prompt prefill.
+
+        Keys the cache by the *prompt* token ids (``seq.input_ids``), not the
+        growing decode length, so later requests that extend this prompt can
+        hit. Previously ``cached_len != len(input_ids)`` skipped saves once
+        decode advanced past the prompt.
+        """
         cache = self._v4_prefix_cache
         if cache is None or self.model is None:
             return
-        if seq.cached_len != len(seq.input_ids):
+        prompt_len = len(seq.input_ids)
+        if prompt_len == 0 or seq.cached_len < prompt_len:
             return
         from .v4_prefix_cache import snapshot_v4_kv
 
@@ -804,10 +828,17 @@ class ModelRunner:
         if not buffers:
             return
         cache.insert(
-            seq.input_ids[: seq.cached_len],
+            list(seq.input_ids),
             last_logits=seq.last_logits,
             buffers=buffers,
         )
+
+    def v4_save_prompt_prefix(self, seq: Sequence, *, batch_slot: int = 0) -> bool:
+        """Public save used when a sequence finishes (ensures Traject multi-turn hits)."""
+        before = len(self._v4_prefix_cache) if self._v4_prefix_cache is not None else 0
+        self._v4_maybe_save_prefix(seq, batch_slot=batch_slot)
+        after = len(self._v4_prefix_cache) if self._v4_prefix_cache is not None else 0
+        return after >= before and after > 0
 
     def _model_forward_paged(
         self,

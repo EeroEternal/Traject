@@ -13,6 +13,10 @@ pub struct GenerateRequest {
     pub delta: GenerateDelta,
     pub constraints: Constraints,
     pub max_tokens: u32,
+    /// Stable agent session across Generate/Tool turns.
+    pub session_id: Option<String>,
+    /// Engine radix / V4 prefix handle from MemoryManager.
+    pub prefix_hint: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -70,8 +74,11 @@ impl InferenceEngine {
             chunk_tokens: chunk_tokens.min(self.default_chunk.max(chunk_tokens)),
             decoded_so_far,
             max_tokens: req.max_tokens,
-            session_id: None,
-            prefix_hint: req.prefix.map(|p| p.to_string()),
+            session_id: req.session_id.clone(),
+            prefix_hint: req
+                .prefix_hint
+                .clone()
+                .or_else(|| req.prefix.map(|p| p.to_string())),
         };
         self.backend.generate_chunk(chunk).await
     }
