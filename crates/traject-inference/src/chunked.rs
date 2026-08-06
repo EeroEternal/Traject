@@ -12,6 +12,10 @@ pub struct ChunkRequest {
     pub chunk_tokens: u32,
     pub decoded_so_far: u32,
     pub max_tokens: u32,
+    /// Agent session id (stable across Generate/Tool turns).
+    pub session_id: Option<String>,
+    /// Opaque engine-side prefix hint (string form of PrefixNodeId or radix key).
+    pub prefix_hint: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -23,4 +27,6 @@ pub struct ChunkResult {
     pub finish_reason: Option<FinishReason>,
     pub tool_call: Option<ToolCall>,
     pub new_prefix: Option<PrefixNodeId>,
+    /// Tokens served from engine radix / V4 prefix cache.
+    pub cache_hit_tokens: u32,
 }

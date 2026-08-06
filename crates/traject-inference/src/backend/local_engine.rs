@@ -36,7 +36,7 @@ impl Default for LocalEngineConfig {
             port: 9001,
             tp: 8,
             cuda_home: Some(PathBuf::from("/usr/local/cuda")),
-            working_dir: Some(PathBuf::from("/home/bodesi/project/sglang-lite")),
+            working_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../third_party/sglang-lite")),
         }
     }
 }

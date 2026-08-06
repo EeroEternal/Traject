@@ -131,6 +131,7 @@ impl InferenceBackend for HttpOpenAiBackend {
             finish_reason: Some(finish_reason),
             tool_call: None,
             new_prefix: None,
+            cache_hit_tokens: 0,
         })
     }
 }

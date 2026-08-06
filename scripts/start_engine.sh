@@ -9,7 +9,7 @@ CONVERTED="${SGLANG_LITE_DSV4_CONVERTED:-/tmp/ds-v4-mp8}"
 PORT="${ENGINE_PORT:-9001}"
 TP="${TP:-8}"
 LOG_DIR="${TRAJECT_LOG_DIR:-/tmp/traject-logs}"
-LITE_ROOT="${SGLANG_LITE_ROOT:-/home/bodesi/project/sglang-lite}"
+LITE_ROOT="${SGLANG_LITE_ROOT:-$(cd "$(dirname "$0")/.." && pwd)/third_party/sglang-lite}"
 
 mkdir -p "$LOG_DIR"
 export PATH="/usr/local/cuda/bin:${VENV}/bin:${PATH}"

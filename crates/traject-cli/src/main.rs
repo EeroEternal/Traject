@@ -1,7 +1,8 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use traject_core::TrajectoryConfig;
-use traject_inference::StubMode;
+use traject_inference::{SglangLiteEngineBackend, StubMode};
 use traject_policy::ReActPolicy;
 use traject_runtime::{Driver, DriverConfig};
 
@@ -24,7 +25,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(|| "0.0.0.0:8080".parse().unwrap());
         if let Some(upstream) = upstream {
-            // Tool-bridge: OpenAI tools → text protocol → sglang-lite (no native tools).
             let upstream = upstream.trim_end_matches('/').to_string();
             tracing::info!(%addr, %upstream, "serving traject tool-bridge");
             traject_api::serve_tool_bridge(addr, upstream).await?;
@@ -34,7 +34,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // traject agent — full Zene coding agent + local GPU inference
     if args.first().map(|s| s.as_str()) == Some("agent") {
         args.remove(0);
         return run_zene_agent(args).await;
@@ -86,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             if flashinfer {
                 use traject_inference::{
-                    FlashInferKernel, FlashInferKernelConfig, KernelBackend, KernelSmokeBackend,
+                    FlashInferKernel, FlashInferKernelConfig, KernelSmokeBackend,
                 };
                 let k = FlashInferKernel::new(FlashInferKernelConfig::default())?;
                 tracing::info!(kernel = k.name(), "using in-process FlashInfer kernel");
@@ -141,8 +140,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_zene_agent(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
-    let backend_url = take_flag_value(&mut args, "--backend-url")
-        .unwrap_or_else(|| "http://127.0.0.1:8000/v1".into());
+    // Primary path: native engine (:9001). Legacy OpenAI (:8000) via --backend-url / --legacy-http.
+    let engine_url = take_flag_value(&mut args, "--engine-url")
+        .unwrap_or_else(|| "http://127.0.0.1:9001".into());
+    let backend_url = take_flag_value(&mut args, "--backend-url");
     let model = take_flag_value(&mut args, "--model")
         .unwrap_or_else(|| "/home/bodesi/models/ds-v4-flash".into());
     let workdir = take_flag_value(&mut args, "--workdir")
@@ -151,46 +152,25 @@ async fn run_zene_agent(mut args: Vec<String>) -> Result<(), Box<dyn std::error:
     let max_turns = take_flag_value(&mut args, "--max-turns")
         .and_then(|s| s.parse().ok())
         .unwrap_or(8u32);
+    let max_tokens = take_flag_value(&mut args, "--max-tokens")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1024u32);
     let no_yolo = args.iter().any(|a| a == "--no-yolo");
-    // sglang-lite rejects `tools`; by default spawn an in-process tool-bridge.
-    let direct = args.iter().any(|a| a == "--direct");
-    args.retain(|a| a != "--no-yolo" && a != "--direct");
+    let legacy_http = args.iter().any(|a| a == "--legacy-http") || backend_url.is_some();
+    args.retain(|a| a != "--no-yolo" && a != "--legacy-http" && a != "--direct");
     let prompt = args.join(" ");
     if prompt.trim().is_empty() {
         return Err(
-            "usage: traject agent [--backend-url URL] [--model ID] [--workdir DIR] [--direct] <prompt>"
-                .into(),
+            "usage: traject agent [--engine-url URL] [--workdir DIR] [--model ID] <prompt>".into(),
         );
     }
 
-    let upstream = backend_url
-        .trim_end_matches('/')
-        .trim_end_matches("/v1")
-        .to_string();
-
-    let (agent_base, _bridge_handle) = if direct {
-        tracing::info!(%backend_url, "direct mode: no tool-bridge");
-        (backend_url.clone(), None)
-    } else {
-        let (addr, handle) = traject_api::spawn_tool_bridge(upstream.clone()).await?;
-        let bridged = format!("http://{addr}/v1");
-        tracing::info!(%bridged, upstream = %upstream, "tool-bridge ready for zene");
-        (bridged, Some(handle))
-    };
-
-    tracing::info!(
-        %prompt,
-        backend_url = %agent_base,
-        %model,
-        workdir = %workdir.display(),
-        max_turns,
-        "starting zene agent on traject"
-    );
-
     let mut runner = traject_zene::ZeneRunner::new(traject_zene::ZeneRunConfig {
         workdir,
-        base_url: agent_base,
-        model,
+        base_url: backend_url
+            .clone()
+            .unwrap_or_else(|| "http://127.0.0.1:8000/v1".into()),
+        model: model.clone(),
         api_key: std::env::var("OPENAI_API_KEY")
             .or_else(|_| std::env::var("ZENE_API_KEY"))
             .unwrap_or_else(|_| "sk-traject-local".into()),
@@ -201,12 +181,43 @@ async fn run_zene_agent(mut args: Vec<String>) -> Result<(), Box<dyn std::error:
         .unwrap_or(traject_zene::AgentProfile::Coder),
         yolo: !no_yolo,
         system_prompt: None,
+        max_tokens,
     });
+
+    if !legacy_http {
+        let backend = Arc::new(SglangLiteEngineBackend::new(&engine_url, &model));
+        tracing::info!(%engine_url, %model, "agent using traject-owned sglang-lite engine");
+        if let Err(e) = backend
+            .wait_ready(std::time::Duration::from_secs(5))
+            .await
+        {
+            tracing::warn!(error = %e, "engine not ready; continuing anyway");
+        }
+        runner = runner.with_backend(backend);
+    } else {
+        // Compatibility: OpenAI control plane + in-process tool-bridge.
+        let url = backend_url.unwrap_or_else(|| "http://127.0.0.1:8000/v1".into());
+        let upstream = url
+            .trim_end_matches('/')
+            .trim_end_matches("/v1")
+            .to_string();
+        let (addr, _handle) = traject_api::spawn_tool_bridge(upstream.clone()).await?;
+        let bridged = format!("http://{addr}/v1");
+        tracing::info!(%bridged, upstream = %upstream, "legacy tool-bridge mode");
+        runner = traject_zene::ZeneRunner::new(traject_zene::ZeneRunConfig {
+            base_url: bridged,
+            ..runner.config().clone()
+        });
+    }
 
     let result = runner.prompt(&prompt).await?;
     tracing::info!(
         trajectory = %result.trajectory_id,
         workdir = %result.workdir.display(),
+        generate_steps = result.generate_steps,
+        tool_steps = result.tool_steps,
+        cache_hit_tokens = result.total_cache_hit_tokens,
+        history_len = result.history_len,
         "zene agent finished"
     );
     println!("{}", result.answer);

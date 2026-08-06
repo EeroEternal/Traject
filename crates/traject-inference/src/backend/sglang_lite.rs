@@ -1,11 +1,13 @@
 //! Native sglang-lite engine protocol (`/v1/generate` NDJSON TokenDelta).
 //!
-//! This is the low-latency path between Traject and a co-located GPU engine
-//! process (typically `:9001`). OpenAI surface stays on the Rust control plane
-//! (`:8000`); Traject prefers the engine API when available.
+//! Traject-owned path: requests carry `trajectory_id` / `session_id` / `prefix_id`
+//! so the engine (and MemoryManager) can track agent sessions across turns.
+//! Prefix reuse is performed by the engine radix/V4 cache on growing prompts;
+//! `cache_hit_tokens` is returned on the final delta.
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use serde_json::json;
 use traject_core::{FinishReason, Result, TrajectError};
 
 use crate::{ChunkRequest, ChunkResult, InferenceBackend};
@@ -60,22 +62,6 @@ impl SglangLiteEngineBackend {
     }
 }
 
-#[derive(serde::Serialize)]
-struct GenerationRequest<'a> {
-    model: &'a str,
-    messages: Vec<Msg<'a>>,
-    max_tokens: u32,
-    temperature: f32,
-    top_p: f32,
-    stream: bool,
-}
-
-#[derive(serde::Serialize)]
-struct Msg<'a> {
-    role: &'a str,
-    content: &'a str,
-}
-
 #[derive(serde::Deserialize)]
 struct TokenDelta {
     #[serde(default)]
@@ -86,6 +72,20 @@ struct TokenDelta {
     finish_reason: Option<String>,
     #[serde(default)]
     error: Option<String>,
+    #[serde(default)]
+    usage: Option<UsageDelta>,
+}
+
+#[derive(serde::Deserialize)]
+struct UsageDelta {
+    #[serde(default)]
+    cache_hit_tokens: Option<u32>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    prompt_tokens: Option<u32>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    completion_tokens: Option<u32>,
 }
 
 #[async_trait]
@@ -97,17 +97,20 @@ impl InferenceBackend for SglangLiteEngineBackend {
             .clone()
             .unwrap_or_else(|| format!("tokens:{:?}", req.delta.token_ids));
 
-        let body = GenerationRequest {
-            model: &self.model,
-            messages: vec![Msg {
-                role: "user",
-                content: &prompt,
-            }],
-            max_tokens: req.chunk_tokens.max(1).min(req.max_tokens.max(1)),
-            temperature: req.constraints.temperature.unwrap_or(0.0),
-            top_p: req.constraints.top_p.unwrap_or(1.0),
-            stream: true,
-        };
+        let request_id = format!("{}:{}", req.trajectory_id, req.step_id);
+        let body = json!({
+            "request_id": request_id,
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": req.chunk_tokens.max(1).min(req.max_tokens.max(1)),
+            "temperature": req.constraints.temperature.unwrap_or(0.0),
+            "top_p": req.constraints.top_p.unwrap_or(1.0),
+            "stream": true,
+            "trajectory_id": req.trajectory_id.to_string(),
+            "session_id": req.session_id,
+            "prefix_id": req.prefix_hint.or_else(|| req.prefix.map(|p| p.to_string())),
+            "step_id": req.step_id.to_string(),
+        });
 
         let url = format!("{}/v1/generate", self.base_url);
         let resp = self
@@ -129,6 +132,7 @@ impl InferenceBackend for SglangLiteEngineBackend {
         let mut text = String::new();
         let mut token_ids = Vec::new();
         let mut finish_reason = FinishReason::Stop;
+        let mut cache_hit_tokens = 0u32;
         let mut stream = resp.bytes_stream();
         let mut buf = String::new();
 
@@ -154,6 +158,11 @@ impl InferenceBackend for SglangLiteEngineBackend {
                 if let Some(id) = delta.token {
                     token_ids.push(id);
                 }
+                if let Some(usage) = delta.usage {
+                    if let Some(hit) = usage.cache_hit_tokens {
+                        cache_hit_tokens = hit;
+                    }
+                }
                 if let Some(reason) = delta.finish_reason.as_deref() {
                     finish_reason = match reason {
                         "length" => FinishReason::Length,
@@ -164,6 +173,14 @@ impl InferenceBackend for SglangLiteEngineBackend {
                 }
             }
         }
+
+        tracing::info!(
+            trajectory = %req.trajectory_id,
+            step = %req.step_id,
+            cache_hit_tokens,
+            out_chars = text.len(),
+            "sglang-lite generate finished"
+        );
 
         let produced = token_ids.len() as u32;
         Ok(ChunkResult {
@@ -182,6 +199,7 @@ impl InferenceBackend for SglangLiteEngineBackend {
             finish_reason: Some(finish_reason),
             tool_call: None,
             new_prefix: None,
+            cache_hit_tokens,
         })
     }
 }

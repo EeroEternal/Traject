@@ -1,0 +1,64 @@
+# Rust
+target/
+**/*.rs.bk
+
+# Python
+__pycache__/
+.ruff_cache/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE / Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Generated protobuf / gRPC (do not commit, regenerate from proto/)
+python/sglang_lite/*_pb2*.py
+python/sglang_lite/*_pb2*.pyi
+logs/
+
+# Project specific
+*.tmp
+*.bak
+sglang_lite.egg-info/
+
+# Test / benchmark outputs
+*.prof
+benchmarks/

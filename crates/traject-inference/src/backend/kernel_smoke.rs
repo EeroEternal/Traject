@@ -114,6 +114,7 @@ impl InferenceBackend for KernelSmokeBackend {
             },
             tool_call: None,
             new_prefix: None,
+            cache_hit_tokens: 0,
         })
     }
 }

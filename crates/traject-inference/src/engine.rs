@@ -70,6 +70,8 @@ impl InferenceEngine {
             chunk_tokens: chunk_tokens.min(self.default_chunk.max(chunk_tokens)),
             decoded_so_far,
             max_tokens: req.max_tokens,
+            session_id: None,
+            prefix_hint: req.prefix.map(|p| p.to_string()),
         };
         self.backend.generate_chunk(chunk).await
     }
@@ -184,6 +186,7 @@ impl InferenceBackend for StubBackend {
                 },
                 tool_call: None,
                 new_prefix: None,
+                cache_hit_tokens: 0,
             });
         }
 
@@ -216,6 +219,7 @@ impl InferenceBackend for StubBackend {
             finish_reason: Some(finish_reason),
             tool_call,
             new_prefix: None,
+            cache_hit_tokens: 0,
         })
     }
 }

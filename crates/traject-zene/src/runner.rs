@@ -1,42 +1,46 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use parking_lot::Mutex;
 use tracing::info;
-use traject_core::{Trajectory, TrajectoryConfig, TrajectoryId};
+use traject_core::{Trajectory, TrajectoryId};
+use traject_inference::InferenceBackend;
 use zene_config::{AgentProfile, ZeneConfig};
 use zene_core::{Agent, PermissionMode, PromptOptions};
+use zene_llm::ChatClient;
 use zene_sandbox::LocalSandbox;
 use zene_session::SessionRecord;
 
-/// How to reach the inference server Zene's ChatClient will call.
+use crate::provider::{finish_session, TrajectLlmProvider, TrajectSession};
+
+/// How to host Zene on Traject-owned inference.
 #[derive(Debug, Clone)]
 pub struct ZeneRunConfig {
-    /// Workspace the agent may read/write.
     pub workdir: PathBuf,
-    /// OpenAI-compatible base URL, e.g. `http://127.0.0.1:8000/v1` or Traject serve.
+    /// Fallback OpenAI base URL (only used when `engine_backend` is None).
     pub base_url: String,
-    /// Model id as known by the server.
     pub model: String,
-    /// Dummy/local API key (UniGateway requires a non-empty key).
     pub api_key: String,
     pub max_turns: u32,
     pub profile: AgentProfile,
-    /// Auto-approve tool calls (equivalent to zene `--yolo`).
     pub yolo: bool,
     pub system_prompt: Option<String>,
+    pub max_tokens: u32,
 }
 
 impl Default for ZeneRunConfig {
     fn default() -> Self {
         Self {
             workdir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            base_url: "http://127.0.0.1:8000/v1".into(),
+            base_url: "http://127.0.0.1:9001".into(),
             model: "/home/bodesi/models/ds-v4-flash".into(),
             api_key: "sk-traject-local".into(),
             max_turns: 12,
             profile: AgentProfile::Coder,
             yolo: true,
             system_prompt: None,
+            max_tokens: 1024,
         }
     }
 }
@@ -53,9 +57,7 @@ impl ZeneRunConfig {
         let mut cfg = ZeneConfig::default();
         cfg.provider = "openai".into();
         cfg.base_url = self.base_url.trim_end_matches('/').to_string();
-        // Zene's openai_base_url returns base_url as-is; unigateway appends /chat/completions.
-        // Ensure we end with /v1 if caller passed host only.
-        if !cfg.base_url.contains("/v1") {
+        if !cfg.base_url.contains("/v1") && !cfg.base_url.contains(":9001") {
             cfg.base_url = format!("{}/v1", cfg.base_url.trim_end_matches('/'));
         }
         cfg.model = self.model.clone();
@@ -72,7 +74,6 @@ impl ZeneRunConfig {
         } else {
             cfg.system_prompt = DEFAULT_TRAJECT_ZENE_PROMPT.to_string();
         }
-        // Prefer lightweight sandbox for integrated runs; Keel still available via profile.
         cfg.sandbox.profile = Some("off".into());
         cfg
     }
@@ -87,12 +88,16 @@ pub struct ZeneRunResult {
     pub trajectory_id: TrajectoryId,
     pub answer: String,
     pub workdir: PathBuf,
+    pub generate_steps: u32,
+    pub tool_steps: u32,
+    pub total_cache_hit_tokens: u32,
+    pub history_len: usize,
 }
 
-/// Hosts a Zene `Agent` and records each prompt as a Traject Trajectory.
+/// Hosts a Zene `Agent` on a Traject Trajectory + InferenceBackend.
 pub struct ZeneRunner {
     config: ZeneRunConfig,
-    /// Lightweight Trajectory ledger (Phase-1: one Trajectory per prompt).
+    backend: Option<Arc<dyn InferenceBackend>>,
     trajectories: Vec<Trajectory>,
 }
 
@@ -100,8 +105,15 @@ impl ZeneRunner {
     pub fn new(config: ZeneRunConfig) -> Self {
         Self {
             config,
+            backend: None,
             trajectories: Vec::new(),
         }
+    }
+
+    /// Route LLM steps through a Traject inference backend (sglang-lite engine).
+    pub fn with_backend(mut self, backend: Arc<dyn InferenceBackend>) -> Self {
+        self.backend = Some(backend);
+        self
     }
 
     pub fn config(&self) -> &ZeneRunConfig {
@@ -112,26 +124,11 @@ impl ZeneRunner {
         &self.trajectories
     }
 
-    /// Run one user prompt through the full Zene agent loop.
+    /// Run one user prompt through the full Zene agent loop on a Trajectory.
     pub async fn prompt(&mut self, user_input: &str) -> Result<ZeneRunResult> {
         let workdir = canonicalize_workdir(&self.config.workdir)?;
         std::fs::create_dir_all(&workdir)
             .with_context(|| format!("create workdir {}", workdir.display()))?;
-
-        let mut traj = Trajectory::create(TrajectoryConfig {
-            tenant: traject_core::TenantId::new("zene"),
-            ..TrajectoryConfig::default()
-        });
-        traj.start()?;
-        let trajectory_id = traj.id;
-
-        info!(
-            %trajectory_id,
-            workdir = %workdir.display(),
-            base_url = %self.config.base_url,
-            model = %self.config.model,
-            "zene agent turn starting"
-        );
 
         let zene_cfg = self.config.to_zene_config();
         let sandbox = LocalSandbox::new(&workdir);
@@ -142,35 +139,105 @@ impl ZeneRunner {
             PermissionMode::Default
         };
 
-        let mut agent = Agent::new(zene_cfg, sandbox, session, permission)
-            .await
-            .context("create zene agent")?;
+        let (trajectory_id, answer, stats) = if let Some(backend) = &self.backend {
+            let host = Arc::new(Mutex::new(TrajectSession::new(
+                Arc::clone(backend),
+                self.config.model.clone(),
+            )));
+            {
+                let mut s = host.lock();
+                s.max_tokens = self.config.max_tokens;
+            }
+            let trajectory_id = host.lock().trajectory_id();
+            info!(
+                %trajectory_id,
+                workdir = %workdir.display(),
+                model = %self.config.model,
+                "zene agent turn starting (traject inference)"
+            );
 
-        let answer = agent
-            .prompt(
-                user_input,
-                PromptOptions {
-                    stream: false,
-                    quiet: true,
-                    cancel: None,
-                    event_handler: None,
-                },
+            let provider = TrajectLlmProvider::new(Arc::clone(&host));
+            let client = ChatClient::from_provider(Box::new(provider));
+            let event_handler = TrajectSession::event_handler(Arc::clone(&host));
+
+            let mut agent =
+                Agent::new_with_client(zene_cfg, sandbox, session, permission, client)
+                    .await
+                    .context("create zene agent")?;
+
+            let answer = agent
+                .prompt(
+                    user_input,
+                    PromptOptions {
+                        stream: false,
+                        quiet: true,
+                        cancel: None,
+                        event_handler: Some(event_handler),
+                    },
+                )
+                .await
+                .context("zene agent prompt")?;
+
+            let traj = finish_session(&host)?;
+            let generate_steps = host.lock().generate_steps;
+            let tool_steps = host.lock().tool_steps;
+            let total_cache_hit_tokens = host.lock().total_cache_hit_tokens;
+            let history_len = traj.history.len();
+            self.trajectories.push(traj);
+
+            (
+                trajectory_id,
+                answer,
+                (generate_steps, tool_steps, total_cache_hit_tokens, history_len),
             )
-            .await
-            .context("zene agent prompt")?;
+        } else {
+            // Legacy HTTP OpenAI path (tool-bridge / external).
+            info!(
+                workdir = %workdir.display(),
+                base_url = %self.config.base_url,
+                model = %self.config.model,
+                "zene agent turn starting (legacy openai http)"
+            );
+            let mut agent = Agent::new(zene_cfg, sandbox, session, permission)
+                .await
+                .context("create zene agent")?;
+            let answer = agent
+                .prompt(
+                    user_input,
+                    PromptOptions {
+                        stream: false,
+                        quiet: true,
+                        cancel: None,
+                        event_handler: None,
+                    },
+                )
+                .await
+                .context("zene agent prompt")?;
+            (
+                TrajectoryId::new(),
+                answer,
+                (0, 0, 0, 0),
+            )
+        };
 
-        traj.memory.set_slot("answer", &answer);
-        traj.memory.scratchpad.push(format!("user: {user_input}"));
-        traj.memory.scratchpad.push(format!("assistant: {answer}"));
-        traj.finish()?;
-        self.trajectories.push(traj);
-
-        info!(%trajectory_id, answer_chars = answer.len(), "zene agent turn finished");
+        info!(
+            %trajectory_id,
+            answer_chars = answer.len(),
+            generate_steps = stats.0,
+            tool_steps = stats.1,
+            cache_hit_tokens = stats.2,
+            history_len = stats.3,
+            "zene agent turn finished"
+        );
 
         Ok(ZeneRunResult {
             trajectory_id,
             answer,
             workdir,
+            generate_steps: stats.0,
+            tool_steps: stats.1,
+            total_cache_hit_tokens: stats.2,
+            history_len: stats.3,
         })
     }
 }
@@ -190,10 +257,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn config_normalizes_v1() {
-        let mut c = ZeneRunConfig::default();
-        c.base_url = "http://127.0.0.1:8000".into();
-        let z = c.to_zene_config();
-        assert!(z.base_url.ends_with("/v1"));
+    fn config_defaults_engine_port() {
+        let c = ZeneRunConfig::default();
+        assert!(c.base_url.contains("9001"));
     }
 }

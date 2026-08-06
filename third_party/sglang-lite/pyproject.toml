@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sglang-lite"
+version = "0.2.1"
+description = "sglang-lite Python execution core (pure library): Radix KV + MoE-aware continuous batching scheduler + model runner for popular MoE models"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "pydantic>=2.0",
+    "torch>=2.3",
+    # Cache API: support both 4.x (to_legacy_cache) and 5.x (layers.keys/values).
+    # Cap <6 until a newer major is explicitly verified.
+    "transformers>=4.40,<6",
+    "accelerate>=0.30",
+    "sentencepiece>=0.2",
+    # gRPC support for unigateway integration (optional in practice, but included for completeness)
+    "grpcio>=1.60",
+    "grpcio-tools>=1.60",
+    # prometheus-client is optional (peeled to serving layer)
+]
+
+[project.scripts]
+sglang-lite-engine = "sglang_lite.process:main"
+
+[project.optional-dependencies]
+dev = ["ruff", "pytest"]
+# For production paged attention with FlashInfer (CUDA only)
+# pip install "sglang-lite[flashinfer]"
+flashinfer = ["flashinfer>=0.1.0"]  # install via --extra-index-url https://flashinfer.ai/whl/cu121/torch2.4/ etc.
+# MoE / DSV4 leaf kernels (pin after numerical alignment on target GPU)
+# pip install "sglang-lite[sgl-kernel]"
+sgl-kernel = ["sgl-kernel>=0.4.4"]
+# DeepSeek-V4 Hybrid: official inference/ + convert shards (see scripts/v4_official_smoke.sh)
+# fast-hadamard-transform: build from source with system CUDA + TORCH_CUDA_ARCH_LIST=12.0
+deepseek-v4 = ["safetensors>=0.4", "tilelang>=0.1.8", "fast-hadamard-transform>=1.0"]
+
+[tool.setuptools]
+packages = ["sglang_lite"]
+package-dir = { "sglang_lite" = "engine" }
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+markers = [
+    "gpu: tests that require CUDA + FlashInfer",
+]

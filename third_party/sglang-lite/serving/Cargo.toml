@@ -1,0 +1,31 @@
+[package]
+name = "sglang-lite-serving"
+version = "0.2.1"
+edition = "2021"
+authors = ["sglang-lite contributors"]
+description = "Official thin standalone serving wrapper for the sglang-lite inference engine."
+license = "Apache-2.0"
+rust-version = "1.75"
+
+[[bin]]
+name = "sglang-lite-serving"
+path = "src/main.rs"
+
+[dependencies]
+# sglang-lite control plane: OpenAI adapter + internal protocol
+sglang-lite-control = { path = "../control" }
+
+# Minimal deps for the thin standalone server
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+axum = { version = "0.7", features = ["macros", "tokio", "http1"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tower-http = { version = "0.5", features = ["trace", "cors"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[dev-dependencies]
+tokio-test = "0.4"

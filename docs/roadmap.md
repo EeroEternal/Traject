@@ -20,6 +20,8 @@
 - [x] Local engine supervisor (`LocalEngineHandle` / `scripts/start_engine.sh`)
 - [x] E2E real inference on 8×5090 (DeepSeek-V4-Flash)
 - [x] In-process `KernelBackend` + FlashInfer decode smoke (`--features flashinfer`)
+- [x] Vendored Zene agent crates (`crates/zene-*`) + TrajectLlmProvider session path
+- [x] Vendored sglang-lite (`third_party/sglang-lite`) with trajectory/session/prefix fields
 - [ ] Full in-process model runner (weights + paged KV owned by MemoryManager)
 - [ ] Tool latency-aware pin TTL from histograms
 - [ ] Prefetch on predicted next Generate
