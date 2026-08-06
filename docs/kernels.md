@@ -100,13 +100,18 @@ max 8). Each layer:
 Per-layer KV is keyed `{prefix}:L{i}`. Free drops base + all layer keys.
 
 **Not loaded yet:** full 43-layer production stack (memory), true multi-head
-attention without mean-pool, expert-cache catalog reuse.
+attention without mean-pool.
 
 ```bash
 export TRAJECT_LOCAL_LAYERS=2   # or 1..8
+export TRAJECT_MOE_CACHE=32     # LRU dequantized experts per MoE layer
 cargo run -p traject-cli --release -- \
   --local-runner --model /path/to/ds-v4-flash --max-tokens 4 "hello"
 ```
+
+Routed MoE keeps a **live `SafetensorCatalog`** (mmap reuse) and an **LRU** of
+dequantized experts (`TRAJECT_MOE_CACHE`, default 32). Chunk logs report
+`moe_cache=(hits, misses)`.
 
 ## Status
 
@@ -121,4 +126,5 @@ cargo run -p traject-cli --release -- \
 - [x] Layer-0 o_proj (`wo_a`/`wo_b` group inject + residual)  
 - [x] Layer-0 routed MoE (gate top-k + lazy FP4 experts)  
 - [x] Multi-layer stack (`TRAJECT_LOCAL_LAYERS`, per-layer KV)  
+- [x] MoE kept-open catalog + true LRU expert cache  
 - [ ] Full 43-layer production parity (still sglang for prod MoE)  

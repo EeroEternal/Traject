@@ -558,11 +558,102 @@ pub struct ExpertF32 {
     pub w3: TensorF32,
 }
 
-/// Layer-0 routed MoE: gate + lazy FP4 expert cache.
+/// True LRU cache of dequantized FP4 experts.
+struct ExpertLru {
+    map: HashMap<usize, ExpertF32>,
+    /// Front = oldest, back = newest.
+    order: std::collections::VecDeque<usize>,
+    cap: usize,
+    hits: u64,
+    misses: u64,
+}
+
+impl ExpertLru {
+    fn new(cap: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            cap: cap.max(1),
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    fn get(&mut self, id: usize) -> Option<ExpertF32> {
+        if let Some(e) = self.map.get(&id) {
+            self.hits += 1;
+            // move to newest
+            if let Some(pos) = self.order.iter().position(|&x| x == id) {
+                self.order.remove(pos);
+            }
+            self.order.push_back(id);
+            return Some(e.clone());
+        }
+        self.misses += 1;
+        None
+    }
+
+    fn put(&mut self, id: usize, e: ExpertF32) {
+        if self.map.contains_key(&id) {
+            self.map.insert(id, e);
+            if let Some(pos) = self.order.iter().position(|&x| x == id) {
+                self.order.remove(pos);
+            }
+            self.order.push_back(id);
+            return;
+        }
+        while self.map.len() >= self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            } else {
+                break;
+            }
+        }
+        self.map.insert(id, e);
+        self.order.push_back(id);
+    }
+}
+
+#[cfg(test)]
+mod expert_lru_tests {
+    use super::*;
+
+    fn dummy_expert(tag: f32) -> ExpertF32 {
+        ExpertF32 {
+            w1: TensorF32 {
+                data: vec![tag],
+                shape: vec![1, 1],
+            },
+            w2: TensorF32 {
+                data: vec![tag],
+                shape: vec![1, 1],
+            },
+            w3: TensorF32 {
+                data: vec![tag],
+                shape: vec![1, 1],
+            },
+        }
+    }
+
+    #[test]
+    fn lru_evicts_oldest() {
+        let mut c = ExpertLru::new(2);
+        c.put(1, dummy_expert(1.0));
+        c.put(2, dummy_expert(2.0));
+        assert!(c.get(1).is_some()); // hit; 1 newest, 2 oldest
+        c.put(3, dummy_expert(3.0)); // evict 2
+        assert!(c.get(2).is_none()); // miss
+        assert!(c.get(1).is_some()); // hit
+        assert!(c.get(3).is_some()); // hit
+        assert_eq!(c.hits, 3);
+        assert_eq!(c.misses, 1);
+    }
+}
+
+/// Routed MoE: gate + lazy FP4 expert cache with a **kept-open** safetensors catalog.
 ///
-/// Experts are **not** all loaded at once (~3GB packed); top-k are dequantized
-/// on demand and kept in a small LRU-ish cache.
-#[derive(Debug)]
+/// Experts are dequantized on demand into an LRU (default cap 32). The catalog
+/// mmaps shards once and reuses them across expert loads (no reopen per miss).
 pub struct Layer0RoutedMoe {
     pub model_dir: PathBuf,
     pub layer: usize,
@@ -573,14 +664,40 @@ pub struct Layer0RoutedMoe {
     pub route_scale: f32,
     pub hidden: usize,
     pub intermediate: usize,
-    /// expert_id → dequantized weights
-    cache: std::sync::Mutex<std::collections::HashMap<usize, ExpertF32>>,
-    cache_cap: usize,
+    catalog: std::sync::Mutex<SafetensorCatalog>,
+    cache: std::sync::Mutex<ExpertLru>,
+}
+
+impl std::fmt::Debug for Layer0RoutedMoe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Layer0RoutedMoe")
+            .field("model_dir", &self.model_dir)
+            .field("layer", &self.layer)
+            .field("n_experts", &self.n_experts)
+            .field("top_k", &self.top_k)
+            .field("route_scale", &self.route_scale)
+            .field("hidden", &self.hidden)
+            .field("intermediate", &self.intermediate)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Clone for Layer0RoutedMoe {
     fn clone(&self) -> Self {
-        // Fresh empty cache on clone (weights reloaded lazily).
+        // Re-open catalog + empty LRU (mmap state is not shared across clones).
+        let catalog = SafetensorCatalog::open(&self.model_dir).unwrap_or_else(|_| {
+            // Fallback empty catalog; expert() will error clearly.
+            SafetensorCatalog {
+                root: self.model_dir.clone(),
+                weight_map: HashMap::new(),
+                open: HashMap::new(),
+            }
+        });
+        let cap = self
+            .cache
+            .lock()
+            .map(|c| c.cap)
+            .unwrap_or(32);
         Self {
             model_dir: self.model_dir.clone(),
             layer: self.layer,
@@ -590,8 +707,8 @@ impl Clone for Layer0RoutedMoe {
             route_scale: self.route_scale,
             hidden: self.hidden,
             intermediate: self.intermediate,
-            cache: std::sync::Mutex::new(std::collections::HashMap::new()),
-            cache_cap: self.cache_cap,
+            catalog: std::sync::Mutex::new(catalog),
+            cache: std::sync::Mutex::new(ExpertLru::new(cap)),
         }
     }
 }
@@ -609,7 +726,6 @@ impl Layer0RoutedMoe {
             }
             logits[i] = s;
         }
-        // partial top-k
         let k = self.top_k.min(n).max(1);
         let mut idx: Vec<usize> = (0..n).collect();
         idx.sort_by(|&a, &b| {
@@ -618,7 +734,6 @@ impl Layer0RoutedMoe {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         idx.truncate(k);
-        // softmax over selected logits
         let max_l = idx
             .iter()
             .map(|&i| logits[i])
@@ -631,25 +746,29 @@ impl Layer0RoutedMoe {
         idx.into_iter().zip(weights).collect()
     }
 
-    /// Load/dequant one expert (cached).
+    /// Cache stats `(hits, misses)` for diagnostics.
+    pub fn cache_stats(&self) -> (u64, u64) {
+        self.cache
+            .lock()
+            .map(|c| (c.hits, c.misses))
+            .unwrap_or((0, 0))
+    }
+
+    /// Load/dequant one expert (LRU + kept-open catalog).
     pub fn expert(&self, id: usize) -> Result<ExpertF32> {
         {
-            let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(e) = cache.get(&id) {
-                return Ok(e.clone());
+            let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(e) = cache.get(id) {
+                return Ok(e);
             }
         }
-        let mut cat = SafetensorCatalog::open(&self.model_dir)?;
-        let e = load_fp4_expert(&mut cat, self.layer, id)?;
+        let e = {
+            let mut cat = self.catalog.lock().unwrap_or_else(|e| e.into_inner());
+            load_fp4_expert(&mut cat, self.layer, id)?
+        };
         {
             let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-            if cache.len() >= self.cache_cap {
-                // Drop an arbitrary entry (simple cap, not true LRU).
-                if let Some(k) = cache.keys().next().copied() {
-                    cache.remove(&k);
-                }
-            }
-            cache.insert(id, e.clone());
+            cache.put(id, e.clone());
         }
         Ok(e)
     }
@@ -717,9 +836,13 @@ pub fn load_layer_routed_moe(model_dir: &Path, layer: usize) -> Result<Layer0Rou
         }
     };
 
-    // Seed cache with expert 0 (already loaded).
-    let mut cache = std::collections::HashMap::new();
-    cache.insert(0, e0);
+    let cache_cap = std::env::var("TRAJECT_MOE_CACHE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(32usize)
+        .max(1);
+    let mut lru = ExpertLru::new(cache_cap);
+    lru.put(0, e0);
 
     info!(
         dir = %model_dir.display(),
@@ -729,7 +852,8 @@ pub fn load_layer_routed_moe(model_dir: &Path, layer: usize) -> Result<Layer0Rou
         hidden,
         intermediate,
         layer,
-        "loaded layer routed MoE gate (FP4 experts lazy)"
+        cache_cap,
+        "loaded layer routed MoE gate (FP4 experts lazy, catalog kept open)"
     );
 
     Ok(Layer0RoutedMoe {
@@ -741,8 +865,8 @@ pub fn load_layer_routed_moe(model_dir: &Path, layer: usize) -> Result<Layer0Rou
         route_scale,
         hidden,
         intermediate,
-        cache: std::sync::Mutex::new(cache),
-        cache_cap: 32,
+        catalog: std::sync::Mutex::new(cat),
+        cache: std::sync::Mutex::new(lru),
     })
 }
 
