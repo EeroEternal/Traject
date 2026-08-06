@@ -195,6 +195,8 @@ struct ModelWeights {
     w_up: Vec<f32>,
     /// Optional real layer-0 attn projections (FP8 dequantized).
     layer0: Option<crate::weights::Layer0AttnWeights>,
+    /// Optional layer-0 shared-expert SwiGLU FFN.
+    layer0_ffn: Option<crate::weights::Layer0SharedFfn>,
     source: String,
     eos_token_id: Option<u32>,
 }
@@ -222,6 +224,7 @@ impl ModelWeights {
             w_down,
             w_up,
             layer0: None,
+            layer0_ffn: None,
             source: "toy".into(),
             eos_token_id: Some(1),
         }
@@ -232,7 +235,9 @@ impl ModelWeights {
         attn_heads: u32,
         attn_dim_per_head: u32,
     ) -> Result<Self> {
-        use crate::weights::{load_embed_head_norm, load_layer0_attn, HfModelConfig};
+        use crate::weights::{
+            load_embed_head_norm, load_layer0_attn, load_layer0_shared_ffn, HfModelConfig,
+        };
 
         let cfg = HfModelConfig::load(model_dir).ok();
         let (embed_t, head_t, norm_t, embed_key) = load_embed_head_norm(model_dir)?;
@@ -267,6 +272,13 @@ impl ModelWeights {
                 None
             }
         };
+        let layer0_ffn = match load_layer0_shared_ffn(model_dir) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                warn!(error = %e, "layer-0 shared FFN not loaded");
+                None
+            }
+        };
         let (w_down, w_up) = random_projections(hidden, attn_dim, 7);
         let norm = norm_t.map(|t| t.data);
         let eos = cfg.as_ref().and_then(|c| c.eos_token_id);
@@ -277,6 +289,7 @@ impl ModelWeights {
             embed_key = %embed_key,
             has_norm = norm.is_some(),
             has_layer0 = layer0.is_some(),
+            has_layer0_ffn = layer0_ffn.is_some(),
             attn_dim,
             model_type = ?cfg.as_ref().and_then(|c| c.model_type.clone()),
             "loaded real safetensors embed/head for local runner"
@@ -291,6 +304,7 @@ impl ModelWeights {
             w_down,
             w_up,
             layer0,
+            layer0_ffn,
             source: format!("safetensors:{}", model_dir.display()),
             eos_token_id: eos.or(Some(1)),
         })
@@ -353,8 +367,35 @@ impl ModelWeights {
         matvec(&self.w_up, self.hidden, self.attn_dim, a)
     }
 
+    /// Shared-expert SwiGLU residual: `h + w2(silu(w1·n) ⊙ w3·n)`.
+    fn shared_ffn_residual(&self, h: &[f32]) -> Vec<f32> {
+        let Some(ffn) = &self.layer0_ffn else {
+            return h.to_vec();
+        };
+        let n = self.rms_norm_with(h, Some(&ffn.ffn_norm));
+        let u = matvec(&ffn.w1.data, ffn.intermediate, ffn.hidden, &n);
+        let g = matvec(&ffn.w3.data, ffn.intermediate, ffn.hidden, &n);
+        let mut gated = vec![0.0f32; ffn.intermediate];
+        for i in 0..ffn.intermediate {
+            // silu(u) = u * sigmoid(u)
+            let ui = u[i];
+            let silu = ui / (1.0 + (-ui).exp());
+            gated[i] = silu * g[i];
+        }
+        let delta = matvec(&ffn.w2.data, ffn.hidden, ffn.intermediate, &gated);
+        let mut out = h.to_vec();
+        for (o, d) in out.iter_mut().zip(delta.iter()) {
+            *o += *d;
+        }
+        out
+    }
+
     fn has_layer0(&self) -> bool {
         self.layer0.is_some()
+    }
+
+    fn has_layer0_ffn(&self) -> bool {
+        self.layer0_ffn.is_some()
     }
 
     fn logits(&self, h: &[f32]) -> Vec<f32> {
@@ -549,6 +590,11 @@ impl LocalWeightRunner {
         self.weights.has_layer0()
     }
 
+    /// Whether layer-0 shared-expert FFN was loaded.
+    pub fn has_layer0_ffn(&self) -> bool {
+        self.weights.has_layer0_ffn()
+    }
+
     /// Name of the active attention kernel (`cpu-ref` or `flashinfer-py`).
     pub fn kernel_name(&self) -> &str {
         self.kernel.name()
@@ -702,12 +748,14 @@ impl InferenceBackend for LocalWeightRunner {
             // Full wo_a/wo_b not loaded yet — residual adapter via w_up.
             let mut attn_o = dec.o;
             attn_o.resize(attn_dim, 0.0);
-            let hidden = self.weights.up(&attn_o);
+            let attn_h = self.weights.up(&attn_o);
             // residual with last embed for stability
             let mut h = emb;
-            for (a, b) in h.iter_mut().zip(hidden.iter()) {
+            for (a, b) in h.iter_mut().zip(attn_h.iter()) {
                 *a = 0.5 * *a + 0.5 * *b;
             }
+            // Real shared-expert SwiGLU when loaded (routed MoE still absent).
+            h = self.weights.shared_ffn_residual(&h);
             let logits = self.weights.logits(&h);
             let sampled = self
                 .kernel
@@ -762,6 +810,7 @@ impl InferenceBackend for LocalWeightRunner {
             vocab = self.weights.vocab,
             has_tokenizer = self.tokenizer.is_some(),
             has_layer0 = self.weights.has_layer0(),
+            has_layer0_ffn = self.weights.has_layer0_ffn(),
             kernel = self.kernel.name(),
             "local weight runner chunk"
         );

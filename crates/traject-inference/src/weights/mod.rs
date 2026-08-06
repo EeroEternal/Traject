@@ -5,6 +5,7 @@ mod dtype;
 mod hf_config;
 
 pub use catalog::{
-    load_embed_head_norm, load_layer0_attn, Layer0AttnWeights, SafetensorCatalog, TensorF32,
+    load_embed_head_norm, load_layer0_attn, load_layer0_shared_ffn, Layer0AttnWeights,
+    Layer0SharedFfn, SafetensorCatalog, TensorF32,
 };
 pub use hf_config::HfModelConfig;

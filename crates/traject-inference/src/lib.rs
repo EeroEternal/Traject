@@ -13,8 +13,8 @@ mod tokenizer;
 mod weights;
 
 pub use weights::{
-    load_embed_head_norm, load_layer0_attn, HfModelConfig, Layer0AttnWeights, SafetensorCatalog,
-    TensorF32,
+    load_embed_head_norm, load_layer0_attn, load_layer0_shared_ffn, HfModelConfig,
+    Layer0AttnWeights, Layer0SharedFfn, SafetensorCatalog, TensorF32,
 };
 pub use tokenizer::HfTokenizer;
 

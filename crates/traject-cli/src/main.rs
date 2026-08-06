@@ -111,6 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         source = %runner.weight_source(),
                         has_tokenizer = runner.has_tokenizer(),
                         has_layer0 = runner.has_layer0_attn(),
+                        has_layer0_ffn = runner.has_layer0_ffn(),
                         kernel = runner.kernel_name(),
                         "weights ready"
                     );
