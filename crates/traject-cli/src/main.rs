@@ -42,6 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let use_tools = args.iter().any(|a| a == "--tools");
     let kernel = args.iter().any(|a| a == "--kernel-smoke");
     let flashinfer = args.iter().any(|a| a == "--flashinfer");
+    let local_runner = args.iter().any(|a| a == "--local-runner");
     let engine_url = take_flag_value(&mut args, "--engine-url");
     let backend_url = take_flag_value(&mut args, "--backend-url");
     let model = take_flag_value(&mut args, "--model")
@@ -49,7 +50,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let max_tokens = take_flag_value(&mut args, "--max-tokens")
         .and_then(|s| s.parse().ok())
         .unwrap_or(64u32);
-    args.retain(|a| a != "--tools" && a != "--kernel-smoke" && a != "--flashinfer");
+    args.retain(|a| {
+        a != "--tools" && a != "--kernel-smoke" && a != "--flashinfer" && a != "--local-runner"
+    });
     let prompt = args
         .first()
         .cloned()
@@ -80,7 +83,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })
     .with_policy(std::sync::Arc::new(policy));
 
-    driver = if flashinfer || kernel {
+    driver = if local_runner {
+        use std::path::PathBuf;
+        use traject_inference::{LocalWeightConfig, LocalWeightRunner};
+        let model_path = PathBuf::from(&model);
+        if model_path.is_dir()
+            && (model_path.join("config.json").exists()
+                || model_path.join("model.safetensors.index.json").exists()
+                || model_path.join("model.safetensors").exists())
+        {
+            tracing::info!(
+                model = %model_path.display(),
+                "using in-process LocalWeightRunner with REAL safetensors embed/head"
+            );
+            match LocalWeightRunner::from_model_dir(&model_path) {
+                Ok(runner) => {
+                    tracing::info!(source = %runner.weight_source(), "weights ready");
+                    driver.with_backend(runner)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "safetensors load failed; toy weights");
+                    driver.with_local_weight_runner(LocalWeightConfig {
+                        max_new_tokens_default: max_tokens,
+                        model_dir: None,
+                        ..LocalWeightConfig::default()
+                    })
+                }
+            }
+        } else {
+            tracing::info!(
+                "using in-process LocalWeightRunner (toy weights; pass HF model dir via --model for safetensors)"
+            );
+            driver.with_local_weight_runner(LocalWeightConfig {
+                max_new_tokens_default: max_tokens,
+                model_dir: None,
+                ..LocalWeightConfig::default()
+            })
+        }
+    } else if flashinfer || kernel {
         #[cfg(feature = "flashinfer")]
         {
             if flashinfer {

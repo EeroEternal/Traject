@@ -518,9 +518,61 @@ class RadixCache:
             if blk.ref_count <= 0:
                 self._allocated_blocks.pop(bid, None)
                 self._page_len.pop(bid, None)
+                # Physical GPU free: zero tensors before returning to free list.
                 self.k_cache[:, bid].zero_()
                 self.v_cache[:, bid].zero_()
+                if self.ckv_cache is not None:
+                    self.ckv_cache[:, bid].zero_()
+                if self.kpe_cache is not None:
+                    self.kpe_cache[:, bid].zero_()
+                if self.packed_kv_cache is not None:
+                    self.packed_kv_cache[:, bid].zero_()
                 self._free_blocks.append(bid)
+
+    def free_prefix_tokens(self, token_ids: List[int]) -> Dict[str, int]:
+        """Drop radix path for ``token_ids`` and release private GPU pages.
+
+        Used by Traject MemoryManager via ``/v1/prefix/free``. Shared ancestors
+        with ref_count > 0 keep their pages.
+        """
+        if not token_ids:
+            return {"nodes_unlinked": 0, "blocks_released": 0}
+        # Walk exact path; collect nodes from leaf toward root.
+        node = self.tree.root
+        path: List[Tuple[int, RadixNode]] = []
+        for tid in token_ids:
+            child = node.children.get(tid)
+            if child is None:
+                break
+            path.append((tid, child))
+            node = child
+        if not path:
+            return {"nodes_unlinked": 0, "blocks_released": 0}
+
+        blocks_released = 0
+        nodes_unlinked = 0
+        # Release from leaf upward while private.
+        for i in range(len(path) - 1, -1, -1):
+            tid, cur = path[i]
+            parent = self.tree.root if i == 0 else path[i - 1][1]
+            if cur.children:
+                break
+            if cur.ref_count > 1:
+                cur.ref_count -= 1
+                break
+            # Private leaf — free GPU pages and unlink.
+            blocks = list(cur.block_ids)
+            cur.block_ids = []
+            cur.past_kv = None
+            cur.last_logits = None
+            if blocks:
+                before = len(self._free_blocks)
+                self.release_blocks(blocks)
+                blocks_released += max(0, len(self._free_blocks) - before)
+            parent.children.pop(tid, None)
+            nodes_unlinked += 1
+            self.evict_count += 1
+        return {"nodes_unlinked": nodes_unlinked, "blocks_released": blocks_released}
 
     def evict(self, needed: int) -> int:
         """Evict low-refcount leaves from the radix tree and free their private pages."""

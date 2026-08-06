@@ -9,7 +9,7 @@ use traject_core::{
 };
 use traject_inference::{
     EnginePrefixClient, HttpOpenAiBackend, InferenceBackend, InferenceEngine, KernelSmokeBackend,
-    SglangLiteEngineBackend, StubBackend, StubMode,
+    LocalWeightConfig, LocalWeightRunner, SglangLiteEngineBackend, StubBackend, StubMode,
 };
 use traject_memory::MemoryManager;
 use traject_policy::{Policy, ReActPolicy};
@@ -139,6 +139,20 @@ impl Driver {
     /// In-process kernel smoke (CPU ref or FlashInfer-backed KernelSmokeBackend).
     pub fn with_kernel_smoke(self, backend: KernelSmokeBackend) -> Self {
         self.with_backend(backend)
+    }
+
+    /// In-process weight runner with physical paged KV (toy weights by default).
+    pub fn with_local_weight_runner(self, cfg: LocalWeightConfig) -> Self {
+        self.with_backend(LocalWeightRunner::new(cfg))
+    }
+
+    /// In-process runner loading real safetensors embed/head from `model_dir`.
+    pub fn with_local_weight_runner_from_dir(
+        self,
+        model_dir: impl Into<std::path::PathBuf>,
+    ) -> Result<Self> {
+        let runner = LocalWeightRunner::from_model_dir(model_dir.into())?;
+        Ok(self.with_backend(runner))
     }
 
     pub fn with_stub_mode(mut self, mode: StubMode) -> Self {
@@ -941,13 +955,20 @@ impl Driver {
     }
 
     fn spawn_engine_free(&self, prefix_id: &str, session_id: Option<String>) {
-        let Some(client) = self.engine_prefix.clone() else {
-            return;
-        };
-        let prefix_id = prefix_id.to_string();
+        // Always free via InferenceBackend (local runner + sglang both implement).
+        let backend = self.engine.backend_arc();
+        let prefix = prefix_id.to_string();
+        let sess = session_id.clone();
         tokio::spawn(async move {
-            client.free(&prefix_id, session_id.as_deref()).await;
+            let _ = backend.free_prefix(&prefix, sess.as_deref()).await;
         });
+        // Also hit dedicated HTTP client if present (double-call is idempotent).
+        if let Some(client) = self.engine_prefix.clone() {
+            let prefix_id = prefix_id.to_string();
+            tokio::spawn(async move {
+                client.free(&prefix_id, session_id.as_deref()).await;
+            });
+        }
     }
 }
 

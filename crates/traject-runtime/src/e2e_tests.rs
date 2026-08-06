@@ -149,6 +149,30 @@ mod e2e {
     }
 
     #[tokio::test]
+    async fn local_weight_runner_trajectory() {
+        use traject_inference::LocalWeightConfig;
+        use traject_policy::ReActPolicy;
+
+        let mut driver = Driver::new(DriverConfig {
+            max_ticks: 64,
+            ..DriverConfig::default()
+        })
+        .with_policy(Arc::new(ReActPolicy {
+            max_steps: 2,
+            system_prompt: "hi".into(),
+        }))
+        .with_local_weight_runner(LocalWeightConfig {
+            max_new_tokens_default: 8,
+            ..LocalWeightConfig::default()
+        });
+        let id = driver.create_trajectory(TrajectoryConfig::default());
+        driver.run_until_finished(id).await.unwrap();
+        let traj = driver.manager.get(id).unwrap();
+        assert!(traj.state.is_terminal());
+        assert!(!traj.history.is_empty());
+    }
+
+    #[tokio::test]
     async fn tool_latency_influences_pin_and_prefetch() {
         use traject_core::{
             Constraints, GenerateDelta, PinReason, ToolCall, ToolResult, TrajectoryConfig,

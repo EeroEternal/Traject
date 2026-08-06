@@ -32,6 +32,13 @@ pub struct GenerateResult {
 #[async_trait]
 pub trait InferenceBackend: Send + Sync {
     async fn generate_chunk(&self, req: ChunkRequest) -> Result<ChunkResult>;
+
+    /// Free physical resources for a prefix handle (paged KV / engine snapshots).
+    /// Default: no-op for backends without owned device memory.
+    async fn free_prefix(&self, prefix_id: &str, session_id: Option<&str>) -> Result<()> {
+        let _ = (prefix_id, session_id);
+        Ok(())
+    }
 }
 
 /// Thin engine over a backend; owns chunking policy.
@@ -59,6 +66,10 @@ impl InferenceEngine {
         self.backend.as_ref()
     }
 
+    pub fn backend_arc(&self) -> std::sync::Arc<dyn InferenceBackend> {
+        std::sync::Arc::clone(&self.backend)
+    }
+
     pub async fn run_chunk(
         &self,
         req: &GenerateRequest,
@@ -81,6 +92,10 @@ impl InferenceEngine {
                 .or_else(|| req.prefix.map(|p| p.to_string())),
         };
         self.backend.generate_chunk(chunk).await
+    }
+
+    pub async fn free_prefix(&self, prefix_id: &str, session_id: Option<&str>) -> Result<()> {
+        self.backend.free_prefix(prefix_id, session_id).await
     }
 }
 
