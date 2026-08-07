@@ -622,12 +622,15 @@ pub struct IndexerWeights {
 /// Learned gated pooling compressor (DeepSeek-V4 `Compressor`).
 ///
 /// `overlap == (ratio == 4)` matches the official module.
+/// `rotate` enables Hadamard + FP4 QAT on emitted latents (indexer's compressor).
 #[derive(Debug, Clone)]
 pub struct CompressorWeights {
     pub ratio: usize,
     pub head_dim: usize,
     pub hidden: usize,
     pub overlap: bool,
+    /// When true (indexer compressor), apply `rotate_activation` + `fp4_act_quant` after RoPE.
+    pub rotate: bool,
     /// `[ratio, coff * head_dim]` absolute position encodings for gates.
     pub ape: Vec<f32>,
     /// `[coff * head_dim, hidden]`
@@ -1084,6 +1087,7 @@ fn load_compressor_into(
         head_dim,
         hidden,
         overlap,
+        rotate: false,
         ape,
         wkv,
         wgate,
@@ -1128,7 +1132,7 @@ fn load_indexer_into(
             weights_proj.cols()
         )));
     }
-    let compressor = load_compressor_into(
+    let mut compressor = load_compressor_into(
         cat,
         layer,
         hidden,
@@ -1136,6 +1140,8 @@ fn load_indexer_into(
         parent_rope.compress_ratio.max(4),
         &format!("layers.{layer}.attn.indexer.compressor"),
     )?;
+    // Official Indexer constructs Compressor(..., rotate=True).
+    compressor.rotate = true;
     // Index heads use same YaRN/base policy as parent, but rope_dim is min(64, head_dim).
     let rope_dim = parent_rope.rope_dim.min(head_dim).max(2);
     let rope = if parent_rope.yarn {
