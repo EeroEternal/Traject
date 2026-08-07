@@ -99,13 +99,15 @@ max 8). Each layer:
    on attention output. Per-head `attn_sink` absorbs softmax mass (CPU kernel).
 3. **o_proj:** group-concat heads → `wo_a` → `wo_b` (official layout; residual is
    `x += o`, not residual-through-`wo_a`).
-4. **Shared expert FFN:** SwiGLU residual
-5. **Routed MoE:** gate top-k + packed FP4 experts (lazy f32 expand)
+4. **Hyper-Connections (HC):** embed expands to `hc_mult` (4) streams; each block
+   does `hc_pre → (attn|ffn) → hc_post` with Sinkhorn `comb`; final `hc_head`
+   collapses streams before lm_head.
+5. **Shared + routed MoE:** under the FFN HC branch (pure delta, residual via HC)
 
 Per-layer KV is keyed `{prefix}:L{i}`. Free drops base + all layer keys.
 
 **Not loaded yet:** full 43-layer production stack (memory); YaRN for compressed
-layers; sparse top-k / indexer / HC residual.
+layers; sparse top-k / indexer.
 
 ```bash
 export TRAJECT_LOCAL_LAYERS=2   # or 1..8
@@ -136,4 +138,6 @@ Routed MoE keeps a **live `SafetensorCatalog`** (mmap reuse) and an **LRU** of
 - [x] Multi-head Q + MQA KV expand (no Q mean-pool; `TRAJECT_ATTN_HEADS`)  
 - [x] MLA RoPE (last 64 dims) + inverse RoPE on o + `attn_sink` + K=V  
 - [x] o_proj group-concat (official `wo_a` layout)  
+- [x] Hyper-Connections residual (`hc_*` + Sinkhorn + `hc_head`)  
+
 - [ ] Full 43-layer production parity (still sglang for prod MoE)  

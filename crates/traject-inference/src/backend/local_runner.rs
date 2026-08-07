@@ -199,6 +199,8 @@ struct ModelWeights {
     eos_token_id: Option<u32>,
     /// Base RoPE theta (V4 Flash: 10000 for pure SWA layers).
     rope_theta: f32,
+    /// Final Hyper-Connection collapse before lm_head.
+    hc_head: Option<crate::weights::HcHeadWeights>,
 }
 
 impl ModelWeights {
@@ -227,6 +229,7 @@ impl ModelWeights {
             source: "toy".into(),
             eos_token_id: Some(1),
             rope_theta: 10000.0,
+            hc_head: None,
         }
     }
 
@@ -235,7 +238,7 @@ impl ModelWeights {
         attn_heads: u32,
         attn_dim_per_head: u32,
     ) -> Result<Self> {
-        use crate::weights::{load_embed_head_norm, load_layer_stack, HfModelConfig};
+        use crate::weights::{load_embed_head_norm, load_hc_head, load_layer_stack, HfModelConfig};
 
         let cfg = HfModelConfig::load(model_dir).ok();
         let (embed_t, head_t, norm_t, embed_key) = load_embed_head_norm(model_dir)?;
@@ -292,6 +295,22 @@ impl ModelWeights {
             .as_ref()
             .and_then(|c| c.rope_theta)
             .unwrap_or(10000.0);
+        let hc_head = match load_hc_head(model_dir) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                warn!(error = %e, "hc_head not loaded; will mean-collapse multi-stream if HC");
+                None
+            }
+        };
+        let has_hc = layers.iter().any(|l| l.hc.is_some());
+        info!(
+            has_hc,
+            has_hc_head = hc_head.is_some(),
+            hc_mult = layers
+                .first()
+                .and_then(|l| l.hc.as_ref().map(|h| h.hc_mult)),
+            "Hyper-Connection status for local runner"
+        );
         Ok(Self {
             vocab: cfg.as_ref().map(|c| c.vocab_size).unwrap_or(vocab).max(vocab),
             hidden,
@@ -305,6 +324,7 @@ impl ModelWeights {
             source: format!("safetensors:{}", model_dir.display()),
             eos_token_id: eos.or(Some(1)),
             rope_theta,
+            hc_head,
         })
     }
 
@@ -508,20 +528,25 @@ impl ModelWeights {
         matvec(&self.w_up, self.hidden, self.attn_dim, attn_o)
     }
 
-    fn shared_ffn_residual_block(
-        &self,
-        ffn: &crate::weights::Layer0SharedFfn,
-        h: &[f32],
-    ) -> Vec<f32> {
+    /// Pure shared-expert SwiGLU (no residual).
+    fn shared_ffn_delta(&self, ffn: &crate::weights::Layer0SharedFfn, h: &[f32]) -> Vec<f32> {
         let n = self.rms_norm_with(h, Some(&ffn.ffn_norm));
-        let delta = swiglu_delta(
+        swiglu_delta(
             &n,
             &ffn.w1.data,
             &ffn.w2.data,
             &ffn.w3.data,
             ffn.hidden,
             ffn.intermediate,
-        );
+        )
+    }
+
+    fn shared_ffn_residual_block(
+        &self,
+        ffn: &crate::weights::Layer0SharedFfn,
+        h: &[f32],
+    ) -> Vec<f32> {
+        let delta = self.shared_ffn_delta(ffn, h);
         let mut out = h.to_vec();
         for (o, d) in out.iter_mut().zip(delta.iter()) {
             *o += *d;
@@ -529,13 +554,17 @@ impl ModelWeights {
         out
     }
 
-    fn routed_moe_residual_block(
+    /// Pure routed MoE sum (no residual). Applies `route_scale`.
+    fn routed_moe_delta(
         &self,
         moe: &crate::weights::Layer0RoutedMoe,
         ffn_norm: Option<&[f32]>,
         h: &[f32],
+        already_normed: bool,
     ) -> Vec<f32> {
-        let n = if let Some(g) = ffn_norm {
+        let n = if already_normed {
+            h.to_vec()
+        } else if let Some(g) = ffn_norm {
             self.rms_norm_with(h, Some(g))
         } else {
             h.to_vec()
@@ -555,11 +584,55 @@ impl ModelWeights {
             }
         }
         let scale = moe.route_scale;
+        for d in delta.iter_mut() {
+            *d *= scale;
+        }
+        delta
+    }
+
+    fn routed_moe_residual_block(
+        &self,
+        moe: &crate::weights::Layer0RoutedMoe,
+        ffn_norm: Option<&[f32]>,
+        h: &[f32],
+    ) -> Vec<f32> {
+        let delta = self.routed_moe_delta(moe, ffn_norm, h, false);
         let mut out = h.to_vec();
         for (o, d) in out.iter_mut().zip(delta.iter()) {
-            *o += scale * *d;
+            *o += *d;
         }
         out
+    }
+
+    /// Official MoE: shared + routed on the same normed input (no residual).
+    fn moe_block_delta(
+        &self,
+        ffn: Option<&crate::weights::Layer0SharedFfn>,
+        moe: Option<&crate::weights::Layer0RoutedMoe>,
+        h: &[f32],
+    ) -> Vec<f32> {
+        let mut y = vec![0.0f32; h.len()];
+        if let Some(ffn) = ffn {
+            let d = self.shared_ffn_delta(ffn, h);
+            for (o, x) in y.iter_mut().zip(d.iter()) {
+                *o += *x;
+            }
+            if let Some(moe) = moe {
+                // Shared already applied ffn_norm; route on same normed activations.
+                let n = self.rms_norm_with(h, Some(&ffn.ffn_norm));
+                let d = self.routed_moe_delta(moe, None, &n, true);
+                for (o, x) in y.iter_mut().zip(d.iter()) {
+                    *o += *x;
+                }
+            }
+        } else if let Some(moe) = moe {
+            y = self.routed_moe_delta(moe, None, h, false);
+        }
+        y
+    }
+
+    fn has_hc(&self) -> bool {
+        self.layers.iter().any(|l| l.hc.is_some())
     }
 
     fn has_layer0(&self) -> bool {
@@ -727,6 +800,245 @@ fn sink_for_heads(layer: &crate::weights::Layer0AttnWeights, n_q: usize) -> Opti
         out.resize(n_q, 0.0);
         out
     })
+}
+
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+/// Expand single hidden → `hc_mult` identical streams (layout `[hc][d]` flat).
+fn expand_hc_streams(h: &[f32], hc_mult: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(hc_mult * h.len());
+    for _ in 0..hc_mult.max(1) {
+        out.extend_from_slice(h);
+    }
+    out
+}
+
+/// Official `hc_split_sinkhorn` (CPU): pre / post / comb from mixes.
+fn hc_split_sinkhorn(
+    mixes: &[f32],
+    scale: &[f32],
+    base: &[f32],
+    hc: usize,
+    iters: usize,
+    eps: f32,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let mut pre = vec![0.0f32; hc];
+    let mut post = vec![0.0f32; hc];
+    let s0 = scale.first().copied().unwrap_or(1.0);
+    let s1 = scale.get(1).copied().unwrap_or(1.0);
+    let s2 = scale.get(2).copied().unwrap_or(1.0);
+    for j in 0..hc {
+        pre[j] = sigmoid(mixes[j] * s0 + base[j]) + eps;
+        post[j] = 2.0 * sigmoid(mixes[j + hc] * s1 + base.get(j + hc).copied().unwrap_or(0.0));
+    }
+    let mut comb = vec![0.0f32; hc * hc];
+    for j in 0..hc {
+        for k in 0..hc {
+            let idx = j * hc + k + hc * 2;
+            let b = base.get(idx).copied().unwrap_or(0.0);
+            comb[j * hc + k] = mixes.get(idx).copied().unwrap_or(0.0) * s2 + b;
+        }
+    }
+    // softmax over last dim + eps
+    for j in 0..hc {
+        let row = &mut comb[j * hc..(j + 1) * hc];
+        let mut max_v = f32::NEG_INFINITY;
+        for &v in row.iter() {
+            max_v = max_v.max(v);
+        }
+        let mut sum = 0.0f32;
+        for v in row.iter_mut() {
+            *v = (*v - max_v).exp();
+            sum += *v;
+        }
+        let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+        for v in row.iter_mut() {
+            *v = *v * inv + eps;
+        }
+    }
+    let col_normalize = |comb: &mut [f32]| {
+        let mut col_sum = vec![0.0f32; hc];
+        for j in 0..hc {
+            for k in 0..hc {
+                col_sum[k] += comb[j * hc + k];
+            }
+        }
+        for j in 0..hc {
+            for k in 0..hc {
+                comb[j * hc + k] /= col_sum[k] + eps;
+            }
+        }
+    };
+    let row_normalize = |comb: &mut [f32]| {
+        for j in 0..hc {
+            let mut s = 0.0f32;
+            for k in 0..hc {
+                s += comb[j * hc + k];
+            }
+            for k in 0..hc {
+                comb[j * hc + k] /= s + eps;
+            }
+        }
+    };
+    col_normalize(&mut comb);
+    for _ in 0..iters.saturating_sub(1) {
+        row_normalize(&mut comb);
+        col_normalize(&mut comb);
+    }
+    (pre, post, comb)
+}
+
+/// HC pre: multi-stream → single stream + post/comb for post.
+fn hc_pre(
+    streams: &[f32],
+    branch: &crate::weights::HcBranchWeights,
+    hc_mult: usize,
+    hidden: usize,
+    sinkhorn_iters: usize,
+    eps: f32,
+    norm_eps: f32,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let hc_dim = hc_mult * hidden;
+    let mix_hc = (2 + hc_mult) * hc_mult;
+    let x = if streams.len() >= hc_dim {
+        &streams[..hc_dim]
+    } else {
+        streams
+    };
+    let mut ss = 0.0f32;
+    for v in x {
+        ss += v * v;
+    }
+    let rsqrt = (ss / x.len().max(1) as f32 + norm_eps).sqrt().recip();
+    // mixes = (fn_w @ x) * rsqrt ; fn_w: [mix_hc, hc_dim]
+    let mut mixes = vec![0.0f32; mix_hc];
+    let cols = branch.fn_w.cols().max(1);
+    for i in 0..mix_hc.min(branch.fn_w.rows()) {
+        let row = &branch.fn_w.data[i * cols..(i + 1) * cols];
+        let mut s = 0.0f32;
+        for (a, b) in row.iter().zip(x.iter()) {
+            s += a * b;
+        }
+        mixes[i] = s * rsqrt;
+    }
+    let (pre, post, comb) = hc_split_sinkhorn(
+        &mixes,
+        &branch.scale,
+        &branch.base,
+        hc_mult,
+        sinkhorn_iters,
+        eps,
+    );
+    // y = sum_i pre[i] * stream[i]
+    let mut y = vec![0.0f32; hidden];
+    for i in 0..hc_mult {
+        let base = i * hidden;
+        if base + hidden > streams.len() {
+            break;
+        }
+        let p = pre[i];
+        for d in 0..hidden {
+            y[d] += p * streams[base + d];
+        }
+    }
+    (y, post, comb)
+}
+
+/// HC post: single stream + residual multi-stream → multi-stream.
+///
+/// `y[j] = post[j] * x + residual[j] * sum_i comb[i,j]` (matches official dims).
+fn hc_post(
+    x: &[f32],
+    residual: &[f32],
+    post: &[f32],
+    comb: &[f32],
+    hc_mult: usize,
+    hidden: usize,
+) -> Vec<f32> {
+    let mut col_sum = vec![0.0f32; hc_mult];
+    for i in 0..hc_mult {
+        for j in 0..hc_mult {
+            col_sum[j] += comb.get(i * hc_mult + j).copied().unwrap_or(0.0);
+        }
+    }
+    let mut out = vec![0.0f32; hc_mult * hidden];
+    for j in 0..hc_mult {
+        let p = post.get(j).copied().unwrap_or(0.0);
+        let c = col_sum[j];
+        let rbase = j * hidden;
+        let obase = j * hidden;
+        for d in 0..hidden {
+            let xv = x.get(d).copied().unwrap_or(0.0);
+            let rv = residual.get(rbase + d).copied().unwrap_or(0.0);
+            out[obase + d] = p * xv + c * rv;
+        }
+    }
+    out
+}
+
+/// Collapse multi-stream → single via `hc_head_*`.
+fn hc_head_collapse(streams: &[f32], head: &crate::weights::HcHeadWeights) -> Vec<f32> {
+    let hc = head.hc_mult.max(1);
+    let hidden = head.hidden.max(1);
+    let hc_dim = hc * hidden;
+    let x = if streams.len() >= hc_dim {
+        &streams[..hc_dim]
+    } else {
+        streams
+    };
+    let mut ss = 0.0f32;
+    for v in x {
+        ss += v * v;
+    }
+    let rsqrt = (ss / x.len().max(1) as f32 + 1e-6).sqrt().recip();
+    let cols = head.fn_w.cols().max(1);
+    let mut mixes = vec![0.0f32; hc];
+    for i in 0..hc.min(head.fn_w.rows()) {
+        let row = &head.fn_w.data[i * cols..(i + 1) * cols];
+        let mut s = 0.0f32;
+        for (a, b) in row.iter().zip(x.iter()) {
+            s += a * b;
+        }
+        mixes[i] = s * rsqrt;
+    }
+    let mut pre = vec![0.0f32; hc];
+    for i in 0..hc {
+        let b = head.base.get(i).copied().unwrap_or(0.0);
+        pre[i] = sigmoid(mixes[i] * head.scale + b) + head.eps;
+    }
+    let mut y = vec![0.0f32; hidden];
+    for i in 0..hc {
+        let base = i * hidden;
+        if base + hidden > streams.len() {
+            break;
+        }
+        let p = pre[i];
+        for d in 0..hidden {
+            y[d] += p * streams[base + d];
+        }
+    }
+    y
+}
+
+/// Mean-collapse multi-stream when hc_head is missing.
+fn mean_collapse_streams(streams: &[f32], hc_mult: usize, hidden: usize) -> Vec<f32> {
+    let mut y = vec![0.0f32; hidden];
+    let n = hc_mult.max(1) as f32;
+    for i in 0..hc_mult {
+        let base = i * hidden;
+        if base + hidden > streams.len() {
+            break;
+        }
+        for d in 0..hidden {
+            y[d] += streams[base + d];
+        }
+    }
+    for v in y.iter_mut() {
+        *v /= n;
+    }
+    y
 }
 
 /// How many transformer layers to load for the local runner.
@@ -1105,83 +1417,193 @@ impl InferenceBackend for LocalWeightRunner {
             .unwrap_or(0)
             .min(head_dim);
 
+        let hc_mult = self
+            .weights
+            .layers
+            .first()
+            .and_then(|l| l.hc.as_ref().map(|h| h.hc_mult))
+            .unwrap_or(1)
+            .max(1);
+
         // Prefill prompt through the full layer stack (per-layer KV under prefix:L{i}).
         if req.decoded_so_far == 0 {
             for (pos, &tid) in prompt_ids.iter().enumerate() {
-                let mut h = self.weights.embed_token(tid);
+                let emb = self.weights.embed_token(tid);
                 if self.weights.layers.is_empty() {
-                    let (mut kk, mut vv) = self.weights.project_kv(&h);
+                    let (mut kk, mut vv) = self.weights.project_kv(&emb);
                     kk.resize(kv_width, 0.0);
                     vv.resize(kv_width, 0.0);
                     self.kv.lock().append_kv(&prefix, &kk, &vv);
                 } else {
+                    let mut streams = if self.weights.has_hc() {
+                        expand_hc_streams(&emb, hc_mult)
+                    } else {
+                        emb
+                    };
                     for (li, block) in self.weights.layers.iter().enumerate() {
                         let pfx = format!("{prefix}:L{li}");
                         let rd = block.attn.rope_head_dim.min(head_dim);
-                        let (mut kk, _) = self.weights.project_kv_layer(&block.attn, &h);
-                        kk.resize(kv_width, 0.0);
-                        apply_rope_latent(&mut kk, head_dim, rd, pos, rope_theta);
-                        let vv = kk.clone();
-                        self.kv.lock().append_kv(&pfx, &kk, &vv);
-                        let mut qq = self.weights.project_q_layer(&block.attn, &h);
-                        qq.resize(q_width, 0.0);
-                        apply_rope_heads(&mut qq, n_q, head_dim, rd, pos, rope_theta, false);
-                        let (k_cache, v_cache, seq_len) = self.kv.lock().materialize_kv(&pfx);
-                        if seq_len > 0 {
-                            let k_exp = if self.multihead {
-                                expand_kv_mqa(&k_cache, seq_len as usize, n_q, head_dim)
-                            } else {
-                                k_cache
-                            };
-                            let v_exp = if self.multihead {
-                                expand_kv_mqa(&v_cache, seq_len as usize, n_q, head_dim)
-                            } else {
-                                v_cache
-                            };
-                            if let Ok(dec) = self
-                                .kernel
-                                .decode(DecodeRequest {
-                                    q: qq,
-                                    k_cache: k_exp,
-                                    v_cache: v_exp,
-                                    seq_len,
-                                    num_heads: n_q as u32,
-                                    head_dim: head_dim as u32,
-                                    layout: KvLayout::Nhd,
-                                    attn_sink: sink_for_heads(&block.attn, n_q),
-                                })
-                                .await
-                            {
-                                let mut attn_o = dec.o;
-                                attn_o.resize(q_width, 0.0);
-                                apply_rope_heads(
-                                    &mut attn_o,
-                                    n_q,
-                                    head_dim,
-                                    rd,
-                                    pos,
-                                    rope_theta,
-                                    true,
-                                );
-                                let delta =
-                                    self.weights.attn_to_hidden_layer(&block.attn, &attn_o, &h);
-                                if block.attn.has_o_proj() {
-                                    for (a, b) in h.iter_mut().zip(delta.iter()) {
-                                        *a += *b;
-                                    }
+                        if let Some(ref hc) = block.hc {
+                            let residual = streams.clone();
+                            let (x, post, comb) = hc_pre(
+                                &streams,
+                                &hc.attn,
+                                hc.hc_mult,
+                                hc.hidden,
+                                hc.sinkhorn_iters,
+                                hc.eps,
+                                hc.norm_eps,
+                            );
+                            let (mut kk, _) = self.weights.project_kv_layer(&block.attn, &x);
+                            kk.resize(kv_width, 0.0);
+                            apply_rope_latent(&mut kk, head_dim, rd, pos, rope_theta);
+                            let vv = kk.clone();
+                            self.kv.lock().append_kv(&pfx, &kk, &vv);
+                            let mut qq = self.weights.project_q_layer(&block.attn, &x);
+                            qq.resize(q_width, 0.0);
+                            apply_rope_heads(&mut qq, n_q, head_dim, rd, pos, rope_theta, false);
+                            let (k_cache, v_cache, seq_len) = self.kv.lock().materialize_kv(&pfx);
+                            let mut attn_out = vec![0.0f32; self.weights.hidden];
+                            if seq_len > 0 {
+                                let k_exp = if self.multihead {
+                                    expand_kv_mqa(&k_cache, seq_len as usize, n_q, head_dim)
                                 } else {
-                                    for (a, b) in h.iter_mut().zip(delta.iter()) {
-                                        *a = 0.5 * *a + 0.5 * *b;
+                                    k_cache
+                                };
+                                let v_exp = if self.multihead {
+                                    expand_kv_mqa(&v_cache, seq_len as usize, n_q, head_dim)
+                                } else {
+                                    v_cache
+                                };
+                                if let Ok(dec) = self
+                                    .kernel
+                                    .decode(DecodeRequest {
+                                        q: qq,
+                                        k_cache: k_exp,
+                                        v_cache: v_exp,
+                                        seq_len,
+                                        num_heads: n_q as u32,
+                                        head_dim: head_dim as u32,
+                                        layout: KvLayout::Nhd,
+                                        attn_sink: sink_for_heads(&block.attn, n_q),
+                                    })
+                                    .await
+                                {
+                                    let mut attn_o = dec.o;
+                                    attn_o.resize(q_width, 0.0);
+                                    apply_rope_heads(
+                                        &mut attn_o,
+                                        n_q,
+                                        head_dim,
+                                        rd,
+                                        pos,
+                                        rope_theta,
+                                        true,
+                                    );
+                                    attn_out = self
+                                        .weights
+                                        .attn_to_hidden_layer(&block.attn, &attn_o, &x);
+                                }
+                            }
+                            streams = hc_post(
+                                &attn_out,
+                                &residual,
+                                &post,
+                                &comb,
+                                hc.hc_mult,
+                                hc.hidden,
+                            );
+                            let residual = streams.clone();
+                            let (x, post, comb) = hc_pre(
+                                &streams,
+                                &hc.ffn,
+                                hc.hc_mult,
+                                hc.hidden,
+                                hc.sinkhorn_iters,
+                                hc.eps,
+                                hc.norm_eps,
+                            );
+                            let y = self.weights.moe_block_delta(
+                                block.ffn.as_ref(),
+                                block.moe.as_ref(),
+                                &x,
+                            );
+                            streams =
+                                hc_post(&y, &residual, &post, &comb, hc.hc_mult, hc.hidden);
+                        } else {
+                            // Simple residual path (no HC).
+                            let mut h = if streams.len() == self.weights.hidden {
+                                streams.clone()
+                            } else {
+                                mean_collapse_streams(&streams, hc_mult, self.weights.hidden)
+                            };
+                            let (mut kk, _) = self.weights.project_kv_layer(&block.attn, &h);
+                            kk.resize(kv_width, 0.0);
+                            apply_rope_latent(&mut kk, head_dim, rd, pos, rope_theta);
+                            let vv = kk.clone();
+                            self.kv.lock().append_kv(&pfx, &kk, &vv);
+                            let mut qq = self.weights.project_q_layer(&block.attn, &h);
+                            qq.resize(q_width, 0.0);
+                            apply_rope_heads(&mut qq, n_q, head_dim, rd, pos, rope_theta, false);
+                            let (k_cache, v_cache, seq_len) = self.kv.lock().materialize_kv(&pfx);
+                            if seq_len > 0 {
+                                let k_exp = if self.multihead {
+                                    expand_kv_mqa(&k_cache, seq_len as usize, n_q, head_dim)
+                                } else {
+                                    k_cache
+                                };
+                                let v_exp = if self.multihead {
+                                    expand_kv_mqa(&v_cache, seq_len as usize, n_q, head_dim)
+                                } else {
+                                    v_cache
+                                };
+                                if let Ok(dec) = self
+                                    .kernel
+                                    .decode(DecodeRequest {
+                                        q: qq,
+                                        k_cache: k_exp,
+                                        v_cache: v_exp,
+                                        seq_len,
+                                        num_heads: n_q as u32,
+                                        head_dim: head_dim as u32,
+                                        layout: KvLayout::Nhd,
+                                        attn_sink: sink_for_heads(&block.attn, n_q),
+                                    })
+                                    .await
+                                {
+                                    let mut attn_o = dec.o;
+                                    attn_o.resize(q_width, 0.0);
+                                    apply_rope_heads(
+                                        &mut attn_o,
+                                        n_q,
+                                        head_dim,
+                                        rd,
+                                        pos,
+                                        rope_theta,
+                                        true,
+                                    );
+                                    let delta = self
+                                        .weights
+                                        .attn_to_hidden_layer(&block.attn, &attn_o, &h);
+                                    if block.attn.has_o_proj() {
+                                        for (a, b) in h.iter_mut().zip(delta.iter()) {
+                                            *a += *b;
+                                        }
+                                    } else {
+                                        for (a, b) in h.iter_mut().zip(delta.iter()) {
+                                            *a = 0.5 * *a + 0.5 * *b;
+                                        }
                                     }
                                 }
                             }
-                        }
-                        if let Some(ref ffn) = block.ffn {
-                            h = self.weights.shared_ffn_residual_block(ffn, &h);
-                        }
-                        if let Some(ref moe) = block.moe {
-                            let norm = block.ffn.as_ref().map(|f| f.ffn_norm.as_slice());
-                            h = self.weights.routed_moe_residual_block(moe, norm, &h);
+                            if let Some(ref ffn) = block.ffn {
+                                h = self.weights.shared_ffn_residual_block(ffn, &h);
+                            }
+                            if let Some(ref moe) = block.moe {
+                                let norm = block.ffn.as_ref().map(|f| f.ffn_norm.as_slice());
+                                h = self.weights.routed_moe_residual_block(moe, norm, &h);
+                            }
+                            streams = h;
                         }
                     }
                 }
@@ -1204,9 +1626,15 @@ impl InferenceBackend for LocalWeightRunner {
                 .copied()
                 .or_else(|| prompt_ids.last().copied())
                 .unwrap_or(1);
-            let mut h = self.weights.embed_token(last_tid);
+            let emb = self.weights.embed_token(last_tid);
+            let mut streams = if self.weights.has_hc() && !self.weights.layers.is_empty() {
+                expand_hc_streams(&emb, hc_mult)
+            } else {
+                emb
+            };
 
             if self.weights.layers.is_empty() {
+                let mut h = streams;
                 let (k_cache, v_cache, seq_len) = self.kv.lock().materialize_kv(&prefix);
                 if seq_len == 0 {
                     break;
@@ -1246,70 +1674,180 @@ impl InferenceBackend for LocalWeightRunner {
                 for (a, b) in h.iter_mut().zip(attn_h.iter()) {
                     *a = 0.5 * *a + 0.5 * *b;
                 }
+                streams = h;
             } else {
                 for (li, block) in self.weights.layers.iter().enumerate() {
                     let pfx = format!("{prefix}:L{li}");
                     let rd = block.attn.rope_head_dim.min(head_dim);
-                    let mut qq = self.weights.project_q_layer(&block.attn, &h);
-                    qq.resize(q_width, 0.0);
-                    let (k_cache, v_cache, seq_len) = self.kv.lock().materialize_kv(&pfx);
-                    if seq_len == 0 {
-                        let (mut kk, _) = self.weights.project_kv_layer(&block.attn, &h);
-                        kk.resize(kv_width, 0.0);
-                        apply_rope_latent(&mut kk, head_dim, rd, 0, rope_theta);
-                        let vv = kk.clone();
-                        self.kv.lock().append_kv(&pfx, &kk, &vv);
-                        continue;
-                    }
-                    let q_pos = (seq_len as usize).saturating_sub(1);
-                    apply_rope_heads(&mut qq, n_q, head_dim, rd, q_pos, rope_theta, false);
-                    let k_exp = if self.multihead {
-                        expand_kv_mqa(&k_cache, seq_len as usize, n_q, head_dim)
-                    } else {
-                        k_cache
-                    };
-                    let v_exp = if self.multihead {
-                        expand_kv_mqa(&v_cache, seq_len as usize, n_q, head_dim)
-                    } else {
-                        v_cache
-                    };
-                    let dec = self
-                        .kernel
-                        .decode(DecodeRequest {
-                            q: qq,
-                            k_cache: k_exp,
-                            v_cache: v_exp,
-                            seq_len,
-                            num_heads: n_q as u32,
-                            head_dim: head_dim as u32,
-                            layout: KvLayout::Nhd,
-                            attn_sink: sink_for_heads(&block.attn, n_q),
-                        })
-                        .await
-                        .map_err(|e| TrajectError::Inference(format!("local decode L{li}: {e}")))?;
-                    let mut attn_o = dec.o;
-                    attn_o.resize(q_width, 0.0);
-                    apply_rope_heads(&mut attn_o, n_q, head_dim, rd, q_pos, rope_theta, true);
-                    let delta = self.weights.attn_to_hidden_layer(&block.attn, &attn_o, &h);
-                    if block.attn.has_o_proj() {
-                        for (a, b) in h.iter_mut().zip(delta.iter()) {
-                            *a += *b;
+                    if let Some(ref hc) = block.hc {
+                        let residual = streams.clone();
+                        let (x, post, comb) = hc_pre(
+                            &streams,
+                            &hc.attn,
+                            hc.hc_mult,
+                            hc.hidden,
+                            hc.sinkhorn_iters,
+                            hc.eps,
+                            hc.norm_eps,
+                        );
+                        let (k_cache, v_cache, seq_len) = self.kv.lock().materialize_kv(&pfx);
+                        if seq_len == 0 {
+                            let (mut kk, _) = self.weights.project_kv_layer(&block.attn, &x);
+                            kk.resize(kv_width, 0.0);
+                            apply_rope_latent(&mut kk, head_dim, rd, 0, rope_theta);
+                            let vv = kk.clone();
+                            self.kv.lock().append_kv(&pfx, &kk, &vv);
+                            streams = residual;
+                            continue;
                         }
+                        let q_pos = (seq_len as usize).saturating_sub(1);
+                        let mut qq = self.weights.project_q_layer(&block.attn, &x);
+                        qq.resize(q_width, 0.0);
+                        apply_rope_heads(&mut qq, n_q, head_dim, rd, q_pos, rope_theta, false);
+                        let k_exp = if self.multihead {
+                            expand_kv_mqa(&k_cache, seq_len as usize, n_q, head_dim)
+                        } else {
+                            k_cache
+                        };
+                        let v_exp = if self.multihead {
+                            expand_kv_mqa(&v_cache, seq_len as usize, n_q, head_dim)
+                        } else {
+                            v_cache
+                        };
+                        let dec = self
+                            .kernel
+                            .decode(DecodeRequest {
+                                q: qq,
+                                k_cache: k_exp,
+                                v_cache: v_exp,
+                                seq_len,
+                                num_heads: n_q as u32,
+                                head_dim: head_dim as u32,
+                                layout: KvLayout::Nhd,
+                                attn_sink: sink_for_heads(&block.attn, n_q),
+                            })
+                            .await
+                            .map_err(|e| {
+                                TrajectError::Inference(format!("local decode L{li}: {e}"))
+                            })?;
+                        let mut attn_o = dec.o;
+                        attn_o.resize(q_width, 0.0);
+                        apply_rope_heads(
+                            &mut attn_o,
+                            n_q,
+                            head_dim,
+                            rd,
+                            q_pos,
+                            rope_theta,
+                            true,
+                        );
+                        let attn_out =
+                            self.weights.attn_to_hidden_layer(&block.attn, &attn_o, &x);
+                        streams =
+                            hc_post(&attn_out, &residual, &post, &comb, hc.hc_mult, hc.hidden);
+                        let residual = streams.clone();
+                        let (x, post, comb) = hc_pre(
+                            &streams,
+                            &hc.ffn,
+                            hc.hc_mult,
+                            hc.hidden,
+                            hc.sinkhorn_iters,
+                            hc.eps,
+                            hc.norm_eps,
+                        );
+                        let y = self.weights.moe_block_delta(
+                            block.ffn.as_ref(),
+                            block.moe.as_ref(),
+                            &x,
+                        );
+                        streams = hc_post(&y, &residual, &post, &comb, hc.hc_mult, hc.hidden);
                     } else {
-                        for (a, b) in h.iter_mut().zip(delta.iter()) {
-                            *a = 0.5 * *a + 0.5 * *b;
+                        let mut h = if streams.len() == self.weights.hidden {
+                            streams.clone()
+                        } else {
+                            mean_collapse_streams(&streams, hc_mult, self.weights.hidden)
+                        };
+                        let mut qq = self.weights.project_q_layer(&block.attn, &h);
+                        qq.resize(q_width, 0.0);
+                        let (k_cache, v_cache, seq_len) = self.kv.lock().materialize_kv(&pfx);
+                        if seq_len == 0 {
+                            let (mut kk, _) = self.weights.project_kv_layer(&block.attn, &h);
+                            kk.resize(kv_width, 0.0);
+                            apply_rope_latent(&mut kk, head_dim, rd, 0, rope_theta);
+                            let vv = kk.clone();
+                            self.kv.lock().append_kv(&pfx, &kk, &vv);
+                            streams = h;
+                            continue;
                         }
-                    }
-                    if let Some(ref ffn) = block.ffn {
-                        h = self.weights.shared_ffn_residual_block(ffn, &h);
-                    }
-                    if let Some(ref moe) = block.moe {
-                        let norm = block.ffn.as_ref().map(|f| f.ffn_norm.as_slice());
-                        h = self.weights.routed_moe_residual_block(moe, norm, &h);
+                        let q_pos = (seq_len as usize).saturating_sub(1);
+                        apply_rope_heads(&mut qq, n_q, head_dim, rd, q_pos, rope_theta, false);
+                        let k_exp = if self.multihead {
+                            expand_kv_mqa(&k_cache, seq_len as usize, n_q, head_dim)
+                        } else {
+                            k_cache
+                        };
+                        let v_exp = if self.multihead {
+                            expand_kv_mqa(&v_cache, seq_len as usize, n_q, head_dim)
+                        } else {
+                            v_cache
+                        };
+                        let dec = self
+                            .kernel
+                            .decode(DecodeRequest {
+                                q: qq,
+                                k_cache: k_exp,
+                                v_cache: v_exp,
+                                seq_len,
+                                num_heads: n_q as u32,
+                                head_dim: head_dim as u32,
+                                layout: KvLayout::Nhd,
+                                attn_sink: sink_for_heads(&block.attn, n_q),
+                            })
+                            .await
+                            .map_err(|e| {
+                                TrajectError::Inference(format!("local decode L{li}: {e}"))
+                            })?;
+                        let mut attn_o = dec.o;
+                        attn_o.resize(q_width, 0.0);
+                        apply_rope_heads(
+                            &mut attn_o,
+                            n_q,
+                            head_dim,
+                            rd,
+                            q_pos,
+                            rope_theta,
+                            true,
+                        );
+                        let delta =
+                            self.weights.attn_to_hidden_layer(&block.attn, &attn_o, &h);
+                        if block.attn.has_o_proj() {
+                            for (a, b) in h.iter_mut().zip(delta.iter()) {
+                                *a += *b;
+                            }
+                        } else {
+                            for (a, b) in h.iter_mut().zip(delta.iter()) {
+                                *a = 0.5 * *a + 0.5 * *b;
+                            }
+                        }
+                        if let Some(ref ffn) = block.ffn {
+                            h = self.weights.shared_ffn_residual_block(ffn, &h);
+                        }
+                        if let Some(ref moe) = block.moe {
+                            let norm = block.ffn.as_ref().map(|f| f.ffn_norm.as_slice());
+                            h = self.weights.routed_moe_residual_block(moe, norm, &h);
+                        }
+                        streams = h;
                     }
                 }
             }
 
+            let h = if streams.len() == self.weights.hidden {
+                streams
+            } else if let Some(ref hh) = self.weights.hc_head {
+                hc_head_collapse(&streams, hh)
+            } else {
+                mean_collapse_streams(&streams, hc_mult, self.weights.hidden)
+            };
             let logits = self.weights.logits(&h);
             let sampled = self
                 .kernel
@@ -1409,6 +1947,9 @@ impl InferenceBackend for LocalWeightRunner {
                 .first()
                 .and_then(|l| l.attn.attn_sink.as_ref())
                 .is_some(),
+            has_hc = self.weights.has_hc(),
+            has_hc_head = self.weights.hc_head.is_some(),
+            hc_mult = hc_mult,
             moe_cache = ?self.weights.layers.first().and_then(|l| {
                 l.moe.as_ref().map(|m| m.cache_stats())
             }),
@@ -1530,5 +2071,36 @@ mod tests {
         // first 4 dims (nope) unchanged; last 2 rotated
         assert_eq!(&x[..4], &head[..4]);
         assert!((x[4] - head[4]).abs() > 1e-6 || (x[5] - head[5]).abs() > 1e-6);
+    }
+
+    #[test]
+    fn hc_sinkhorn_shapes_and_positive() {
+        let hc = 2usize;
+        let mix_hc = (2 + hc) * hc; // 8
+        let mixes = vec![0.1f32; mix_hc];
+        let scale = vec![1.0f32, 1.0, 1.0];
+        let base = vec![0.0f32; mix_hc];
+        let (pre, post, comb) = hc_split_sinkhorn(&mixes, &scale, &base, hc, 4, 1e-6);
+        assert_eq!(pre.len(), hc);
+        assert_eq!(post.len(), hc);
+        assert_eq!(comb.len(), hc * hc);
+        for &p in &pre {
+            assert!(p > 0.0);
+        }
+        // col sums after sinkhorn should be ~1
+        for j in 0..hc {
+            let mut s = 0.0f32;
+            for i in 0..hc {
+                s += comb[i * hc + j];
+            }
+            assert!((s - 1.0).abs() < 0.05, "col {j} sum {s}");
+        }
+    }
+
+    #[test]
+    fn expand_hc_repeats() {
+        let h = vec![1.0f32, 2.0];
+        let s = expand_hc_streams(&h, 3);
+        assert_eq!(s, vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0]);
     }
 }
