@@ -1090,7 +1090,80 @@ fn slice_kv_window(
     (k_out, v_out, keep as u32)
 }
 
-/// Apply sliding window (optional) then MQA expand for KernelBackend.
+/// Max strided compress tokens to keep (matches V4 `index_topk` order of magnitude).
+fn max_compress_tokens() -> usize {
+    std::env::var("TRAJECT_COMPRESS_TOPK")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(512)
+        .max(1)
+}
+
+/// Indices for sliding-window tokens + strided history (compress layers).
+///
+/// Official path uses a learned compressor + indexer; this keeps a **strided
+/// full-token** stand-in for compressed slots so long-range tokens remain
+/// visible when `compress_ratio > 1`.
+fn build_sparse_kv_indices(
+    seq_len: usize,
+    window: usize,
+    compress_ratio: usize,
+    max_compress: usize,
+) -> Vec<usize> {
+    if seq_len == 0 {
+        return Vec::new();
+    }
+    let win = if window == 0 {
+        seq_len
+    } else {
+        window.min(seq_len)
+    };
+    let win_start = seq_len - win;
+    let mut idxs = Vec::with_capacity(win + max_compress.min(win_start / compress_ratio.max(1)));
+    if compress_ratio > 1 && win_start > 0 {
+        // One token per compress block in the pre-window history (block end).
+        let mut p = compress_ratio - 1;
+        let mut n = 0usize;
+        while p < win_start && n < max_compress {
+            idxs.push(p);
+            p += compress_ratio;
+            n += 1;
+        }
+    }
+    for i in win_start..seq_len {
+        idxs.push(i);
+    }
+    idxs
+}
+
+/// Gather selected token slots from `[S * width]` K/V caches.
+fn gather_kv_by_idx(
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    width: usize,
+    idxs: &[usize],
+) -> (Vec<f32>, Vec<f32>, u32) {
+    let width = width.max(1);
+    let n = idxs.len();
+    let mut ko = vec![0.0f32; n * width];
+    let mut vo = vec![0.0f32; n * width];
+    for (o, &i) in idxs.iter().enumerate() {
+        if i >= seq_len {
+            continue;
+        }
+        let src = i * width;
+        if src + width <= k.len() {
+            ko[o * width..(o + 1) * width].copy_from_slice(&k[src..src + width]);
+        }
+        if src + width <= v.len() {
+            vo[o * width..(o + 1) * width].copy_from_slice(&v[src..src + width]);
+        }
+    }
+    (ko, vo, n as u32)
+}
+
+/// Window (and optional strided compress history) then MQA expand for KernelBackend.
 fn prepare_kv_for_decode(
     multihead: bool,
     k_cache: Vec<f32>,
@@ -1099,13 +1172,20 @@ fn prepare_kv_for_decode(
     n_q: usize,
     head_dim: usize,
     window: usize,
+    compress_ratio: usize,
 ) -> (Vec<f32>, Vec<f32>, u32) {
     let width = if multihead {
         head_dim.max(1)
     } else {
         (n_q * head_dim).max(1)
     };
-    let (k, v, sl) = slice_kv_window(k_cache, v_cache, seq_len, width, window);
+    let s = seq_len as usize;
+    let (k, v, sl) = if compress_ratio > 1 && s > window.max(1) && window > 0 {
+        let idxs = build_sparse_kv_indices(s, window, compress_ratio, max_compress_tokens());
+        gather_kv_by_idx(&k_cache, &v_cache, s, width, &idxs)
+    } else {
+        slice_kv_window(k_cache, v_cache, seq_len, width, window)
+    };
     if multihead {
         (
             expand_kv_mqa(&k, sl as usize, n_q, head_dim),
@@ -1537,14 +1617,15 @@ impl InferenceBackend for LocalWeightRunner {
                             let mut attn_out = vec![0.0f32; self.weights.hidden];
                             if seq_len > 0 {
                                 let (k_exp, v_exp, seq_len) = prepare_kv_for_decode(
-    self.multihead,
-    k_cache,
-    v_cache,
-    seq_len,
-    n_q,
-    head_dim,
-    self.sliding_window,
-);
+                                    self.multihead,
+                                    k_cache,
+                                    v_cache,
+                                    seq_len,
+                                    n_q,
+                                    head_dim,
+                                    self.sliding_window,
+                                    block.attn.rope.compress_ratio,
+                                );
                                 if let Ok(dec) = self
                                     .kernel
                                     .decode(DecodeRequest {
@@ -1610,14 +1691,15 @@ impl InferenceBackend for LocalWeightRunner {
                             let (k_cache, v_cache, seq_len) = self.kv.lock().materialize_kv(&pfx);
                             if seq_len > 0 {
                                 let (k_exp, v_exp, seq_len) = prepare_kv_for_decode(
-    self.multihead,
-    k_cache,
-    v_cache,
-    seq_len,
-    n_q,
-    head_dim,
-    self.sliding_window,
-);
+                                    self.multihead,
+                                    k_cache,
+                                    v_cache,
+                                    seq_len,
+                                    n_q,
+                                    head_dim,
+                                    self.sliding_window,
+                                    block.attn.rope.compress_ratio,
+                                );
                                 if let Ok(dec) = self
                                     .kernel
                                     .decode(DecodeRequest {
@@ -1697,14 +1779,15 @@ impl InferenceBackend for LocalWeightRunner {
                 q.resize(q_width, 0.0);
                 apply_rope_heads(&mut q, n_q, head_dim, &toy_rope, q_pos, false);
                 let (k_exp, v_exp, seq_len) = prepare_kv_for_decode(
-    self.multihead,
-    k_cache,
-    v_cache,
-    seq_len,
-    n_q,
-    head_dim,
-    self.sliding_window,
-);
+                    self.multihead,
+                    k_cache,
+                    v_cache,
+                    seq_len,
+                    n_q,
+                    head_dim,
+                    self.sliding_window,
+                    0,
+                );
                 let dec = self
                     .kernel
                     .decode(DecodeRequest {
@@ -1756,14 +1839,15 @@ impl InferenceBackend for LocalWeightRunner {
                         qq.resize(q_width, 0.0);
                         apply_rope_heads(&mut qq, n_q, head_dim, &block.attn.rope, q_pos, false);
                         let (k_exp, v_exp, seq_len) = prepare_kv_for_decode(
-    self.multihead,
-    k_cache,
-    v_cache,
-    seq_len,
-    n_q,
-    head_dim,
-    self.sliding_window,
-);
+                            self.multihead,
+                            k_cache,
+                            v_cache,
+                            seq_len,
+                            n_q,
+                            head_dim,
+                            self.sliding_window,
+                            block.attn.rope.compress_ratio,
+                        );
                         let dec = self
                             .kernel
                             .decode(DecodeRequest {
@@ -1824,14 +1908,15 @@ impl InferenceBackend for LocalWeightRunner {
                         let q_pos = (seq_len as usize).saturating_sub(1);
                         apply_rope_heads(&mut qq, n_q, head_dim, &block.attn.rope, q_pos, false);
                         let (k_exp, v_exp, seq_len) = prepare_kv_for_decode(
-    self.multihead,
-    k_cache,
-    v_cache,
-    seq_len,
-    n_q,
-    head_dim,
-    self.sliding_window,
-);
+                            self.multihead,
+                            k_cache,
+                            v_cache,
+                            seq_len,
+                            n_q,
+                            head_dim,
+                            self.sliding_window,
+                            block.attn.rope.compress_ratio,
+                        );
                         let dec = self
                             .kernel
                             .decode(DecodeRequest {
@@ -2175,5 +2260,31 @@ mod tests {
         assert_eq!(sl, 1);
         assert_eq!(k2, k);
         assert_eq!(v2, v);
+    }
+
+    #[test]
+    fn sparse_indices_window_and_stride() {
+        // seq=20, window=4, ratio=4 → history ends 3,7,11,15 then window 16..19
+        let idxs = build_sparse_kv_indices(20, 4, 4, 512);
+        assert_eq!(idxs, vec![3, 7, 11, 15, 16, 17, 18, 19]);
+    }
+
+    #[test]
+    fn sparse_indices_swa_only_when_ratio_one() {
+        let idxs = build_sparse_kv_indices(10, 4, 0, 512);
+        assert_eq!(idxs, vec![6, 7, 8, 9]);
+        let idxs = build_sparse_kv_indices(10, 4, 1, 512);
+        assert_eq!(idxs, vec![6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn gather_kv_picks_tokens() {
+        // seq=3, width=2: tokens [0,1],[2,3],[4,5]
+        let k: Vec<f32> = (0..6).map(|x| x as f32).collect();
+        let v: Vec<f32> = (10..16).map(|x| x as f32).collect();
+        let (k2, v2, n) = gather_kv_by_idx(&k, &v, 3, 2, &[0, 2]);
+        assert_eq!(n, 2);
+        assert_eq!(k2, vec![0.0, 1.0, 4.0, 5.0]);
+        assert_eq!(v2, vec![10.0, 11.0, 14.0, 15.0]);
     }
 }

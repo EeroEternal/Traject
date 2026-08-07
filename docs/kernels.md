@@ -97,12 +97,14 @@ full f32 expand). Each layer:
    Q keeps **H heads × D** (`TRAJECT_ATTN_HEADS`, default 8; model has 64×512).  
    Per-head RMSNorm after `wq_b`. KV is a **single latent (K=V)**, stored compressed
    (`1 × D`) and expanded to H heads at kernel time.
-2. **RoPE + attn_sink + SWA:** last `qk_rope_head_dim` (64) dims get RoPE;
-   inverse RoPE on attention output. Per-head `attn_sink` absorbs softmax mass.
-   Decode attends only the last **`sliding_window`** tokens (default 128;
-   `TRAJECT_SLIDING_WINDOW=0` = full context).  
-   - `compress_ratios[i]==0`: base `rope_theta` (no YaRN)  
-   - `compress_ratios[i]>0`: **`compress_rope_theta` + YaRN** (`rope_scaling`)
+2. **RoPE + attn_sink + SWA / sparse history:** last `qk_rope_head_dim` (64)
+   dims get RoPE; inverse RoPE on attention output. Per-head `attn_sink`
+   absorbs softmax mass.  
+   - `compress_ratios[i]==0`: base `rope_theta`; attend last **`sliding_window`**
+     tokens (default 128; `TRAJECT_SLIDING_WINDOW=0` = full context)  
+   - `compress_ratios[i]>0`: **YaRN** + sparse gather = window tokens **and**
+     strided pre-window history (`TRAJECT_COMPRESS_TOPK`, default 512).  
+     (Stand-in for learned compressor/indexer; true compressor still TODO.)
 3. **o_proj:** group-concat heads → `wo_a` → `wo_b` (official layout; residual is
    `x += o`, not residual-through-`wo_a`).
 4. **Hyper-Connections (HC):** embed expands to `hc_mult` (4) streams; each block
@@ -112,14 +114,15 @@ full f32 expand). Each layer:
 
 Per-layer KV is keyed `{prefix}:L{i}`. Free drops base + all layer keys.
 
-**Not loaded yet:** full 43-layer production parity (compress/sparse indexer
-kernels); optional GPU dense FP8 matvec.
+**Not loaded yet:** learned compressor / indexer (strided history is temporary);
+full 43-layer parity; optional GPU dense FP8 matvec.
 
 ```bash
 export TRAJECT_LOCAL_LAYERS=2      # 1..TRAJECT_LOCAL_LAYERS_MAX (default cap 32)
 export TRAJECT_LOCAL_LAYERS_MAX=32 # raise toward 43 when RAM allows
 export TRAJECT_ATTN_HEADS=8        # Q heads (MQA); max 64 for V4 Flash
 export TRAJECT_SLIDING_WINDOW=128  # 0 = disable SWA
+export TRAJECT_COMPRESS_TOPK=512   # max strided history tokens (compress layers)
 export TRAJECT_MOE_CACHE=32        # LRU packed experts per MoE layer
 cargo run -p traject-cli --release -- \
   --local-runner --model /path/to/ds-v4-flash --max-tokens 4 "hello"
@@ -151,4 +154,6 @@ Chunk logs report `multihead`, `sliding_window`, `packed_fp8`, `moe_cache`.
 - [x] Sliding-window attention (`sliding_window` / `TRAJECT_SLIDING_WINDOW`)  
 - [x] Packed FP8 dense weights + fused matvec (attn + shared FFN)  
 - [x] Per-layer YaRN RoPE for compressed layers (`compress_ratios` / `compress_rope_theta`)  
+- [x] Sparse window + strided history KV gather for compress layers  
+- [ ] Learned compressor / indexer (true compressed KV slots)  
 - [ ] Full 43-layer production parity (still sglang for prod MoE)  
