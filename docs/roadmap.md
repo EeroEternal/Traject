@@ -48,6 +48,7 @@
 - [x] Learned KV compressor (gated pooling → compress pool)
 - [x] Learned indexer top-k over compress pool (ratio-4 layers)
 - [x] Shared MoE catalog across layers + `TRAJECT_LOCAL_LAYERS` up to full model depth
+- [x] Indexer Hadamard + FP4 QAT sim (official lightning-indexer QK path)
 - [ ] Quality/perf parity with sglang-lite for in-process 43-layer runs
 - [x] Tool latency-aware pin TTL from histograms (`ToolLatencyTracker` p95)
 - [x] Prefetch pin after tool return (`PinReason::Prefetch`)

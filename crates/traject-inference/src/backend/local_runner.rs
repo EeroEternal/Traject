@@ -1310,6 +1310,10 @@ fn compressor_push(
         }
         // RoPE at last token of the block
         rope.apply_slice(&mut out, pos, false);
+        // Indexer compressor: Hadamard + FP4 QAT (official rotate=True path).
+        if comp.rotate {
+            crate::weights::dtype::indexer_qk_qat_inplace(&mut out, 32);
+        }
         return Some(out);
     }
 
@@ -1390,6 +1394,9 @@ fn compressor_push(
         *v = *v * inv * g;
     }
     rope.apply_slice(&mut out, pos, false);
+    if comp.rotate {
+        crate::weights::dtype::indexer_qk_qat_inplace(&mut out, 32);
+    }
     Some(out)
 }
 
@@ -1468,11 +1475,13 @@ fn topk_compress_by_indexer(
         return (Vec::new(), Vec::new(), 0);
     }
     let k = ix.topk.min(n).max(1);
-    // q: [H * D_idx]
+    // q: [H * D_idx] — RoPE then Hadamard + FP4 QAT (official Indexer.forward)
     let mut q = ix.wq_b.matvec(qr);
     q.resize(nh * id, 0.0);
     for h in 0..nh {
-        ix.rope.apply_slice(&mut q[h * id..(h + 1) * id], pos, false);
+        let qh = &mut q[h * id..(h + 1) * id];
+        ix.rope.apply_slice(qh, pos, false);
+        crate::weights::dtype::indexer_qk_qat_inplace(qh, 32);
     }
     // head weights: weights_proj @ x  * scale
     let cols = ix.weights_proj.cols().max(1);
@@ -2798,7 +2807,8 @@ mod tests {
     #[test]
     fn indexer_topk_picks_highest_score() {
         use crate::weights::{CompressorWeights, IndexerWeights, LinearMat, RopeParams, TensorF32};
-        // 1 head, dim 2, topk 1, two compress tokens
+        // 1 head, dim 2, topk 1, two compress tokens.
+        // Index keys are pre-rotated/QAT'd as the rotate=true compressor would emit.
         let hidden = 2usize;
         let id = 2usize;
         let wq = TensorF32 {
@@ -2814,6 +2824,7 @@ mod tests {
             head_dim: id,
             hidden,
             overlap: false,
+            rotate: true,
             ape: vec![0.0; 4 * id],
             wkv: LinearMat::F32(wq.clone()),
             wgate: LinearMat::F32(wq.clone()),
@@ -2829,17 +2840,64 @@ mod tests {
             compressor: dummy_comp,
             rope: RopeParams::base(2, 10000.0),
         };
-        // main compress tokens dim=2: t0=[1,0], t1=[0,1]
+        // main compress tokens (unrotated main pool): t0=[1,0], t1=[0,1]
         let ck = vec![1.0, 0.0, 0.0, 1.0];
         let cv = ck.clone();
-        // index tokens same
-        let ik = ck.clone();
-        let qr = vec![1.0, 0.0]; // aligns with t0
+        // index stream: match q-side QAT of [1,0] vs its negation
+        let mut t0 = vec![1.0f32, 0.0];
+        crate::weights::dtype::indexer_qk_qat_inplace(&mut t0, 32);
+        let mut t1 = vec![-t0[0], -t0[1]];
+        let mut ik = t0;
+        ik.append(&mut t1);
+        let qr = vec![1.0, 0.0];
         let x = vec![1.0, 0.0];
         let (ok, _ov, n) =
             topk_compress_by_indexer(&ix, &qr, &x, 0, &ck, &cv, 2, 2, &ik, 2);
         assert_eq!(n, 1);
         assert_eq!(ok, vec![1.0, 0.0]);
+    }
+
+    #[test]
+    fn compressor_rotate_applies_qat() {
+        use crate::weights::{CompressorWeights, LinearMat, RopeParams, TensorF32};
+        let hidden = 4usize;
+        let head_dim = 4usize; // power of two for Hadamard
+        let ratio = 2usize;
+        let w = TensorF32 {
+            data: {
+                let mut m = vec![0.0f32; head_dim * hidden];
+                for i in 0..head_dim {
+                    m[i * hidden + i] = 1.0;
+                }
+                m
+            },
+            shape: vec![head_dim, hidden],
+        };
+        let comp = CompressorWeights {
+            ratio,
+            head_dim,
+            hidden,
+            overlap: false,
+            rotate: true,
+            ape: vec![0.0; ratio * head_dim],
+            wkv: LinearMat::F32(w.clone()),
+            wgate: LinearMat::F32(w),
+            norm: vec![1.0; head_dim],
+        };
+        let rope = RopeParams::base(2, 10000.0);
+        let mut st = CompressLayerState::new(&comp);
+        let x = vec![1.0f32, 0.5, 0.25, 0.125];
+        assert!(compressor_push(&comp, &mut st, &x, 0, &rope).is_none());
+        let out = compressor_push(&comp, &mut st, &x, 1, &rope).expect("emit");
+        assert_eq!(out.len(), head_dim);
+        assert!(out.iter().all(|v| v.is_finite()));
+        // QAT projects onto the e2m1×scale lattice (not identity passthrough).
+        let mut ref_x = out.clone();
+        // already QAT'd once; second pass should be nearly idempotent
+        crate::weights::dtype::fp4_act_quant_inplace(&mut ref_x, 32);
+        for (a, b) in out.iter().zip(ref_x.iter()) {
+            assert!((a - b).abs() < 1e-4, "{a} vs {b}");
+        }
     }
 
     #[test]
@@ -2864,6 +2922,7 @@ mod tests {
             head_dim,
             hidden,
             overlap: false,
+            rotate: false,
             ape: vec![0.0; ratio * head_dim],
             wkv: LinearMat::F32(w.clone()),
             wgate: LinearMat::F32(w),

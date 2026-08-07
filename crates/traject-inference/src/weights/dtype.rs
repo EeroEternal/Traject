@@ -330,6 +330,122 @@ pub fn row_dot_fp8_block_scaled(
     Ok(acc)
 }
 
+/// In-place normalized Walsh–Hadamard transform (FWHT).
+///
+/// Matches `fast_hadamard_transform.hadamard_transform(x, scale=dim**-0.5)` when
+/// `scale = (len as f32).sqrt().recip()`. `x.len()` must be a power of two.
+pub fn hadamard_transform_inplace(x: &mut [f32], scale: f32) {
+    let n = x.len();
+    if n == 0 {
+        return;
+    }
+    debug_assert!(n.is_power_of_two(), "hadamard len {n} must be power of two");
+    let mut h = 1usize;
+    while h < n {
+        let step = h * 2;
+        for i in (0..n).step_by(step) {
+            for j in 0..h {
+                let a = x[i + j];
+                let b = x[i + j + h];
+                x[i + j] = a + b;
+                x[i + j + h] = a - b;
+            }
+        }
+        h = step;
+    }
+    if (scale - 1.0).abs() > f32::EPSILON {
+        for v in x.iter_mut() {
+            *v *= scale;
+        }
+    }
+}
+
+/// Official `rotate_activation`: Hadamard with `scale = dim ** -0.5`.
+///
+/// No-op when `x.len()` is not a power of two (production index heads use 128).
+pub fn rotate_activation_inplace(x: &mut [f32]) {
+    let n = x.len();
+    if n == 0 || !n.is_power_of_two() {
+        return;
+    }
+    let scale = (n as f32).sqrt().recip();
+    hadamard_transform_inplace(x, scale);
+}
+
+/// Nearest OCP FP4 E2M1 codepoint for a scalar in `[-6, 6]`.
+#[inline]
+pub fn f32_to_nearest_e2m1(v: f32) -> f32 {
+    // Positive codebook: 0, 0.5, 1, 1.5, 2, 3, 4, 6
+    const POS: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+    let sign = if v.is_sign_negative() { -1.0 } else { 1.0 };
+    let a = v.abs().min(6.0);
+    let mut best = POS[0];
+    let mut best_d = (a - best).abs();
+    for &c in &POS[1..] {
+        let d = (a - c).abs();
+        if d < best_d {
+            best = c;
+            best_d = d;
+        }
+    }
+    sign * best
+}
+
+/// `ceil(log2(x))` via IEEE-754 bit ops (matches TileLang `fast_log2_ceil`).
+#[inline]
+fn fast_log2_ceil(x: f32) -> i32 {
+    let bits = x.to_bits();
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let man = bits & 0x7f_ffff;
+    exp - 127 + if man != 0 { 1 } else { 0 }
+}
+
+/// Power-of-two scale for FP4 QAT: `2^ceil(log2(amax / 6))`.
+#[inline]
+fn fp4_round_scale(amax: f32) -> f32 {
+    // Floor amax so scale stays in e8m0 range (official: max(amax, 6 * 2^-126)).
+    let amax = amax.max(6.0 * 2f32.powi(-126));
+    let t = amax / 6.0;
+    2f32.powi(fast_log2_ceil(t))
+}
+
+/// Block-wise FP4 quant → dequant (QAT simulation), matching `fp4_act_quant(..., inplace=True)`.
+///
+/// Groups along the last axis of length `x.len()` (one row). When `len % block_size != 0`,
+/// falls back to a single block of full length (unit tests with tiny dims).
+pub fn fp4_act_quant_inplace(x: &mut [f32], block_size: usize) {
+    let n = x.len();
+    if n == 0 {
+        return;
+    }
+    let bs = if block_size > 0 && n % block_size == 0 {
+        block_size
+    } else {
+        n
+    };
+    let mut i = 0;
+    while i < n {
+        let end = (i + bs).min(n);
+        let mut amax = 0.0f32;
+        for v in &x[i..end] {
+            amax = amax.max(v.abs());
+        }
+        let s = fp4_round_scale(amax);
+        let inv = if s > 0.0 { 1.0 / s } else { 0.0 };
+        for v in &mut x[i..end] {
+            let q = f32_to_nearest_e2m1(*v * inv);
+            *v = q * s;
+        }
+        i = end;
+    }
+}
+
+/// Indexer Q/K path: Hadamard rotate then FP4 QAT sim (official `Indexer.forward`).
+pub fn indexer_qk_qat_inplace(x: &mut [f32], fp4_block: usize) {
+    rotate_activation_inplace(x);
+    fp4_act_quant_inplace(x, fp4_block);
+}
+
 /// Block-scaled FP8 dequant: `weight[out,in]` with `scale[out/B, in/B]`, block size `B`.
 ///
 /// DeepSeek-V4 uses B=128: e4m3 weights × e8m0 scales.
@@ -485,5 +601,65 @@ mod tests {
         for (a, b) in y.iter().zip(y_ref.iter()) {
             assert!((a - b).abs() < 1e-5, "{a} vs {b}");
         }
+    }
+
+    #[test]
+    fn hadamard_dim2_normalized() {
+        // H2 * [1,0] / sqrt(2) = [1,1]/sqrt(2)
+        let mut x = [1.0f32, 0.0];
+        rotate_activation_inplace(&mut x);
+        let s = 2f32.sqrt().recip();
+        assert!((x[0] - s).abs() < 1e-5, "x0={}", x[0]);
+        assert!((x[1] - s).abs() < 1e-5, "x1={}", x[1]);
+    }
+
+    #[test]
+    fn hadamard_involutive_up_to_sign_scale() {
+        // Normalized FWHT is involutive: H(H(x)) = x
+        let mut x = [1.0f32, 2.0, 3.0, 4.0];
+        let orig = x;
+        rotate_activation_inplace(&mut x);
+        rotate_activation_inplace(&mut x);
+        for (a, b) in x.iter().zip(orig.iter()) {
+            assert!((a - b).abs() < 1e-4, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn e2m1_nearest_known() {
+        assert!((f32_to_nearest_e2m1(0.1) - 0.0).abs() < 1e-6);
+        assert!((f32_to_nearest_e2m1(0.4) - 0.5).abs() < 1e-6);
+        assert!((f32_to_nearest_e2m1(5.0) - 4.0).abs() < 1e-6 || (f32_to_nearest_e2m1(5.0) - 6.0).abs() < 1e-6);
+        assert!((f32_to_nearest_e2m1(-1.2) + 1.0).abs() < 1e-6 || (f32_to_nearest_e2m1(-1.2) + 1.5).abs() < 1e-6);
+        assert!((f32_to_nearest_e2m1(10.0) - 6.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fp4_act_quant_roundtrips_exact_codebook() {
+        // Values already on the grid with amax=6 → scale=1
+        let mut x = [0.0f32, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+        let orig = x;
+        fp4_act_quant_inplace(&mut x, 8);
+        for (a, b) in x.iter().zip(orig.iter()) {
+            assert!((a - b).abs() < 1e-5, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn fp4_act_quant_scales_large_values() {
+        // amax=12 → scale = 2 (ceil log2(12/6)=ceil log2(2)=1 → 2)
+        let mut x = [12.0f32; 32];
+        fp4_act_quant_inplace(&mut x, 32);
+        // 12/2=6 → e2m1 6 → *2 = 12
+        for v in &x {
+            assert!((v - 12.0).abs() < 1e-4, "v={v}");
+        }
+    }
+
+    #[test]
+    fn indexer_qk_qat_finite() {
+        let mut x: Vec<f32> = (0..128).map(|i| (i as f32) * 0.01 - 0.5).collect();
+        indexer_qk_qat_inplace(&mut x, 32);
+        assert!(x.iter().all(|v| v.is_finite()));
     }
 }

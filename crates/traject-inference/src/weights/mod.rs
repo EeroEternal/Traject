@@ -1,7 +1,7 @@
 //! Weight loading for in-process runners (safetensors / HF sharded checkpoints).
 
 mod catalog;
-mod dtype;
+pub mod dtype;
 mod hf_config;
 
 pub use catalog::{
