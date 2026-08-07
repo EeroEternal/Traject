@@ -58,6 +58,30 @@ pub struct HfModelConfig {
     /// Sliding-window size for pure SWA layers (V4 Flash: 128).
     #[serde(default, alias = "window_size")]
     pub sliding_window: Option<u32>,
+    /// Per-layer KV compress ratios (0 = pure SWA; >0 = compress + YaRN rope).
+    #[serde(default)]
+    pub compress_ratios: Option<Vec<u32>>,
+    /// RoPE base for compressed layers (V4 Flash: 160000).
+    #[serde(default)]
+    pub compress_rope_theta: Option<f32>,
+    /// YaRN / rope scaling block from config.json.
+    #[serde(default)]
+    pub rope_scaling: Option<RopeScalingConfig>,
+}
+
+/// Subset of HF `rope_scaling` used for YaRN frequency interpolation.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct RopeScalingConfig {
+    #[serde(default)]
+    pub r#type: Option<String>,
+    #[serde(default)]
+    pub factor: Option<f32>,
+    #[serde(default)]
+    pub original_max_position_embeddings: Option<u32>,
+    #[serde(default)]
+    pub beta_fast: Option<f32>,
+    #[serde(default)]
+    pub beta_slow: Option<f32>,
 }
 
 fn default_vocab() -> u32 {

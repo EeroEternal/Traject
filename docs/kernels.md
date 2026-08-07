@@ -97,10 +97,12 @@ full f32 expand). Each layer:
    Q keeps **H heads × D** (`TRAJECT_ATTN_HEADS`, default 8; model has 64×512).  
    Per-head RMSNorm after `wq_b`. KV is a **single latent (K=V)**, stored compressed
    (`1 × D`) and expanded to H heads at kernel time.
-2. **RoPE + attn_sink + SWA:** last `qk_rope_head_dim` (64) dims get base RoPE;
+2. **RoPE + attn_sink + SWA:** last `qk_rope_head_dim` (64) dims get RoPE;
    inverse RoPE on attention output. Per-head `attn_sink` absorbs softmax mass.
    Decode attends only the last **`sliding_window`** tokens (default 128;
-   `TRAJECT_SLIDING_WINDOW=0` = full context).
+   `TRAJECT_SLIDING_WINDOW=0` = full context).  
+   - `compress_ratios[i]==0`: base `rope_theta` (no YaRN)  
+   - `compress_ratios[i]>0`: **`compress_rope_theta` + YaRN** (`rope_scaling`)
 3. **o_proj:** group-concat heads → `wo_a` → `wo_b` (official layout; residual is
    `x += o`, not residual-through-`wo_a`).
 4. **Hyper-Connections (HC):** embed expands to `hc_mult` (4) streams; each block
@@ -110,8 +112,8 @@ full f32 expand). Each layer:
 
 Per-layer KV is keyed `{prefix}:L{i}`. Free drops base + all layer keys.
 
-**Not loaded yet:** full 43-layer production parity (compress/sparse indexer,
-YaRN); optional GPU kernels for dense FP8 matvec.
+**Not loaded yet:** full 43-layer production parity (compress/sparse indexer
+kernels); optional GPU dense FP8 matvec.
 
 ```bash
 export TRAJECT_LOCAL_LAYERS=2      # 1..TRAJECT_LOCAL_LAYERS_MAX (default cap 32)
@@ -148,4 +150,5 @@ Chunk logs report `multihead`, `sliding_window`, `packed_fp8`, `moe_cache`.
 - [x] Shared dense safetensors catalog + raised layer cap (`TRAJECT_LOCAL_LAYERS_MAX`)  
 - [x] Sliding-window attention (`sliding_window` / `TRAJECT_SLIDING_WINDOW`)  
 - [x] Packed FP8 dense weights + fused matvec (attn + shared FFN)  
+- [x] Per-layer YaRN RoPE for compressed layers (`compress_ratios` / `compress_rope_theta`)  
 - [ ] Full 43-layer production parity (still sglang for prod MoE)  
