@@ -1434,7 +1434,8 @@ pub struct Layer0RoutedMoe {
     pub route_scale: f32,
     pub hidden: usize,
     pub intermediate: usize,
-    catalog: std::sync::Mutex<SafetensorCatalog>,
+    /// Shared across layers when loaded via [`load_layer_stack`].
+    catalog: std::sync::Arc<std::sync::Mutex<SafetensorCatalog>>,
     cache: std::sync::Mutex<ExpertLru>,
 }
 
@@ -1454,15 +1455,7 @@ impl std::fmt::Debug for Layer0RoutedMoe {
 
 impl Clone for Layer0RoutedMoe {
     fn clone(&self) -> Self {
-        // Re-open catalog + empty LRU (mmap state is not shared across clones).
-        let catalog = SafetensorCatalog::open(&self.model_dir).unwrap_or_else(|_| {
-            // Fallback empty catalog; expert() will error clearly.
-            SafetensorCatalog {
-                root: self.model_dir.clone(),
-                weight_map: HashMap::new(),
-                open: HashMap::new(),
-            }
-        });
+        // Share catalog Arc; empty LRU (per-clone expert cache).
         let cap = self.cache.lock().map(|c| c.cap).unwrap_or(32);
         Self {
             model_dir: self.model_dir.clone(),
@@ -1473,7 +1466,7 @@ impl Clone for Layer0RoutedMoe {
             route_scale: self.route_scale,
             hidden: self.hidden,
             intermediate: self.intermediate,
-            catalog: std::sync::Mutex::new(catalog),
+            catalog: std::sync::Arc::clone(&self.catalog),
             cache: std::sync::Mutex::new(ExpertLru::new(cap)),
         }
     }
@@ -1560,12 +1553,26 @@ fn load_fp4_expert_packed(
 
 /// Load routed MoE gate for `layers.{layer}` (packed FP4 experts, lazy LRU).
 pub fn load_layer_routed_moe(model_dir: &Path, layer: usize) -> Result<Layer0RoutedMoe> {
-    let mut cat = SafetensorCatalog::open(model_dir)?;
+    let cat = std::sync::Arc::new(std::sync::Mutex::new(SafetensorCatalog::open(model_dir)?));
+    load_layer_routed_moe_with_catalog(model_dir, layer, cat)
+}
+
+/// Like [`load_layer_routed_moe`] but reuses a shared catalog (one open per stack).
+pub fn load_layer_routed_moe_with_catalog(
+    model_dir: &Path,
+    layer: usize,
+    catalog: std::sync::Arc<std::sync::Mutex<SafetensorCatalog>>,
+) -> Result<Layer0RoutedMoe> {
     let gate_name = format!("layers.{layer}.ffn.gate.weight");
-    if !cat.has(&gate_name) {
-        return Err(TrajectError::Other(format!("{gate_name} not found")));
-    }
-    let gate = cat.load_f32(&gate_name)?;
+    let (gate, e0) = {
+        let mut cat = catalog.lock().unwrap_or_else(|e| e.into_inner());
+        if !cat.has(&gate_name) {
+            return Err(TrajectError::Other(format!("{gate_name} not found")));
+        }
+        let gate = cat.load_f32(&gate_name)?;
+        let e0 = load_fp4_expert_packed(&mut cat, layer, 0)?;
+        (gate, e0)
+    };
     if gate.shape.len() != 2 {
         return Err(TrajectError::Other(format!(
             "gate shape {:?} want [n_experts, hidden]",
@@ -1575,8 +1582,6 @@ pub fn load_layer_routed_moe(model_dir: &Path, layer: usize) -> Result<Layer0Rou
     let n_experts = gate.rows();
     let hidden = gate.cols();
 
-    // Probe expert 0 (packed only) for intermediate size.
-    let e0 = load_fp4_expert_packed(&mut cat, layer, 0)?;
     if e0.w1.logical_cols() != hidden || e0.w3.logical_cols() != hidden {
         return Err(TrajectError::Other(format!(
             "expert0 in_features mismatch: hidden={hidden} w1_cols={} w3_cols={}",
@@ -1621,6 +1626,7 @@ pub fn load_layer_routed_moe(model_dir: &Path, layer: usize) -> Result<Layer0Rou
         intermediate,
         layer,
         cache_cap,
+        shared_moe_catalog = true,
         "loaded layer routed MoE gate (packed FP4 experts, fused matvec, catalog kept open)"
     );
 
@@ -1633,7 +1639,7 @@ pub fn load_layer_routed_moe(model_dir: &Path, layer: usize) -> Result<Layer0Rou
         route_scale,
         hidden,
         intermediate,
-        catalog: std::sync::Mutex::new(cat),
+        catalog,
         cache: std::sync::Mutex::new(lru),
     })
 }
@@ -1912,17 +1918,19 @@ pub fn load_hc_head(model_dir: &Path) -> Result<HcHeadWeights> {
 
 /// Load the first `n_layers` transformer blocks (attn + shared FFN + routed MoE + HC).
 ///
-/// Reuses one [`SafetensorCatalog`] for dense attn/FFN/HC tensors. Each routed MoE
-/// layer still opens its own catalog (kept live for lazy expert loads).
+/// Reuses one dense [`SafetensorCatalog`] for attn/FFN/HC, and **one shared**
+/// catalog for all MoE layers (lazy expert loads).
 pub fn load_layer_stack(model_dir: &Path, n_layers: usize) -> Result<Vec<LayerBlock>> {
     let n = n_layers.max(1);
     let mut cat = SafetensorCatalog::open(model_dir)?;
+    let moe_cat = std::sync::Arc::new(std::sync::Mutex::new(SafetensorCatalog::open(model_dir)?));
     let mut out = Vec::with_capacity(n);
     for layer in 0..n {
         let attn = load_layer_attn_into(&mut cat, model_dir, layer)?;
         let ffn = load_layer_shared_ffn_into(&mut cat, model_dir, layer).ok();
-        // MoE keeps its own catalog for expert LRU; separate open is intentional.
-        let moe = load_layer_routed_moe(model_dir, layer).ok();
+        let moe =
+            load_layer_routed_moe_with_catalog(model_dir, layer, std::sync::Arc::clone(&moe_cat))
+                .ok();
         let hc = match load_layer_hc_into(&mut cat, model_dir, layer) {
             Ok(h) => Some(h),
             Err(e) => {
@@ -1947,7 +1955,8 @@ pub fn load_layer_stack(model_dir: &Path, n_layers: usize) -> Result<Vec<LayerBl
     info!(
         n_layers = n,
         dir = %model_dir.display(),
-        shared_catalog = true,
+        shared_dense_catalog = true,
+        shared_moe_catalog = true,
         "loaded layer stack"
     );
     Ok(out)

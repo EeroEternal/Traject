@@ -1028,10 +1028,10 @@ fn mean_collapse_streams(streams: &[f32], hc_mult: usize, hidden: usize) -> Vec<
 /// How many transformer layers to load for the local runner.
 ///
 /// - `TRAJECT_LOCAL_LAYERS` — requested count (default **2**, min 1)
-/// - `TRAJECT_LOCAL_LAYERS_MAX` — hard cap (default **32** with packed FP8 dense,
-///   never above model depth)
+/// - `TRAJECT_LOCAL_LAYERS_MAX` — hard cap (default **43** = full V4 Flash depth,
+///   never above model `num_hidden_layers`)
 ///
-/// Packed FP8 dense is ~¼ of f32 (~0.13 GiB/layer); raise toward 43 when RAM allows.
+/// Packed FP8 dense is ~0.13 GiB/layer; 43 layers ~6 GiB dense (+ embed/head).
 fn local_layer_count(cfg: Option<&crate::weights::HfModelConfig>) -> usize {
     let env = std::env::var("TRAJECT_LOCAL_LAYERS")
         .ok()
@@ -1044,7 +1044,7 @@ fn local_layer_count(cfg: Option<&crate::weights::HfModelConfig>) -> usize {
     let cap = std::env::var("TRAJECT_LOCAL_LAYERS_MAX")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(32)
+        .unwrap_or(max_model.max(1))
         .max(1)
         .min(max_model);
     n.min(cap)

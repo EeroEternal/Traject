@@ -115,12 +115,12 @@ full f32 expand). Each layer:
 
 Per-layer KV is keyed `{prefix}:L{i}`. Free drops base + all layer keys.
 
-**Not loaded yet:** full 43-layer production parity; Hadamard/FP4 QAT sim in
-indexer; optional GPU dense FP8 matvec.
+**Remaining gaps vs full production:** Hadamard/FP4 QAT sim in indexer; GPU
+dense FP8 matvec; quality parity (CPU path is a research stack, not sglang-lite).
 
 ```bash
-export TRAJECT_LOCAL_LAYERS=2      # 1..TRAJECT_LOCAL_LAYERS_MAX (default cap 32)
-export TRAJECT_LOCAL_LAYERS_MAX=32 # raise toward 43 when RAM allows
+export TRAJECT_LOCAL_LAYERS=2      # 1..num_hidden_layers (V4 Flash: 43)
+export TRAJECT_LOCAL_LAYERS_MAX=43 # default = model depth
 export TRAJECT_ATTN_HEADS=8        # Q heads (MQA); max 64 for V4 Flash
 export TRAJECT_SLIDING_WINDOW=128  # 0 = disable SWA
 export TRAJECT_COMPRESS_TOPK=512   # max strided history tokens (compress layers)
@@ -129,8 +129,9 @@ cargo run -p traject-cli --release -- \
   --local-runner --model /path/to/ds-v4-flash --max-tokens 4 "hello"
 ```
 
-Dense attn/FFN use **packed FP8** fused matvec; routed MoE uses **packed FP4**.
-Chunk logs report `multihead`, `sliding_window`, `packed_fp8`, `moe_cache`.
+Dense attn/FFN use **packed FP8** fused matvec; all MoE layers share **one**
+safetensors catalog; routed experts use **packed FP4**. Chunk logs report
+`multihead`, `sliding_window`, `n_layers`, `moe_cache`.
 
 ## Status
 
@@ -158,6 +159,5 @@ Chunk logs report `multihead`, `sliding_window`, `packed_fp8`, `moe_cache`.
 - [x] Sparse window + strided history KV gather for compress layers  
 - [x] Learned KV compressor (`compressor.*` → `{prefix}:L{i}:C` pool)  
 - [x] Learned indexer top-k (`indexer.*` → score `:I`, select `:C`)  
-
-- [ ] Learned indexer top-k over compress pool  
-- [ ] Full 43-layer production parity (still sglang for prod MoE)  
+- [x] Shared MoE safetensors catalog across layers + full-depth layer cap (43)  
+- [ ] Quality/perf parity with sglang-lite (GPU kernels, QAT sim, full eval)  
