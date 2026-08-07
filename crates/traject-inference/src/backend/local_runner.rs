@@ -197,6 +197,8 @@ struct ModelWeights {
     layers: Vec<crate::weights::LayerBlock>,
     source: String,
     eos_token_id: Option<u32>,
+    /// Base RoPE theta (V4 Flash: 10000 for pure SWA layers).
+    rope_theta: f32,
 }
 
 impl ModelWeights {
@@ -224,6 +226,7 @@ impl ModelWeights {
             layers: Vec::new(),
             source: "toy".into(),
             eos_token_id: Some(1),
+            rope_theta: 10000.0,
         }
     }
 
@@ -285,6 +288,10 @@ impl ModelWeights {
             model_type = ?cfg.as_ref().and_then(|c| c.model_type.clone()),
             "loaded real safetensors embed/head for local runner"
         );
+        let rope_theta = cfg
+            .as_ref()
+            .and_then(|c| c.rope_theta)
+            .unwrap_or(10000.0);
         Ok(Self {
             vocab: cfg.as_ref().map(|c| c.vocab_size).unwrap_or(vocab).max(vocab),
             hidden,
@@ -297,6 +304,7 @@ impl ModelWeights {
             layers,
             source: format!("safetensors:{}", model_dir.display()),
             eos_token_id: eos.or(Some(1)),
+            rope_theta,
         })
     }
 
@@ -325,7 +333,7 @@ impl ModelWeights {
         self.rms_norm_with(x, self.norm.as_deref())
     }
 
-    /// Hidden → Q vector for a specific layer (or toy down if no layers).
+    /// Hidden → multi-head Q (no RoPE; caller applies position).
     fn project_q_layer(&self, layer: &crate::weights::Layer0AttnWeights, h: &[f32]) -> Vec<f32> {
         let hn = self.rms_norm_with(h, Some(&layer.attn_norm));
         let mut q = matvec(&layer.wq_a.data, layer.q_lora_dim(), layer.hidden, &hn);
@@ -345,6 +353,18 @@ impl ModelWeights {
             } else {
                 out.resize(need, 0.0);
             }
+            // Per-head RMSNorm after wq_b (official Attention.forward).
+            for hi in 0..use_h {
+                let sl = &mut out[hi * head_dim..(hi + 1) * head_dim];
+                let mut ss = 0.0f32;
+                for v in sl.iter() {
+                    ss += v * v;
+                }
+                let inv = (ss / head_dim as f32 + 1e-6).sqrt().recip();
+                for v in sl.iter_mut() {
+                    *v *= inv;
+                }
+            }
             return out;
         }
         let mut out = q;
@@ -352,6 +372,7 @@ impl ModelWeights {
         out
     }
 
+    /// Hidden → shared MQA latent (K=V). RoPE applied by caller at token pos.
     fn project_kv_layer(
         &self,
         layer: &crate::weights::Layer0AttnWeights,
@@ -362,8 +383,9 @@ impl ModelWeights {
         if let Some(ref kn) = layer.kv_norm {
             kv = self.rms_norm_with(&kv, Some(kn));
         }
-        kv.resize(self.attn_dim, 0.0);
-        let v = kv.iter().map(|x| x * 0.5).collect();
+        kv.resize(layer.kv_dim().max(1), 0.0);
+        // Official V4: single latent is both K and V for sparse MLA.
+        let v = kv.clone();
         (kv, v)
     }
 
@@ -387,7 +409,7 @@ impl ModelWeights {
         &self,
         layer: &crate::weights::Layer0AttnWeights,
         attn_o: &[f32],
-        h_resid: &[f32],
+        _h_resid: &[f32],
     ) -> Vec<f32> {
         if let Some(ref wo_b) = layer.wo_b {
             let inter = layer.o_intermediate();
@@ -401,52 +423,76 @@ impl ModelWeights {
             } else {
                 1
             };
-            if n_heads > 1 && attn_o.len() >= n_heads * head_dim {
-                // Multi-head o: [H, D] → group-mean → o_lora slots.
-                let hpg = (n_heads / g).max(1);
-                for gi in 0..g {
-                    let mut pooled = vec![0.0f32; head_dim];
-                    let mut count = 0usize;
-                    for hi in 0..hpg {
-                        let h = gi * hpg + hi;
-                        if h >= n_heads {
+            // Official: o.view(groups, heads_per_group * head_dim) @ wo_a[g]
+            // (concat heads in group — not mean-pool).
+            let hpg = (n_heads_full / g).max(1);
+            let group_in = hpg * head_dim;
+            if let Some(ref wo_a) = layer.wo_a {
+                if wo_a.rows() == inter && wo_a.cols() == group_in && n_heads >= hpg {
+                    let groups_used = (n_heads / hpg).min(g).max(1);
+                    for gi in 0..groups_used {
+                        let gbase = gi * hpg * head_dim;
+                        if gbase + group_in > attn_o.len() {
                             break;
                         }
-                        let base = h * head_dim;
-                        for d in 0..head_dim {
-                            pooled[d] += attn_o[base + d];
+                        let group = &attn_o[gbase..gbase + group_in];
+                        for r in 0..lor {
+                            let row = &wo_a.data[(gi * lor + r) * group_in
+                                ..(gi * lor + r + 1) * group_in];
+                            let mut s = 0.0f32;
+                            for (a, b) in row.iter().zip(group.iter()) {
+                                s += a * b;
+                            }
+                            mid[gi * lor + r] = s;
                         }
-                        count += 1;
                     }
-                    if count > 0 {
-                        let inv = 1.0 / count as f32;
-                        for d in pooled.iter_mut() {
-                            *d *= inv;
+                } else if n_heads > 1 && attn_o.len() >= n_heads * head_dim {
+                    // Fallback: mean-pool heads when group dims don't match (partial heads).
+                    let hpg_use = (n_heads / g).max(1);
+                    for gi in 0..g {
+                        let mut pooled = vec![0.0f32; head_dim];
+                        let mut count = 0usize;
+                        for hi in 0..hpg_use {
+                            let h = gi * hpg_use + hi;
+                            if h >= n_heads {
+                                break;
+                            }
+                            let base = h * head_dim;
+                            for d in 0..head_dim {
+                                pooled[d] += attn_o[base + d];
+                            }
+                            count += 1;
+                        }
+                        if count > 0 {
+                            let inv = 1.0 / count as f32;
+                            for d in pooled.iter_mut() {
+                                *d *= inv;
+                            }
+                        }
+                        let base = gi * lor;
+                        let take = head_dim.min(lor);
+                        for d in 0..take {
+                            mid[base + d] += pooled[d];
                         }
                     }
-                    let base = gi * lor;
-                    let take = head_dim.min(lor);
-                    for d in 0..take {
-                        mid[base + d] += pooled[d];
+                } else {
+                    let take = attn_o.len().min(lor);
+                    let scale = 1.0 / (g as f32).sqrt();
+                    for gi in 0..g {
+                        let base = gi * lor;
+                        for d in 0..take {
+                            mid[base + d] += attn_o[d] * scale;
+                        }
                     }
                 }
             } else {
-                // Single-vector o (legacy / toy): inject into each group.
+                // No wo_a: inject raw o into o_lora slots.
                 let take = attn_o.len().min(lor);
                 let scale = 1.0 / (g as f32).sqrt();
                 for gi in 0..g {
                     let base = gi * lor;
                     for d in 0..take {
                         mid[base + d] += attn_o[d] * scale;
-                    }
-                }
-            }
-            if let Some(ref wo_a) = layer.wo_a {
-                if wo_a.rows() == inter && wo_a.cols() == layer.hidden && h_resid.len() == layer.hidden
-                {
-                    let add = matvec(&wo_a.data, inter, layer.hidden, h_resid);
-                    for (m, a) in mid.iter_mut().zip(add.iter()) {
-                        *m += *a;
                     }
                 }
             }
@@ -620,6 +666,67 @@ fn expand_kv_mqa(kv: &[f32], seq: usize, n_q_heads: usize, head_dim: usize) -> V
         }
     }
     out
+}
+
+/// Apply rotary embeddings to the last `rope_dim` of a single head vector.
+///
+/// Matches official `apply_rotary_emb` (complex multiply on consecutive pairs).
+fn apply_rope_slice(x: &mut [f32], pos: usize, rope_dim: usize, theta: f32, inverse: bool) {
+    if rope_dim == 0 || x.len() < rope_dim {
+        return;
+    }
+    let start = x.len() - rope_dim;
+    let half = rope_dim / 2;
+    let sign = if inverse { -1.0f32 } else { 1.0f32 };
+    for i in 0..half {
+        let freq = 1.0 / theta.powf((2 * i) as f32 / rope_dim as f32);
+        let angle = (pos as f32) * freq;
+        let (c, s) = (angle.cos(), angle.sin() * sign);
+        let a = x[start + 2 * i];
+        let b = x[start + 2 * i + 1];
+        x[start + 2 * i] = a * c - b * s;
+        x[start + 2 * i + 1] = a * s + b * c;
+    }
+}
+
+/// RoPE on multi-head layout `[H * D]` (last `rope_dim` of each head).
+fn apply_rope_heads(
+    x: &mut [f32],
+    n_heads: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    pos: usize,
+    theta: f32,
+    inverse: bool,
+) {
+    let rd = rope_dim.min(head_dim);
+    if rd == 0 || n_heads == 0 {
+        return;
+    }
+    for h in 0..n_heads {
+        let base = h * head_dim;
+        if base + head_dim > x.len() {
+            break;
+        }
+        apply_rope_slice(&mut x[base..base + head_dim], pos, rd, theta, inverse);
+    }
+}
+
+/// RoPE on a single MQA latent of length `head_dim`.
+fn apply_rope_latent(x: &mut [f32], head_dim: usize, rope_dim: usize, pos: usize, theta: f32) {
+    if x.len() < head_dim {
+        return;
+    }
+    apply_rope_slice(&mut x[..head_dim], pos, rope_dim.min(head_dim), theta, false);
+}
+
+/// First `n_q` entries of layer `attn_sink`, if present.
+fn sink_for_heads(layer: &crate::weights::Layer0AttnWeights, n_q: usize) -> Option<Vec<f32>> {
+    layer.attn_sink.as_ref().map(|s| {
+        let mut out = s[..s.len().min(n_q)].to_vec();
+        out.resize(n_q, 0.0);
+        out
+    })
 }
 
 /// How many transformer layers to load for the local runner.
@@ -989,10 +1096,18 @@ impl InferenceBackend for LocalWeightRunner {
         };
         let q_width = n_q * head_dim;
         let n_layers = self.weights.n_layers().max(1);
+        let rope_theta = self.weights.rope_theta;
+        let rope_dim = self
+            .weights
+            .layers
+            .first()
+            .map(|b| b.attn.rope_head_dim)
+            .unwrap_or(0)
+            .min(head_dim);
 
         // Prefill prompt through the full layer stack (per-layer KV under prefix:L{i}).
         if req.decoded_so_far == 0 {
-            for &tid in &prompt_ids {
+            for (pos, &tid) in prompt_ids.iter().enumerate() {
                 let mut h = self.weights.embed_token(tid);
                 if self.weights.layers.is_empty() {
                     let (mut kk, mut vv) = self.weights.project_kv(&h);
@@ -1002,12 +1117,15 @@ impl InferenceBackend for LocalWeightRunner {
                 } else {
                     for (li, block) in self.weights.layers.iter().enumerate() {
                         let pfx = format!("{prefix}:L{li}");
-                        let (mut kk, mut vv) = self.weights.project_kv_layer(&block.attn, &h);
+                        let rd = block.attn.rope_head_dim.min(head_dim);
+                        let (mut kk, _) = self.weights.project_kv_layer(&block.attn, &h);
                         kk.resize(kv_width, 0.0);
-                        vv.resize(kv_width, 0.0);
+                        apply_rope_latent(&mut kk, head_dim, rd, pos, rope_theta);
+                        let vv = kk.clone();
                         self.kv.lock().append_kv(&pfx, &kk, &vv);
                         let mut qq = self.weights.project_q_layer(&block.attn, &h);
                         qq.resize(q_width, 0.0);
+                        apply_rope_heads(&mut qq, n_q, head_dim, rd, pos, rope_theta, false);
                         let (k_cache, v_cache, seq_len) = self.kv.lock().materialize_kv(&pfx);
                         if seq_len > 0 {
                             let k_exp = if self.multihead {
@@ -1030,11 +1148,21 @@ impl InferenceBackend for LocalWeightRunner {
                                     num_heads: n_q as u32,
                                     head_dim: head_dim as u32,
                                     layout: KvLayout::Nhd,
+                                    attn_sink: sink_for_heads(&block.attn, n_q),
                                 })
                                 .await
                             {
                                 let mut attn_o = dec.o;
                                 attn_o.resize(q_width, 0.0);
+                                apply_rope_heads(
+                                    &mut attn_o,
+                                    n_q,
+                                    head_dim,
+                                    rd,
+                                    pos,
+                                    rope_theta,
+                                    true,
+                                );
                                 let delta =
                                     self.weights.attn_to_hidden_layer(&block.attn, &attn_o, &h);
                                 if block.attn.has_o_proj() {
@@ -1083,8 +1211,10 @@ impl InferenceBackend for LocalWeightRunner {
                 if seq_len == 0 {
                     break;
                 }
+                let q_pos = (seq_len as usize).saturating_sub(1);
                 let mut q = self.weights.project_q(&h);
                 q.resize(q_width, 0.0);
+                apply_rope_heads(&mut q, n_q, head_dim, rope_dim, q_pos, rope_theta, false);
                 let k_exp = if self.multihead {
                     expand_kv_mqa(&k_cache, seq_len as usize, n_q, head_dim)
                 } else {
@@ -1105,11 +1235,13 @@ impl InferenceBackend for LocalWeightRunner {
                         num_heads: n_q as u32,
                         head_dim: head_dim as u32,
                         layout: KvLayout::Nhd,
+                        attn_sink: None,
                     })
                     .await
                     .map_err(|e| TrajectError::Inference(format!("local decode: {e}")))?;
                 let mut attn_o = dec.o;
                 attn_o.resize(q_width, 0.0);
+                apply_rope_heads(&mut attn_o, n_q, head_dim, rope_dim, q_pos, rope_theta, true);
                 let attn_h = self.weights.attn_to_hidden(&attn_o, &h);
                 for (a, b) in h.iter_mut().zip(attn_h.iter()) {
                     *a = 0.5 * *a + 0.5 * *b;
@@ -1117,16 +1249,20 @@ impl InferenceBackend for LocalWeightRunner {
             } else {
                 for (li, block) in self.weights.layers.iter().enumerate() {
                     let pfx = format!("{prefix}:L{li}");
+                    let rd = block.attn.rope_head_dim.min(head_dim);
                     let mut qq = self.weights.project_q_layer(&block.attn, &h);
                     qq.resize(q_width, 0.0);
                     let (k_cache, v_cache, seq_len) = self.kv.lock().materialize_kv(&pfx);
                     if seq_len == 0 {
-                        let (mut kk, mut vv) = self.weights.project_kv_layer(&block.attn, &h);
+                        let (mut kk, _) = self.weights.project_kv_layer(&block.attn, &h);
                         kk.resize(kv_width, 0.0);
-                        vv.resize(kv_width, 0.0);
+                        apply_rope_latent(&mut kk, head_dim, rd, 0, rope_theta);
+                        let vv = kk.clone();
                         self.kv.lock().append_kv(&pfx, &kk, &vv);
                         continue;
                     }
+                    let q_pos = (seq_len as usize).saturating_sub(1);
+                    apply_rope_heads(&mut qq, n_q, head_dim, rd, q_pos, rope_theta, false);
                     let k_exp = if self.multihead {
                         expand_kv_mqa(&k_cache, seq_len as usize, n_q, head_dim)
                     } else {
@@ -1147,11 +1283,13 @@ impl InferenceBackend for LocalWeightRunner {
                             num_heads: n_q as u32,
                             head_dim: head_dim as u32,
                             layout: KvLayout::Nhd,
+                            attn_sink: sink_for_heads(&block.attn, n_q),
                         })
                         .await
                         .map_err(|e| TrajectError::Inference(format!("local decode L{li}: {e}")))?;
                     let mut attn_o = dec.o;
                     attn_o.resize(q_width, 0.0);
+                    apply_rope_heads(&mut attn_o, n_q, head_dim, rd, q_pos, rope_theta, true);
                     let delta = self.weights.attn_to_hidden_layer(&block.attn, &attn_o, &h);
                     if block.attn.has_o_proj() {
                         for (a, b) in h.iter_mut().zip(delta.iter()) {
@@ -1194,9 +1332,12 @@ impl InferenceBackend for LocalWeightRunner {
                 let mut hh = emb_n;
                 for (li, block) in self.weights.layers.iter().enumerate() {
                     let pfx = format!("{prefix}:L{li}");
-                    let (mut k, mut v) = self.weights.project_kv_layer(&block.attn, &hh);
+                    let rd = block.attn.rope_head_dim.min(head_dim);
+                    let pos = self.kv.lock().materialize_kv(&pfx).2 as usize;
+                    let (mut k, _) = self.weights.project_kv_layer(&block.attn, &hh);
                     k.resize(kv_width, 0.0);
-                    v.resize(kv_width, 0.0);
+                    apply_rope_latent(&mut k, head_dim, rd, pos, rope_theta);
+                    let v = k.clone();
                     self.kv.lock().append_kv(&pfx, &k, &v);
                     // Advance residual lightly so deeper layers see something non-constant.
                     if let Some(ref ffn) = block.ffn {
@@ -1261,6 +1402,13 @@ impl InferenceBackend for LocalWeightRunner {
             multihead = self.multihead,
             n_q_heads = self.n_q_heads,
             head_dim = self.head_dim,
+            rope_dim = rope_dim,
+            has_attn_sink = self
+                .weights
+                .layers
+                .first()
+                .and_then(|l| l.attn.attn_sink.as_ref())
+                .is_some(),
             moe_cache = ?self.weights.layers.first().and_then(|l| {
                 l.moe.as_ref().map(|m| m.cache_stats())
             }),
@@ -1359,5 +1507,28 @@ mod tests {
         assert_eq!(&out[4..6], &[1.0, 2.0]);
         // token1 heads all [3,4]
         assert_eq!(&out[6..8], &[3.0, 4.0]);
+    }
+
+    #[test]
+    fn rope_roundtrip_near_identity() {
+        // Apply RoPE then inverse → recover original (within float noise).
+        let mut x = vec![0.5f32, -0.25, 0.1, 0.75];
+        let orig = x.clone();
+        apply_rope_slice(&mut x, 7, 4, 10000.0, false);
+        assert!((x[0] - orig[0]).abs() > 1e-6 || (x[1] - orig[1]).abs() > 1e-6);
+        apply_rope_slice(&mut x, 7, 4, 10000.0, true);
+        for (a, b) in x.iter().zip(orig.iter()) {
+            assert!((a - b).abs() < 1e-5, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn rope_only_last_dims() {
+        let mut x = vec![1.0f32, 2.0, 3.0, 4.0, 0.5, -0.5];
+        let head = x.clone();
+        apply_rope_slice(&mut x, 3, 2, 10000.0, false);
+        // first 4 dims (nope) unchanged; last 2 rotated
+        assert_eq!(&x[..4], &head[..4]);
+        assert!((x[4] - head[4]).abs() > 1e-6 || (x[5] - head[5]).abs() > 1e-6);
     }
 }

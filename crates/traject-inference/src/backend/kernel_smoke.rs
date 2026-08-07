@@ -79,6 +79,7 @@ impl InferenceBackend for KernelSmokeBackend {
                 num_heads: self.num_heads,
                 head_dim: self.head_dim,
                 layout: KvLayout::Nhd,
+                attn_sink: None,
             })
             .await?;
 

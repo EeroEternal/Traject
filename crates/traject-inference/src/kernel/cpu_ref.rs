@@ -17,6 +17,7 @@ fn softmax_attn(
     seq_len: usize,
     num_heads: usize,
     head_dim: usize,
+    attn_sink: Option<&[f32]>,
 ) -> Result<Vec<f32>> {
     // q: [1, H, D], k/v: [S, H, D] in NHD
     if q.len() != num_heads * head_dim {
@@ -44,13 +45,22 @@ fn softmax_attn(
             scores[s] = dot * scale;
             max_s = max_s.max(scores[s]);
         }
+        let sink = attn_sink.and_then(|s| s.get(h).copied());
+        if let Some(sk) = sink {
+            max_s = max_s.max(sk);
+        }
         let mut sum = 0.0f32;
         for s in scores.iter_mut() {
             *s = (*s - max_s).exp();
             sum += *s;
         }
+        // Attention sink: absorb probability mass, no value contribution.
+        if let Some(sk) = sink {
+            sum += (sk - max_s).exp();
+        }
+        let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
         for s in scores.iter_mut() {
-            *s /= sum;
+            *s *= inv;
         }
         let oh = &mut out[h * head_dim..(h + 1) * head_dim];
         for s in 0..seq_len {
@@ -79,7 +89,7 @@ impl KernelBackend for CpuRefKernel {
             let q = &req.q[i * h * d..(i + 1) * h * d];
             let k = &req.k[..(i + 1) * h * d];
             let v = &req.v[..(i + 1) * h * d];
-            let oi = softmax_attn(q, k, v, i + 1, h, d)?;
+            let oi = softmax_attn(q, k, v, i + 1, h, d, None)?;
             o.extend_from_slice(&oi);
         }
         Ok(PrefillResult { o })
@@ -93,6 +103,7 @@ impl KernelBackend for CpuRefKernel {
             req.seq_len as usize,
             req.num_heads as usize,
             req.head_dim as usize,
+            req.attn_sink.as_deref(),
         )?;
         Ok(DecodeResult { o })
     }
@@ -143,9 +154,49 @@ mod tests {
                 num_heads: h as u32,
                 head_dim: d as u32,
                 layout: Default::default(),
+                attn_sink: None,
             })
             .await
             .unwrap();
         assert_eq!(out.o.len(), h * d);
+    }
+
+    #[tokio::test]
+    async fn decode_with_sink_reduces_output_magnitude() {
+        let k = CpuRefKernel;
+        let h = 1usize;
+        let d = 2usize;
+        let s = 1usize;
+        let q = vec![1.0f32, 0.0];
+        let kc = vec![1.0f32, 0.0];
+        let vc = vec![2.0f32, 0.0];
+        let base = k
+            .decode(DecodeRequest {
+                q: q.clone(),
+                k_cache: kc.clone(),
+                v_cache: vc.clone(),
+                seq_len: s as u32,
+                num_heads: h as u32,
+                head_dim: d as u32,
+                layout: Default::default(),
+                attn_sink: None,
+            })
+            .await
+            .unwrap();
+        let sunk = k
+            .decode(DecodeRequest {
+                q,
+                k_cache: kc,
+                v_cache: vc,
+                seq_len: s as u32,
+                num_heads: h as u32,
+                head_dim: d as u32,
+                layout: Default::default(),
+                // Large sink → most mass absorbed → smaller o
+                attn_sink: Some(vec![20.0]),
+            })
+            .await
+            .unwrap();
+        assert!(sunk.o[0].abs() < base.o[0].abs());
     }
 }
