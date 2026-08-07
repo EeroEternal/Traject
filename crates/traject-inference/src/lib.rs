@@ -17,7 +17,7 @@ pub use weights::{
     load_layer0_shared_ffn, load_layer_attn, load_layer_hc, load_layer_routed_moe,
     load_layer_shared_ffn, load_layer_stack, ExpertF32, ExpertPacked, HcBranchWeights,
     HcHeadWeights, HfModelConfig, Layer0AttnWeights, Layer0RoutedMoe, Layer0SharedFfn, LayerBlock,
-    LayerHcWeights, PackedFp4Mat, SafetensorCatalog, TensorF32,
+    LayerHcWeights, LinearMat, PackedFp4Mat, PackedFp8Mat, SafetensorCatalog, TensorF32,
 };
 pub use tokenizer::HfTokenizer;
 

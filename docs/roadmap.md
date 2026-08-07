@@ -42,6 +42,7 @@
 - [x] MLA RoPE + attn_sink + K=V + o_proj group-concat (official V4 path)
 - [x] Hyper-Connections residual (`hc_mult` streams + Sinkhorn + `hc_head`)
 - [x] Shared dense catalog + layer cap (`TRAJECT_LOCAL_LAYERS_MAX`) + sliding-window attn
+- [x] Packed FP8 dense weights + fused matvec (attn + shared FFN; ~¼ RAM of f32)
 - [ ] Full 43-layer production parity in-process (prod MoE remains sglang-lite)
 - [x] Tool latency-aware pin TTL from histograms (`ToolLatencyTracker` p95)
 - [x] Prefetch pin after tool return (`PinReason::Prefetch`)

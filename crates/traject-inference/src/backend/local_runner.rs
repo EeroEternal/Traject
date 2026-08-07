@@ -356,12 +356,12 @@ impl ModelWeights {
     /// Hidden → multi-head Q (no RoPE; caller applies position).
     fn project_q_layer(&self, layer: &crate::weights::Layer0AttnWeights, h: &[f32]) -> Vec<f32> {
         let hn = self.rms_norm_with(h, Some(&layer.attn_norm));
-        let mut q = matvec(&layer.wq_a.data, layer.q_lora_dim(), layer.hidden, &hn);
+        let mut q = layer.wq_a.matvec(&hn);
         if let Some(ref qn) = layer.q_norm {
             q = self.rms_norm_with(&q, Some(qn));
         }
         if let Some(ref wq_b) = layer.wq_b {
-            let q_full = matvec(&wq_b.data, wq_b.rows(), wq_b.cols(), &q);
+            let q_full = wq_b.matvec(&q);
             // Keep multi-head Q: first n_q_heads × head_dim (no mean-pool).
             let n_heads = layer.n_heads.unwrap_or(1).max(1);
             let head_dim = layer.kv_dim().max(1);
@@ -399,7 +399,7 @@ impl ModelWeights {
         h: &[f32],
     ) -> (Vec<f32>, Vec<f32>) {
         let hn = self.rms_norm_with(h, Some(&layer.attn_norm));
-        let mut kv = matvec(&layer.wkv.data, layer.kv_dim(), layer.hidden, &hn);
+        let mut kv = layer.wkv.matvec(&hn);
         if let Some(ref kn) = layer.kv_norm {
             kv = self.rms_norm_with(&kv, Some(kn));
         }
@@ -457,13 +457,7 @@ impl ModelWeights {
                         }
                         let group = &attn_o[gbase..gbase + group_in];
                         for r in 0..lor {
-                            let row = &wo_a.data[(gi * lor + r) * group_in
-                                ..(gi * lor + r + 1) * group_in];
-                            let mut s = 0.0f32;
-                            for (a, b) in row.iter().zip(group.iter()) {
-                                s += a * b;
-                            }
-                            mid[gi * lor + r] = s;
+                            mid[gi * lor + r] = wo_a.row_dot(gi * lor + r, group);
                         }
                     }
                 } else if n_heads > 1 && attn_o.len() >= n_heads * head_dim {
@@ -516,7 +510,7 @@ impl ModelWeights {
                     }
                 }
             }
-            return matvec(&wo_b.data, layer.hidden, inter, &mid);
+            return wo_b.matvec(&mid);
         }
         matvec(&self.w_up, self.hidden, self.attn_dim, attn_o)
     }
@@ -531,14 +525,16 @@ impl ModelWeights {
     /// Pure shared-expert SwiGLU (no residual).
     fn shared_ffn_delta(&self, ffn: &crate::weights::Layer0SharedFfn, h: &[f32]) -> Vec<f32> {
         let n = self.rms_norm_with(h, Some(&ffn.ffn_norm));
-        swiglu_delta(
-            &n,
-            &ffn.w1.data,
-            &ffn.w2.data,
-            &ffn.w3.data,
-            ffn.hidden,
-            ffn.intermediate,
-        )
+        // SwiGLU with LinearMat (packed FP8 or f32).
+        let u = ffn.w1.matvec(&n);
+        let g = ffn.w3.matvec(&n);
+        let mut gated = vec![0.0f32; ffn.intermediate];
+        for i in 0..ffn.intermediate {
+            let x = u.get(i).copied().unwrap_or(0.0);
+            let y = g.get(i).copied().unwrap_or(0.0);
+            gated[i] = x * (1.0 / (1.0 + (-x).exp())) * y; // silu(u) * g
+        }
+        ffn.w2.matvec(&gated)
     }
 
     fn shared_ffn_residual_block(
@@ -1044,9 +1040,10 @@ fn mean_collapse_streams(streams: &[f32], hc_mult: usize, hidden: usize) -> Vec<
 /// How many transformer layers to load for the local runner.
 ///
 /// - `TRAJECT_LOCAL_LAYERS` — requested count (default **2**, min 1)
-/// - `TRAJECT_LOCAL_LAYERS_MAX` — hard cap (default **16**, never above model depth)
+/// - `TRAJECT_LOCAL_LAYERS_MAX` — hard cap (default **32** with packed FP8 dense,
+///   never above model depth)
 ///
-/// Dense layers are ~0.5 GiB f32 each; raise max only when the host has RAM.
+/// Packed FP8 dense is ~¼ of f32 (~0.13 GiB/layer); raise toward 43 when RAM allows.
 fn local_layer_count(cfg: Option<&crate::weights::HfModelConfig>) -> usize {
     let env = std::env::var("TRAJECT_LOCAL_LAYERS")
         .ok()
@@ -1059,7 +1056,7 @@ fn local_layer_count(cfg: Option<&crate::weights::HfModelConfig>) -> usize {
     let cap = std::env::var("TRAJECT_LOCAL_LAYERS_MAX")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(16)
+        .unwrap_or(32)
         .max(1)
         .min(max_model);
     n.min(cap)
@@ -1152,6 +1149,7 @@ fn matvec(w: &[f32], out_dim: usize, in_dim: usize, x: &[f32]) -> Vec<f32> {
 }
 
 /// SwiGLU: `w2( silu(w1 x) ⊙ w3 x )`.
+#[allow(dead_code)] // kept for unit tests / f32-only fallbacks
 fn swiglu_delta(
     x: &[f32],
     w1: &[f32],
