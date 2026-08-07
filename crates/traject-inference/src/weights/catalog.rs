@@ -1189,7 +1189,176 @@ pub fn load_layer0_routed_moe(model_dir: &Path) -> Result<Layer0RoutedMoe> {
     load_layer_routed_moe(model_dir, 0)
 }
 
-/// Load the first `n_layers` transformer blocks (attn + shared FFN + routed MoE).
+/// Hyper-Connection weights for one residual branch (attn or ffn).
+#[derive(Debug, Clone)]
+pub struct HcBranchWeights {
+    /// `[mix_hc, hc_mult * hidden]` — linear on flattened multi-stream state.
+    pub fn_w: TensorF32,
+    /// `[mix_hc]` bias inside sigmoid / comb.
+    pub base: Vec<f32>,
+    /// `[3]` scales for pre / post / comb.
+    pub scale: Vec<f32>,
+}
+
+/// Per-layer Hyper-Connections (DeepSeek-V4 Block).
+#[derive(Debug, Clone)]
+pub struct LayerHcWeights {
+    pub hc_mult: usize,
+    pub hidden: usize,
+    pub sinkhorn_iters: usize,
+    pub eps: f32,
+    pub norm_eps: f32,
+    pub attn: HcBranchWeights,
+    pub ffn: HcBranchWeights,
+}
+
+impl LayerHcWeights {
+    pub fn mix_hc(&self) -> usize {
+        (2 + self.hc_mult) * self.hc_mult
+    }
+    pub fn hc_dim(&self) -> usize {
+        self.hc_mult.saturating_mul(self.hidden)
+    }
+}
+
+/// Final HC collapse before lm_head (`hc_head_*`).
+#[derive(Debug, Clone)]
+pub struct HcHeadWeights {
+    pub hc_mult: usize,
+    pub hidden: usize,
+    /// `[hc_mult, hc_mult * hidden]`
+    pub fn_w: TensorF32,
+    pub base: Vec<f32>,
+    pub scale: f32,
+    pub eps: f32,
+}
+
+/// Load layer HC parameters (soft-fail if missing).
+pub fn load_layer_hc(model_dir: &Path, layer: usize) -> Result<LayerHcWeights> {
+    let mut cat = SafetensorCatalog::open(model_dir)?;
+    let (hc_mult, sinkhorn_iters, eps, norm_eps) = {
+        use crate::weights::HfModelConfig;
+        match HfModelConfig::load(model_dir) {
+            Ok(cfg) => (
+                cfg.hc_mult.unwrap_or(4) as usize,
+                cfg.hc_sinkhorn_iters.unwrap_or(20) as usize,
+                cfg.hc_eps.unwrap_or(1e-6),
+                1e-6f32,
+            ),
+            Err(_) => (4, 20, 1e-6, 1e-6),
+        }
+    };
+    let mix_hc = (2 + hc_mult) * hc_mult;
+    // Infer hidden from hc_attn_fn cols / hc_mult.
+    let attn_fn = cat.load_f32(&format!("layers.{layer}.hc_attn_fn"))?;
+    if attn_fn.shape.len() != 2 || attn_fn.rows() != mix_hc {
+        return Err(TrajectError::Other(format!(
+            "layer-{layer} hc_attn_fn shape {:?} want [{mix_hc}, hc*hidden]",
+            attn_fn.shape
+        )));
+    }
+    let hc_dim = attn_fn.cols();
+    if hc_dim % hc_mult != 0 {
+        return Err(TrajectError::Other(format!(
+            "layer-{layer} hc_dim {hc_dim} not divisible by hc_mult {hc_mult}"
+        )));
+    }
+    let hidden = hc_dim / hc_mult;
+    let attn_base = cat.load_f32(&format!("layers.{layer}.hc_attn_base"))?.data;
+    let attn_scale = cat.load_f32(&format!("layers.{layer}.hc_attn_scale"))?.data;
+    let ffn_fn = cat.load_f32(&format!("layers.{layer}.hc_ffn_fn"))?;
+    let ffn_base = cat.load_f32(&format!("layers.{layer}.hc_ffn_base"))?.data;
+    let ffn_scale = cat.load_f32(&format!("layers.{layer}.hc_ffn_scale"))?.data;
+    if attn_base.len() != mix_hc || attn_scale.len() != 3 {
+        return Err(TrajectError::Other(format!(
+            "layer-{layer} hc_attn base/scale len base={} scale={}",
+            attn_base.len(),
+            attn_scale.len()
+        )));
+    }
+    if ffn_fn.shape != attn_fn.shape || ffn_base.len() != mix_hc || ffn_scale.len() != 3 {
+        return Err(TrajectError::Other(format!(
+            "layer-{layer} hc_ffn shape mismatch fn={:?} base={} scale={}",
+            ffn_fn.shape,
+            ffn_base.len(),
+            ffn_scale.len()
+        )));
+    }
+    info!(
+        layer,
+        hc_mult,
+        hidden,
+        mix_hc,
+        sinkhorn_iters,
+        "loaded layer Hyper-Connection weights"
+    );
+    Ok(LayerHcWeights {
+        hc_mult,
+        hidden,
+        sinkhorn_iters,
+        eps,
+        norm_eps,
+        attn: HcBranchWeights {
+            fn_w: attn_fn,
+            base: attn_base,
+            scale: attn_scale,
+        },
+        ffn: HcBranchWeights {
+            fn_w: ffn_fn,
+            base: ffn_base,
+            scale: ffn_scale,
+        },
+    })
+}
+
+/// Load final HC head collapse weights.
+pub fn load_hc_head(model_dir: &Path) -> Result<HcHeadWeights> {
+    let mut cat = SafetensorCatalog::open(model_dir)?;
+    let (hc_mult, eps) = {
+        use crate::weights::HfModelConfig;
+        match HfModelConfig::load(model_dir) {
+            Ok(cfg) => (
+                cfg.hc_mult.unwrap_or(4) as usize,
+                cfg.hc_eps.unwrap_or(1e-6),
+            ),
+            Err(_) => (4, 1e-6),
+        }
+    };
+    let fn_w = cat.load_f32("hc_head_fn")?;
+    let base = cat.load_f32("hc_head_base")?.data;
+    let scale_t = cat.load_f32("hc_head_scale")?;
+    if fn_w.shape.len() != 2 || fn_w.rows() != hc_mult {
+        return Err(TrajectError::Other(format!(
+            "hc_head_fn shape {:?} want [{hc_mult}, hc*hidden]",
+            fn_w.shape
+        )));
+    }
+    let hc_dim = fn_w.cols();
+    if hc_dim % hc_mult != 0 {
+        return Err(TrajectError::Other(format!(
+            "hc_head_fn cols {hc_dim} not divisible by hc_mult {hc_mult}"
+        )));
+    }
+    let hidden = hc_dim / hc_mult;
+    if base.len() != hc_mult {
+        return Err(TrajectError::Other(format!(
+            "hc_head_base len {} != {hc_mult}",
+            base.len()
+        )));
+    }
+    let scale = scale_t.data.first().copied().unwrap_or(1.0);
+    info!(hc_mult, hidden, scale, "loaded HC head collapse weights");
+    Ok(HcHeadWeights {
+        hc_mult,
+        hidden,
+        fn_w,
+        base,
+        scale,
+        eps,
+    })
+}
+
+/// Load the first `n_layers` transformer blocks (attn + shared FFN + routed MoE + HC).
 pub fn load_layer_stack(model_dir: &Path, n_layers: usize) -> Result<Vec<LayerBlock>> {
     let n = n_layers.max(1);
     let mut out = Vec::with_capacity(n);
@@ -1197,25 +1366,39 @@ pub fn load_layer_stack(model_dir: &Path, n_layers: usize) -> Result<Vec<LayerBl
         let attn = load_layer_attn(model_dir, layer)?;
         let ffn = load_layer_shared_ffn(model_dir, layer).ok();
         let moe = load_layer_routed_moe(model_dir, layer).ok();
+        let hc = match load_layer_hc(model_dir, layer) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                warn!(layer, error = %e, "layer HC weights missing; simple residual");
+                None
+            }
+        };
         if ffn.is_none() {
             warn!(layer, "shared FFN missing for layer");
         }
         if moe.is_none() {
             warn!(layer, "routed MoE missing for layer");
         }
-        out.push(LayerBlock { layer, attn, ffn, moe });
+        out.push(LayerBlock {
+            layer,
+            attn,
+            ffn,
+            moe,
+            hc,
+        });
     }
     info!(n_layers = n, dir = %model_dir.display(), "loaded layer stack");
     Ok(out)
 }
 
-/// One transformer block (attn + optional FFN/MoE).
+/// One transformer block (attn + optional FFN/MoE + HC).
 #[derive(Debug, Clone)]
 pub struct LayerBlock {
     pub layer: usize,
     pub attn: Layer0AttnWeights,
     pub ffn: Option<Layer0SharedFfn>,
     pub moe: Option<Layer0RoutedMoe>,
+    pub hc: Option<LayerHcWeights>,
 }
 
 /// Load the tensors needed for LocalWeightRunner from a HF model dir.

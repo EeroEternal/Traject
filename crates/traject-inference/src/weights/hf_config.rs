@@ -46,6 +46,15 @@ pub struct HfModelConfig {
     /// Base RoPE theta (default 10000).
     #[serde(default)]
     pub rope_theta: Option<f32>,
+    /// Hyper-Connection stream count (V4 Flash: 4).
+    #[serde(default)]
+    pub hc_mult: Option<u32>,
+    /// Sinkhorn iterations for HC comb matrix (default 20).
+    #[serde(default)]
+    pub hc_sinkhorn_iters: Option<u32>,
+    /// HC epsilon (default 1e-6).
+    #[serde(default)]
+    pub hc_eps: Option<f32>,
 }
 
 fn default_vocab() -> u32 {
