@@ -777,6 +777,23 @@ fn apply_rope_latent(
     rope.apply_slice(&mut x[..head_dim], pos, false);
 }
 
+/// Official attention KV path: RoPE then FP8 QAT on **no-RoPE** dims
+/// (`act_quant(kv[..., :-rd], 64, ue8m0, inplace)`).
+fn finalize_attn_kv_latent(
+    x: &mut [f32],
+    head_dim: usize,
+    rope: &crate::weights::RopeParams,
+    pos: usize,
+) {
+    apply_rope_latent(x, head_dim, rope, pos);
+    let d = head_dim.min(x.len());
+    if d == 0 {
+        return;
+    }
+    let rd = rope.rope_dim.min(d);
+    crate::weights::dtype::fp8_act_quant_nope_inplace(&mut x[..d], rd, 64);
+}
+
 /// First `n_q` entries of layer `attn_sink`, if present.
 fn sink_for_heads(layer: &crate::weights::Layer0AttnWeights, n_q: usize) -> Option<Vec<f32>> {
     layer.attn_sink.as_ref().map(|s| {
@@ -1310,9 +1327,12 @@ fn compressor_push(
         }
         // RoPE at last token of the block
         rope.apply_slice(&mut out, pos, false);
-        // Indexer compressor: Hadamard + FP4 QAT (official rotate=True path).
+        // Official: rotate=True → Hadamard+FP4; else FP8 QAT on no-RoPE dims.
         if comp.rotate {
             crate::weights::dtype::indexer_qk_qat_inplace(&mut out, 32);
+        } else {
+            let rd = rope.rope_dim.min(out.len());
+            crate::weights::dtype::fp8_act_quant_nope_inplace(&mut out, rd, 64);
         }
         return Some(out);
     }
@@ -1396,6 +1416,9 @@ fn compressor_push(
     rope.apply_slice(&mut out, pos, false);
     if comp.rotate {
         crate::weights::dtype::indexer_qk_qat_inplace(&mut out, 32);
+    } else {
+        let rd = rope.rope_dim.min(out.len());
+        crate::weights::dtype::fp8_act_quant_nope_inplace(&mut out, rd, 64);
     }
     Some(out)
 }
@@ -1995,7 +2018,7 @@ impl InferenceBackend for LocalWeightRunner {
                             );
                             let (mut kk, _) = self.weights.project_kv_layer(&block.attn, &x);
                             kk.resize(kv_width, 0.0);
-                            apply_rope_latent(&mut kk, head_dim, &block.attn.rope, pos);
+                            finalize_attn_kv_latent(&mut kk, head_dim, &block.attn.rope, pos);
                             let vv = kk.clone();
                             self.kv.lock().append_kv(&pfx, &kk, &vv);
                             let hn = self.weights.rms_norm_with(&x, Some(&block.attn.attn_norm));
@@ -2095,7 +2118,7 @@ impl InferenceBackend for LocalWeightRunner {
                             };
                             let (mut kk, _) = self.weights.project_kv_layer(&block.attn, &h);
                             kk.resize(kv_width, 0.0);
-                            apply_rope_latent(&mut kk, head_dim, &block.attn.rope, pos);
+                            finalize_attn_kv_latent(&mut kk, head_dim, &block.attn.rope, pos);
                             let vv = kk.clone();
                             self.kv.lock().append_kv(&pfx, &kk, &vv);
                             let hn = self.weights.rms_norm_with(&h, Some(&block.attn.attn_norm));
@@ -2267,7 +2290,7 @@ impl InferenceBackend for LocalWeightRunner {
                         if seq_len == 0 {
                             let (mut kk, _) = self.weights.project_kv_layer(&block.attn, &x);
                             kk.resize(kv_width, 0.0);
-                            apply_rope_latent(&mut kk, head_dim, &block.attn.rope, 0);
+                            finalize_attn_kv_latent(&mut kk, head_dim, &block.attn.rope, 0);
                             let vv = kk.clone();
                             self.kv.lock().append_kv(&pfx, &kk, &vv);
                             let hn = self.weights.rms_norm_with(&x, Some(&block.attn.attn_norm));
@@ -2363,7 +2386,7 @@ impl InferenceBackend for LocalWeightRunner {
                         if seq_len == 0 {
                             let (mut kk, _) = self.weights.project_kv_layer(&block.attn, &h);
                             kk.resize(kv_width, 0.0);
-                            apply_rope_latent(&mut kk, head_dim, &block.attn.rope, 0);
+                            finalize_attn_kv_latent(&mut kk, head_dim, &block.attn.rope, 0);
                             let vv = kk.clone();
                             self.kv.lock().append_kv(&pfx, &kk, &vv);
                             let hn = self.weights.rms_norm_with(&h, Some(&block.attn.attn_norm));
@@ -2480,7 +2503,7 @@ impl InferenceBackend for LocalWeightRunner {
                     let pos = self.kv.lock().materialize_kv(&pfx).2 as usize;
                     let (mut k, _) = self.weights.project_kv_layer(&block.attn, &hh);
                     k.resize(kv_width, 0.0);
-                    apply_rope_latent(&mut k, head_dim, &block.attn.rope, pos);
+                    finalize_attn_kv_latent(&mut k, head_dim, &block.attn.rope, pos);
                     let v = k.clone();
                     self.kv.lock().append_kv(&pfx, &k, &v);
                     let hn = self.weights.rms_norm_with(&hh, Some(&block.attn.attn_norm));

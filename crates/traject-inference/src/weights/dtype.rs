@@ -446,6 +446,125 @@ pub fn indexer_qk_qat_inplace(x: &mut [f32], fp4_block: usize) {
     fp4_act_quant_inplace(x, fp4_block);
 }
 
+/// Encode f32 → nearest OCP FP8 E4M3 bits (max finite 448; 0x7F is NaN).
+pub fn f32_to_e4m3_bits(v: f32) -> u8 {
+    if !v.is_finite() {
+        return 0x7f;
+    }
+    let sign = if v.is_sign_negative() { 0x80u8 } else { 0 };
+    let a = v.abs().min(448.0);
+    if a == 0.0 {
+        return sign;
+    }
+    // Subnormal region: |v| < 2^-6
+    let smallest_normal = 2f32.powi(-6);
+    if a < smallest_normal {
+        // value = (mant/8) * 2^-6 ⇒ mant = round(a * 8 * 64) = round(a * 512)
+        let mant = (a * 512.0).round() as i32;
+        if mant <= 0 {
+            return sign;
+        }
+        if mant >= 8 {
+            // Round up to smallest normal: exp=1, mant=0
+            return sign | (1 << 3);
+        }
+        return sign | (mant as u8);
+    }
+    // Normal: a = (1 + mant/8) * 2^e  with e = floor(log2(a))
+    let e = a.log2().floor() as i32;
+    let mut exp_field = e + 7;
+    if exp_field < 1 {
+        // Should have been handled as subnormal; clamp.
+        return sign | 1;
+    }
+    if exp_field > 15 {
+        return sign | 0x7e; // max finite
+    }
+    let inv = 2f32.powi(-e);
+    let frac = a * inv - 1.0;
+    let mut mant = (frac * 8.0).round() as i32;
+    if mant >= 8 {
+        mant = 0;
+        exp_field += 1;
+        if exp_field > 15 {
+            return sign | 0x7e;
+        }
+    }
+    if mant < 0 {
+        mant = 0;
+    }
+    // exp=15, mant=7 is NaN — clamp to max finite.
+    if exp_field == 15 && mant >= 7 {
+        mant = 6;
+    }
+    sign | ((exp_field as u8) << 3) | ((mant as u8) & 7)
+}
+
+/// Nearest e4m3 representable value (via encode→decode).
+#[inline]
+pub fn f32_to_nearest_e4m3(v: f32) -> f32 {
+    e4m3_bits_to_f32(f32_to_e4m3_bits(v))
+}
+
+/// Power-of-two scale for FP8 QAT (ue8m0): `2^ceil(log2(amax / 448))`.
+#[inline]
+fn fp8_round_scale(amax: f32) -> f32 {
+    // Official kernel: max(amax, 1e-4)
+    let amax = amax.max(1e-4);
+    let t = amax / 448.0;
+    2f32.powi(fast_log2_ceil(t))
+}
+
+/// Block-wise FP8 e4m3 quant → dequant (QAT simulation).
+///
+/// Matches official `act_quant(..., scale_fmt="ue8m0", inplace=True)` used on
+/// attention/compressor **no-RoPE** dims with `block_size=64`.
+///
+/// When `len % block_size != 0`, falls back to a single full-length block.
+pub fn fp8_act_quant_inplace(x: &mut [f32], block_size: usize) {
+    const FP8_MAX: f32 = 448.0;
+    let n = x.len();
+    if n == 0 {
+        return;
+    }
+    let bs = if block_size > 0 && n % block_size == 0 {
+        block_size
+    } else {
+        n
+    };
+    let mut i = 0;
+    while i < n {
+        let end = (i + bs).min(n);
+        let mut amax = 0.0f32;
+        for v in &x[i..end] {
+            amax = amax.max(v.abs());
+        }
+        let s = fp8_round_scale(amax);
+        let inv = if s > 0.0 { 1.0 / s } else { 0.0 };
+        for v in &mut x[i..end] {
+            let q = (*v * inv).clamp(-FP8_MAX, FP8_MAX);
+            *v = f32_to_nearest_e4m3(q) * s;
+        }
+        i = end;
+    }
+}
+
+/// Official KV / compressor path: FP8-simulate **no-RoPE** dims only.
+///
+/// `act_quant(kv[..., :-rd], 64, ...)`; last `rope_dim` values stay full precision.
+pub fn fp8_act_quant_nope_inplace(x: &mut [f32], rope_dim: usize, block_size: usize) {
+    let n = x.len();
+    if n == 0 {
+        return;
+    }
+    let rd = rope_dim.min(n);
+    let nope = n.saturating_sub(rd);
+    if nope == 0 {
+        return;
+    }
+    fp8_act_quant_inplace(&mut x[..nope], block_size);
+}
+
 /// Block-scaled FP8 dequant: `weight[out,in]` with `scale[out/B, in/B]`, block size `B`.
 ///
 /// DeepSeek-V4 uses B=128: e4m3 weights × e8m0 scales.
@@ -661,5 +780,53 @@ mod tests {
         let mut x: Vec<f32> = (0..128).map(|i| (i as f32) * 0.01 - 0.5).collect();
         indexer_qk_qat_inplace(&mut x, 32);
         assert!(x.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn e4m3_roundtrip_known() {
+        // byte 65 → 2.25 (existing decode fixture)
+        assert!((e4m3_bits_to_f32(65) - 2.25).abs() < 1e-5);
+        assert_eq!(f32_to_e4m3_bits(2.25), 65);
+        // max finite
+        assert!((f32_to_nearest_e4m3(448.0) - 448.0).abs() < 1e-3);
+        assert!((f32_to_nearest_e4m3(1000.0) - 448.0).abs() < 1e-3);
+        // zero / sign
+        assert_eq!(f32_to_e4m3_bits(0.0), 0);
+        assert_eq!(f32_to_e4m3_bits(-0.0) & 0x7f, 0);
+        assert!((f32_to_nearest_e4m3(-2.25) + 2.25).abs() < 1e-5);
+    }
+
+    #[test]
+    fn fp8_act_quant_roundtrips_exact_grid() {
+        // Values already on e4m3 * scale=1 grid
+        let mut x = [0.0f32, 0.5, 1.0, 1.5, 2.0, 2.25, 3.0, 4.0];
+        let orig = x;
+        fp8_act_quant_inplace(&mut x, 8);
+        for (a, b) in x.iter().zip(orig.iter()) {
+            assert!((a - b).abs() < 1e-4, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn fp8_act_quant_scales_large() {
+        // amax=896 → scale = 2 (ceil log2(896/448)=ceil log2(2)=1)
+        let mut x = [896.0f32; 64];
+        fp8_act_quant_inplace(&mut x, 64);
+        // 896/2=448 → e4m3 448 → *2 = 896
+        for v in &x {
+            assert!((v - 896.0).abs() < 1e-2, "v={v}");
+        }
+    }
+
+    #[test]
+    fn fp8_act_quant_nope_preserves_rope_tail() {
+        let mut x = vec![1.0f32; 16];
+        for i in 12..16 {
+            x[i] = 100.0 + i as f32; // rope tail — must stay exact
+        }
+        let tail = x[12..].to_vec();
+        fp8_act_quant_nope_inplace(&mut x, 4, 4);
+        assert_eq!(&x[12..], &tail[..]);
+        assert!(x[..12].iter().all(|v| v.is_finite()));
     }
 }
