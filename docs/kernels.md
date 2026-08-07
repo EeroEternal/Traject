@@ -102,9 +102,10 @@ full f32 expand). Each layer:
    absorbs softmax mass.  
    - `compress_ratios[i]==0`: base `rope_theta`; attend last **`sliding_window`**
      tokens (default 128; `TRAJECT_SLIDING_WINDOW=0` = full context)  
-   - `compress_ratios[i]>0`: **YaRN** + sparse gather = window tokens **and**
-     strided pre-window history (`TRAJECT_COMPRESS_TOPK`, default 512).  
-     (Stand-in for learned compressor/indexer; true compressor still TODO.)
+   - `compress_ratios[i]>0`: **YaRN** + **learned compressor** (when weights load)
+     writes compressed slots to `{prefix}:L{i}:C`; decode attends
+     **window ‖ compress-pool**. If compressor missing, falls back to strided
+     history (`TRAJECT_COMPRESS_TOPK`).
 3. **o_proj:** group-concat heads → `wo_a` → `wo_b` (official layout; residual is
    `x += o`, not residual-through-`wo_a`).
 4. **Hyper-Connections (HC):** embed expands to `hc_mult` (4) streams; each block
@@ -114,7 +115,7 @@ full f32 expand). Each layer:
 
 Per-layer KV is keyed `{prefix}:L{i}`. Free drops base + all layer keys.
 
-**Not loaded yet:** learned compressor / indexer (strided history is temporary);
+**Not loaded yet:** learned **indexer** top-k (compress pool is fully attended);
 full 43-layer parity; optional GPU dense FP8 matvec.
 
 ```bash
@@ -155,5 +156,6 @@ Chunk logs report `multihead`, `sliding_window`, `packed_fp8`, `moe_cache`.
 - [x] Packed FP8 dense weights + fused matvec (attn + shared FFN)  
 - [x] Per-layer YaRN RoPE for compressed layers (`compress_ratios` / `compress_rope_theta`)  
 - [x] Sparse window + strided history KV gather for compress layers  
-- [ ] Learned compressor / indexer (true compressed KV slots)  
+- [x] Learned KV compressor (`compressor.*` → `{prefix}:L{i}:C` pool)  
+- [ ] Learned indexer top-k over compress pool  
 - [ ] Full 43-layer production parity (still sglang for prod MoE)  

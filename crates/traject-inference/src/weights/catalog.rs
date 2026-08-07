@@ -594,6 +594,40 @@ pub struct Layer0AttnWeights {
     pub rope_head_dim: usize,
     /// Per-layer RoPE table (base SWA or YaRN for compress layers).
     pub rope: RopeParams,
+    /// Optional learned KV compressor (`layers.{i}.attn.compressor.*`).
+    pub compressor: Option<CompressorWeights>,
+}
+
+/// Learned gated pooling compressor (DeepSeek-V4 `Compressor`).
+///
+/// `overlap == (ratio == 4)` matches the official module.
+#[derive(Debug, Clone)]
+pub struct CompressorWeights {
+    pub ratio: usize,
+    pub head_dim: usize,
+    pub hidden: usize,
+    pub overlap: bool,
+    /// `[ratio, coff * head_dim]` absolute position encodings for gates.
+    pub ape: Vec<f32>,
+    /// `[coff * head_dim, hidden]`
+    pub wkv: LinearMat,
+    /// `[coff * head_dim, hidden]`
+    pub wgate: LinearMat,
+    /// RMSNorm γ `[head_dim]`
+    pub norm: Vec<f32>,
+}
+
+impl CompressorWeights {
+    pub fn coff(&self) -> usize {
+        if self.overlap {
+            2
+        } else {
+            1
+        }
+    }
+    pub fn out_dim(&self) -> usize {
+        self.coff() * self.head_dim
+    }
 }
 
 impl Layer0AttnWeights {
@@ -893,6 +927,19 @@ fn load_layer_attn_into(
         }
     };
 
+    let compressor = if rope.compress_ratio > 0 {
+        match load_compressor_into(&mut cat, layer, hidden, wkv.rows().max(1), rope.compress_ratio)
+        {
+            Ok(c) => Some(c),
+            Err(e) => {
+                warn!(layer, error = %e, "compressor not loaded; keep strided history fallback");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     info!(
         dir = %model_dir.display(),
         hidden,
@@ -905,6 +952,7 @@ fn load_layer_attn_into(
         has_wo_a = wo_a.is_some(),
         has_wo_b = wo_b.is_some(),
         has_attn_sink = attn_sink.is_some(),
+        has_compressor = compressor.is_some(),
         rope_head_dim,
         compress_ratio = rope.compress_ratio,
         yarn = rope.yarn,
@@ -933,6 +981,79 @@ fn load_layer_attn_into(
         attn_sink,
         rope_head_dim,
         rope,
+        compressor,
+    })
+}
+
+fn load_compressor_into(
+    cat: &mut SafetensorCatalog,
+    layer: usize,
+    hidden: usize,
+    head_dim: usize,
+    ratio: usize,
+) -> Result<CompressorWeights> {
+    let ratio = ratio.max(1);
+    let overlap = ratio == 4;
+    let coff = if overlap { 2 } else { 1 };
+    let out_dim = coff * head_dim;
+    let ape = cat
+        .load_f32(&format!("layers.{layer}.attn.compressor.ape"))?
+        .data;
+    if ape.len() != ratio * out_dim {
+        return Err(TrajectError::Other(format!(
+            "compressor ape len {} want {}",
+            ape.len(),
+            ratio * out_dim
+        )));
+    }
+    let wkv = load_weight_linear(
+        cat,
+        &[&format!("layers.{layer}.attn.compressor.wkv.weight")],
+    )?;
+    let wgate = load_weight_linear(
+        cat,
+        &[&format!("layers.{layer}.attn.compressor.wgate.weight")],
+    )?;
+    if wkv.rows() != out_dim || wkv.cols() != hidden {
+        return Err(TrajectError::Other(format!(
+            "compressor wkv [{},{}] want [{out_dim},{hidden}]",
+            wkv.rows(),
+            wkv.cols()
+        )));
+    }
+    if wgate.rows() != out_dim || wgate.cols() != hidden {
+        return Err(TrajectError::Other(format!(
+            "compressor wgate [{},{}] want [{out_dim},{hidden}]",
+            wgate.rows(),
+            wgate.cols()
+        )));
+    }
+    let norm = cat
+        .load_f32(&format!("layers.{layer}.attn.compressor.norm.weight"))?
+        .data;
+    if norm.len() != head_dim {
+        return Err(TrajectError::Other(format!(
+            "compressor norm len {} want {head_dim}",
+            norm.len()
+        )));
+    }
+    info!(
+        layer,
+        ratio,
+        head_dim,
+        overlap,
+        out_dim,
+        "loaded layer attention compressor"
+    );
+    Ok(CompressorWeights {
+        ratio,
+        head_dim,
+        hidden,
+        overlap,
+        ape,
+        wkv,
+        wgate,
+        norm,
     })
 }
 
