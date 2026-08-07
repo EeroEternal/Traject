@@ -596,6 +596,27 @@ pub struct Layer0AttnWeights {
     pub rope: RopeParams,
     /// Optional learned KV compressor (`layers.{i}.attn.compressor.*`).
     pub compressor: Option<CompressorWeights>,
+    /// Optional sparse indexer over compress pool (only when `compress_ratio == 4`).
+    pub indexer: Option<IndexerWeights>,
+}
+
+/// Learned top-k indexer over compressed KV (DeepSeek-V4 `Indexer`).
+///
+/// Official code only attaches this when `compress_ratio == 4`.
+#[derive(Debug, Clone)]
+pub struct IndexerWeights {
+    pub n_heads: usize,
+    pub head_dim: usize,
+    pub topk: usize,
+    pub q_lora: usize,
+    /// `[n_heads * head_dim, q_lora]`
+    pub wq_b: LinearMat,
+    /// `[n_heads, hidden]`
+    pub weights_proj: TensorF32,
+    /// Indexer's own compressor (usually `head_dim=128`).
+    pub compressor: CompressorWeights,
+    /// RoPE table for index heads (same YaRN policy as the parent layer).
+    pub rope: RopeParams,
 }
 
 /// Learned gated pooling compressor (DeepSeek-V4 `Compressor`).
@@ -928,11 +949,30 @@ fn load_layer_attn_into(
     };
 
     let compressor = if rope.compress_ratio > 0 {
-        match load_compressor_into(&mut cat, layer, hidden, wkv.rows().max(1), rope.compress_ratio)
-        {
+        match load_compressor_into(
+            &mut cat,
+            layer,
+            hidden,
+            wkv.rows().max(1),
+            rope.compress_ratio,
+            &format!("layers.{layer}.attn.compressor"),
+        ) {
             Ok(c) => Some(c),
             Err(e) => {
                 warn!(layer, error = %e, "compressor not loaded; keep strided history fallback");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Official: indexer only when compress_ratio == 4.
+    let indexer = if rope.compress_ratio == 4 {
+        match load_indexer_into(&mut cat, model_dir, layer, hidden, wq_a.rows(), &rope) {
+            Ok(ix) => Some(ix),
+            Err(e) => {
+                warn!(layer, error = %e, "indexer not loaded; attend full compress pool");
                 None
             }
         }
@@ -953,6 +993,7 @@ fn load_layer_attn_into(
         has_wo_b = wo_b.is_some(),
         has_attn_sink = attn_sink.is_some(),
         has_compressor = compressor.is_some(),
+        has_indexer = indexer.is_some(),
         rope_head_dim,
         compress_ratio = rope.compress_ratio,
         yarn = rope.yarn,
@@ -982,6 +1023,7 @@ fn load_layer_attn_into(
         rope_head_dim,
         rope,
         compressor,
+        indexer,
     })
 }
 
@@ -991,49 +1033,40 @@ fn load_compressor_into(
     hidden: usize,
     head_dim: usize,
     ratio: usize,
+    key_prefix: &str,
 ) -> Result<CompressorWeights> {
     let ratio = ratio.max(1);
     let overlap = ratio == 4;
     let coff = if overlap { 2 } else { 1 };
     let out_dim = coff * head_dim;
-    let ape = cat
-        .load_f32(&format!("layers.{layer}.attn.compressor.ape"))?
-        .data;
+    let ape = cat.load_f32(&format!("{key_prefix}.ape"))?.data;
     if ape.len() != ratio * out_dim {
         return Err(TrajectError::Other(format!(
-            "compressor ape len {} want {}",
+            "compressor ape len {} want {} ({key_prefix})",
             ape.len(),
             ratio * out_dim
         )));
     }
-    let wkv = load_weight_linear(
-        cat,
-        &[&format!("layers.{layer}.attn.compressor.wkv.weight")],
-    )?;
-    let wgate = load_weight_linear(
-        cat,
-        &[&format!("layers.{layer}.attn.compressor.wgate.weight")],
-    )?;
+    let wkv = load_weight_linear(cat, &[&format!("{key_prefix}.wkv.weight")])?;
+    let wgate = load_weight_linear(cat, &[&format!("{key_prefix}.wgate.weight")])?;
     if wkv.rows() != out_dim || wkv.cols() != hidden {
         return Err(TrajectError::Other(format!(
-            "compressor wkv [{},{}] want [{out_dim},{hidden}]",
+            "compressor wkv [{},{}] want [{out_dim},{hidden}] ({key_prefix})",
             wkv.rows(),
             wkv.cols()
         )));
     }
     if wgate.rows() != out_dim || wgate.cols() != hidden {
         return Err(TrajectError::Other(format!(
-            "compressor wgate [{},{}] want [{out_dim},{hidden}]",
+            "compressor wgate [{},{}] want [{out_dim},{hidden}] ({key_prefix})",
             wgate.rows(),
             wgate.cols()
         )));
     }
-    let norm = cat
-        .load_f32(&format!("layers.{layer}.attn.compressor.norm.weight"))?
-        .data;
+    let norm = cat.load_f32(&format!("{key_prefix}.norm.weight"))?.data;
     if norm.len() != head_dim {
         return Err(TrajectError::Other(format!(
-            "compressor norm len {} want {head_dim}",
+            "compressor norm len {} want {head_dim} ({key_prefix})",
             norm.len()
         )));
     }
@@ -1043,6 +1076,7 @@ fn load_compressor_into(
         head_dim,
         overlap,
         out_dim,
+        key_prefix,
         "loaded layer attention compressor"
     );
     Ok(CompressorWeights {
@@ -1054,6 +1088,87 @@ fn load_compressor_into(
         wkv,
         wgate,
         norm,
+    })
+}
+
+fn load_indexer_into(
+    cat: &mut SafetensorCatalog,
+    model_dir: &Path,
+    layer: usize,
+    hidden: usize,
+    q_lora: usize,
+    parent_rope: &RopeParams,
+) -> Result<IndexerWeights> {
+    use crate::weights::HfModelConfig;
+    let (n_heads, head_dim, topk) = match HfModelConfig::load(model_dir) {
+        Ok(cfg) => (
+            cfg.index_n_heads.unwrap_or(64) as usize,
+            cfg.index_head_dim.unwrap_or(128) as usize,
+            cfg.index_topk.unwrap_or(512) as usize,
+        ),
+        Err(_) => (64, 128, 512),
+    };
+    let wq_b = load_weight_linear(
+        cat,
+        &[&format!("layers.{layer}.attn.indexer.wq_b.weight")],
+    )?;
+    let want_rows = n_heads * head_dim;
+    if wq_b.rows() != want_rows || wq_b.cols() != q_lora {
+        return Err(TrajectError::Other(format!(
+            "indexer wq_b [{},{}] want [{want_rows},{q_lora}]",
+            wq_b.rows(),
+            wq_b.cols()
+        )));
+    }
+    let weights_proj = cat.load_f32(&format!("layers.{layer}.attn.indexer.weights_proj.weight"))?;
+    if weights_proj.rows() != n_heads || weights_proj.cols() != hidden {
+        return Err(TrajectError::Other(format!(
+            "indexer weights_proj [{},{}] want [{n_heads},{hidden}]",
+            weights_proj.rows(),
+            weights_proj.cols()
+        )));
+    }
+    let compressor = load_compressor_into(
+        cat,
+        layer,
+        hidden,
+        head_dim,
+        parent_rope.compress_ratio.max(4),
+        &format!("layers.{layer}.attn.indexer.compressor"),
+    )?;
+    // Index heads use same YaRN/base policy as parent, but rope_dim is min(64, head_dim).
+    let rope_dim = parent_rope.rope_dim.min(head_dim).max(2);
+    let rope = if parent_rope.yarn {
+        RopeParams::yarn_or_base(
+            rope_dim,
+            parent_rope.theta,
+            parent_rope.compress_ratio,
+            // recover yarn params from parent inv_freq length — use defaults
+            65536,
+            16.0,
+            32.0,
+            1.0,
+        )
+    } else {
+        RopeParams::base(rope_dim, parent_rope.theta)
+    };
+    info!(
+        layer,
+        n_heads,
+        head_dim,
+        topk,
+        q_lora,
+        "loaded layer attention indexer"
+    );
+    Ok(IndexerWeights {
+        n_heads,
+        head_dim,
+        topk,
+        q_lora,
+        wq_b,
+        weights_proj,
+        compressor,
+        rope,
     })
 }
 

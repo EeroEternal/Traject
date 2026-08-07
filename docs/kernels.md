@@ -102,10 +102,10 @@ full f32 expand). Each layer:
    absorbs softmax mass.  
    - `compress_ratios[i]==0`: base `rope_theta`; attend last **`sliding_window`**
      tokens (default 128; `TRAJECT_SLIDING_WINDOW=0` = full context)  
-   - `compress_ratios[i]>0`: **YaRN** + **learned compressor** (when weights load)
-     writes compressed slots to `{prefix}:L{i}:C`; decode attends
-     **window ‖ compress-pool**. If compressor missing, falls back to strided
-     history (`TRAJECT_COMPRESS_TOPK`).
+   - `compress_ratios[i]>0`: **YaRN** + **learned compressor** → `{prefix}:L{i}:C`  
+     - `ratio==4`: **learned indexer** (own compress stream `:I`) selects top-k
+       compress slots (`index_topk`, default 512)  
+     - other ratios: attend full compress pool (or strided fallback)
 3. **o_proj:** group-concat heads → `wo_a` → `wo_b` (official layout; residual is
    `x += o`, not residual-through-`wo_a`).
 4. **Hyper-Connections (HC):** embed expands to `hc_mult` (4) streams; each block
@@ -115,8 +115,8 @@ full f32 expand). Each layer:
 
 Per-layer KV is keyed `{prefix}:L{i}`. Free drops base + all layer keys.
 
-**Not loaded yet:** learned **indexer** top-k (compress pool is fully attended);
-full 43-layer parity; optional GPU dense FP8 matvec.
+**Not loaded yet:** full 43-layer production parity; Hadamard/FP4 QAT sim in
+indexer; optional GPU dense FP8 matvec.
 
 ```bash
 export TRAJECT_LOCAL_LAYERS=2      # 1..TRAJECT_LOCAL_LAYERS_MAX (default cap 32)
@@ -157,5 +157,7 @@ Chunk logs report `multihead`, `sliding_window`, `packed_fp8`, `moe_cache`.
 - [x] Per-layer YaRN RoPE for compressed layers (`compress_ratios` / `compress_rope_theta`)  
 - [x] Sparse window + strided history KV gather for compress layers  
 - [x] Learned KV compressor (`compressor.*` → `{prefix}:L{i}:C` pool)  
+- [x] Learned indexer top-k (`indexer.*` → score `:I`, select `:C`)  
+
 - [ ] Learned indexer top-k over compress pool  
 - [ ] Full 43-layer production parity (still sglang for prod MoE)  
