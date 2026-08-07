@@ -76,6 +76,15 @@ pub struct HfModelConfig {
     /// Indexer top-k over compress pool (V4 Flash: 512).
     #[serde(default)]
     pub index_topk: Option<u32>,
+    /// MoE score function: `softmax` | `sigmoid` | `sqrtsoftplus` (V4 Flash).
+    #[serde(default, alias = "score_func")]
+    pub scoring_func: Option<String>,
+    /// First N layers use hash routing via `gate.tid2eid` (V4 Flash: 3).
+    #[serde(default, alias = "n_hash_layers")]
+    pub num_hash_layers: Option<u32>,
+    /// Clamp on expert SwiGLU gate/up activations (V4 Flash: 10).
+    #[serde(default)]
+    pub swiglu_limit: Option<f32>,
 }
 
 /// Subset of HF `rope_scaling` used for YaRN frequency interpolation.

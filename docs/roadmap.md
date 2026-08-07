@@ -50,6 +50,7 @@
 - [x] Shared MoE catalog across layers + `TRAJECT_LOCAL_LAYERS` up to full model depth
 - [x] Indexer Hadamard + FP4 QAT sim (official lightning-indexer QK path)
 - [x] Main attn/compressor FP8 act_quant QAT on no-RoPE dims
+- [x] Official MoE gate (sqrtsoftplus / bias / hash tid2eid / swiglu_limit)
 - [ ] Quality/perf parity with sglang-lite for in-process 43-layer runs
 - [x] Tool latency-aware pin TTL from histograms (`ToolLatencyTracker` p95)
 - [x] Prefetch pin after tool return (`PinReason::Prefetch`)
