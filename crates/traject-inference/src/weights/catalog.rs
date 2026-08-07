@@ -1611,19 +1611,24 @@ impl Layer0RoutedMoe {
     ///
     /// `token_id` is required for hash layers (`tid2eid`); ignored otherwise.
     pub fn route(&self, h: &[f32], token_id: Option<u32>) -> Vec<(usize, f32)> {
+        use rayon::prelude::*;
         let n = self.n_experts.min(self.gate.rows());
         if n == 0 {
             return Vec::new();
         }
-        let mut logits = vec![0.0f32; n];
-        for i in 0..n {
-            let row = &self.gate.data[i * self.hidden..(i + 1) * self.hidden];
-            let mut s = 0.0f32;
-            for (a, b) in row.iter().zip(h.iter()) {
-                s += a * b;
-            }
-            logits[i] = s;
-        }
+        let hidden = self.hidden;
+        let gate = &self.gate.data;
+        let logits: Vec<f32> = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let row = &gate[i * hidden..(i + 1) * hidden];
+                let mut s = 0.0f32;
+                for (a, b) in row.iter().zip(h.iter()) {
+                    s += a * b;
+                }
+                s
+            })
+            .collect();
         // Score function → original_scores (routing weights come from these).
         let mut original = vec![0.0f32; n];
         match self.score_func {

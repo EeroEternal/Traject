@@ -557,6 +557,8 @@ impl ModelWeights {
     }
 
     /// Pure routed MoE sum (no residual). Weights already include `route_scale`.
+    ///
+    /// Top-k expert SwiGLUs run in parallel (rayon); results are reduced serially.
     fn routed_moe_delta(
         &self,
         moe: &crate::weights::Layer0RoutedMoe,
@@ -565,6 +567,7 @@ impl ModelWeights {
         already_normed: bool,
         token_id: Option<u32>,
     ) -> Vec<f32> {
+        use rayon::prelude::*;
         let n = if already_normed {
             h.to_vec()
         } else if let Some(g) = ffn_norm {
@@ -573,12 +576,17 @@ impl ModelWeights {
             h.to_vec()
         };
         let routes = moe.route(&n, token_id);
+        let limit = moe.swiglu_limit;
+        let parts: Vec<(usize, f32, traject_core::Result<Vec<f32>>)> = routes
+            .into_par_iter()
+            .map(|(eid, w)| {
+                let out = moe.expert(eid).and_then(|ex| ex.swiglu(&n, limit));
+                (eid, w, out)
+            })
+            .collect();
         let mut delta = vec![0.0f32; moe.hidden];
-        for (eid, w) in routes {
-            match moe
-                .expert(eid)
-                .and_then(|ex| ex.swiglu(&n, moe.swiglu_limit))
-            {
+        for (eid, w, res) in parts {
+            match res {
                 Ok(d) => {
                     for (o, x) in delta.iter_mut().zip(d.iter()) {
                         *o += w * *x;
@@ -656,19 +664,23 @@ impl ModelWeights {
     }
 
     fn logits(&self, h: &[f32]) -> Vec<f32> {
+        use rayon::prelude::*;
         let h = self.rms_norm(h);
         let v = self.vocab as usize;
-        let mut out = vec![0.0f32; v];
-        // head is [vocab, hidden] — logits[i] = dot(head[i], h)
-        for i in 0..v {
-            let row = &self.head[i * self.hidden..(i + 1) * self.hidden];
-            let mut s = 0.0;
-            for (a, b) in h.iter().zip(row.iter()) {
-                s += a * b;
-            }
-            out[i] = s;
-        }
-        out
+        let hidden = self.hidden;
+        let head = &self.head;
+        // head is [vocab, hidden] — logits[i] = dot(head[i], h); parallel over vocab.
+        (0..v)
+            .into_par_iter()
+            .map(|i| {
+                let row = &head[i * hidden..(i + 1) * hidden];
+                let mut s = 0.0f32;
+                for (a, b) in h.iter().zip(row.iter()) {
+                    s += a * b;
+                }
+                s
+            })
+            .collect()
     }
 }
 

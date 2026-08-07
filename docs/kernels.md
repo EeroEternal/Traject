@@ -136,7 +136,8 @@ cargo run -p traject-cli --release -- \
 Dense attn/FFN use **packed FP8** fused matvec (rayon-parallel rows) with
 **FP8 act_quant** on inputs (block 128, ue8m0 — official `linear()`); all MoE
 layers share **one** safetensors catalog; routed experts use **packed FP4**
-(same act_quant on x). CPU attention softmax is parallel over heads.
+(same act_quant on x). CPU path also parallelizes: attention heads, MoE gate
+scores + top-k expert SwiGLU, and **lm_head** (vocab×hidden) logits.
 Chunk logs report `multihead`, `sliding_window`, `n_layers`, `moe_cache`.
 
 ## Status
@@ -171,4 +172,5 @@ Chunk logs report `multihead`, `sliding_window`, `n_layers`, `moe_cache`.
 - [x] Official MoE gate: sqrtsoftplus + bias + hash tid2eid + swiglu_limit  
 - [x] Linear act_quant on FP8/FP4 matvec inputs (block 128, ue8m0)  
 - [x] Rayon-parallel dense/expert matvec + multi-head attn; default full heads  
+- [x] Rayon-parallel lm_head logits + MoE gate scores + top-k expert SwiGLU  
 - [ ] Quality/perf parity with sglang-lite (GPU kernels, full eval)  
