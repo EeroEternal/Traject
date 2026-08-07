@@ -97,15 +97,15 @@ full f32 expand). Each layer:
    Q keeps **H heads × D** (`TRAJECT_ATTN_HEADS`, default 8; model has 64×512).  
    Per-head RMSNorm after `wq_b`. KV is a **single latent (K=V)**, stored compressed
    (`1 × D`) and expanded to H heads at kernel time.
-2. **RoPE + attn_sink + SWA / sparse history:** last `qk_rope_head_dim` (64)
-   dims get RoPE; inverse RoPE on attention output. Per-head `attn_sink`
-   absorbs softmax mass.  
+2. **RoPE + FP8 QAT + attn_sink + SWA / sparse history:** last
+   `qk_rope_head_dim` (64) dims get RoPE; **no-RoPE** dims get FP8
+   `act_quant` (block 64, ue8m0) to match QAT. Inverse RoPE on attention
+   output. Per-head `attn_sink` absorbs softmax mass.  
    - `compress_ratios[i]==0`: base `rope_theta`; attend last **`sliding_window`**
      tokens (default 128; `TRAJECT_SLIDING_WINDOW=0` = full context)  
    - `compress_ratios[i]>0`: **YaRN** + **learned compressor** → `{prefix}:L{i}:C`  
-     - `ratio==4`: **learned indexer** (own compress stream `:I`) selects top-k
-       compress slots (`index_topk`, default 512); Q and index-KV use **Hadamard
-       rotate + FP4 QAT** (official `rotate_activation` / `fp4_act_quant`)  
+     (main compress: FP8 no-RoPE QAT; ratio-4 indexer: Hadamard+FP4 on Q/index-KV)  
+     - `ratio==4`: **learned indexer** top-k (`index_topk`, default 512)  
      - other ratios: attend full compress pool (or strided fallback)
 3. **o_proj:** group-concat heads → `wo_a` → `wo_b` (official layout; residual is
    `x += o`, not residual-through-`wo_a`).
@@ -117,7 +117,7 @@ full f32 expand). Each layer:
 Per-layer KV is keyed `{prefix}:L{i}`. Free drops base + all layer keys.
 
 **Remaining gaps vs full production:** GPU dense FP8 matvec; quality/perf
-parity with sglang-lite (CPU path is a research stack).
+parity with sglang-lite (full 43-layer eval).
 
 ```bash
 export TRAJECT_LOCAL_LAYERS=2      # 1..num_hidden_layers (V4 Flash: 43)
@@ -162,4 +162,5 @@ safetensors catalog; routed experts use **packed FP4**. Chunk logs report
 - [x] Learned indexer top-k (`indexer.*` → score `:I`, select `:C`)  
 - [x] Shared MoE safetensors catalog across layers + full-depth layer cap (43)  
 - [x] Indexer Hadamard rotate + FP4 QAT sim (`rotate_activation` / `fp4_act_quant`)  
+- [x] Main KV + compressor FP8 `act_quant` on no-RoPE dims (block 64, ue8m0)  
 - [ ] Quality/perf parity with sglang-lite (GPU kernels, full eval)  
