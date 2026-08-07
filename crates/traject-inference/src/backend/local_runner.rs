@@ -1163,7 +1163,11 @@ fn gather_kv_by_idx(
     (ko, vo, n as u32)
 }
 
-/// Window (and optional strided compress history) then MQA expand for KernelBackend.
+/// Window (+ learned compress pool or strided history) then MQA expand.
+///
+/// `compress_pool`: optional `(k, v, len)` from `{prefix}:L{i}:C` when a learned
+/// compressor is loaded. When present, window fine tokens are concatenated with
+/// the compress pool (official layout stand-in: window ‖ compressed).
 fn prepare_kv_for_decode(
     multihead: bool,
     k_cache: Vec<f32>,
@@ -1173,6 +1177,7 @@ fn prepare_kv_for_decode(
     head_dim: usize,
     window: usize,
     compress_ratio: usize,
+    compress_pool: Option<(Vec<f32>, Vec<f32>, u32)>,
 ) -> (Vec<f32>, Vec<f32>, u32) {
     let width = if multihead {
         head_dim.max(1)
@@ -1180,7 +1185,24 @@ fn prepare_kv_for_decode(
         (n_q * head_dim).max(1)
     };
     let s = seq_len as usize;
-    let (k, v, sl) = if compress_ratio > 1 && s > window.max(1) && window > 0 {
+    let (k, v, sl) = if let Some((ck, cv, cl)) = compress_pool {
+        if cl > 0 {
+            let (mut wk, mut wv, wl) = slice_kv_window(k_cache, v_cache, seq_len, width, window);
+            let cneed = cl as usize * width;
+            if ck.len() >= cneed && cv.len() >= cneed {
+                wk.extend_from_slice(&ck[..cneed]);
+                wv.extend_from_slice(&cv[..cneed]);
+                (wk, wv, wl + cl)
+            } else {
+                (wk, wv, wl)
+            }
+        } else if compress_ratio > 1 && s > window.max(1) && window > 0 {
+            let idxs = build_sparse_kv_indices(s, window, compress_ratio, max_compress_tokens());
+            gather_kv_by_idx(&k_cache, &v_cache, s, width, &idxs)
+        } else {
+            slice_kv_window(k_cache, v_cache, seq_len, width, window)
+        }
+    } else if compress_ratio > 1 && s > window.max(1) && window > 0 {
         let idxs = build_sparse_kv_indices(s, window, compress_ratio, max_compress_tokens());
         gather_kv_by_idx(&k_cache, &v_cache, s, width, &idxs)
     } else {
@@ -1194,6 +1216,211 @@ fn prepare_kv_for_decode(
         )
     } else {
         (k, v, sl)
+    }
+}
+
+/// Per-layer incremental compressor state (official `kv_state` / `score_state`).
+#[derive(Debug, Clone)]
+struct CompressLayerState {
+    /// Flat `[slots * out_dim]` for kv projections in the open block.
+    kv_state: Vec<f32>,
+    score_state: Vec<f32>,
+    tokens_seen: usize,
+}
+
+impl CompressLayerState {
+    fn new(comp: &crate::weights::CompressorWeights) -> Self {
+        let slots = if comp.overlap {
+            2 * comp.ratio
+        } else {
+            comp.ratio
+        };
+        let out_dim = comp.out_dim();
+        let n = slots * out_dim;
+        Self {
+            kv_state: vec![0.0; n],
+            score_state: vec![f32::NEG_INFINITY; n],
+            tokens_seen: 0,
+        }
+    }
+}
+
+/// Push one token into the compressor; when a block completes return `head_dim` latent.
+fn compressor_push(
+    comp: &crate::weights::CompressorWeights,
+    state: &mut CompressLayerState,
+    x: &[f32],
+    pos: usize,
+    rope: &crate::weights::RopeParams,
+) -> Option<Vec<f32>> {
+    let ratio = comp.ratio.max(1);
+    let d = comp.head_dim.max(1);
+    let out_dim = comp.out_dim();
+    let mut kv = comp.wkv.matvec(x);
+    let mut score = comp.wgate.matvec(x);
+    kv.resize(out_dim, 0.0);
+    score.resize(out_dim, 0.0);
+
+    if !comp.overlap {
+        let r = pos % ratio;
+        // ape[r]
+        let ape_off = r * out_dim;
+        for j in 0..out_dim {
+            let a = comp.ape.get(ape_off + j).copied().unwrap_or(0.0);
+            score[j] += a;
+        }
+        let base = r * out_dim;
+        state.kv_state[base..base + out_dim].copy_from_slice(&kv);
+        state.score_state[base..base + out_dim].copy_from_slice(&score);
+        state.tokens_seen = pos + 1;
+        if (pos + 1) % ratio != 0 {
+            return None;
+        }
+        // Softmax over ratio for each dim, weighted sum of kv → [d] (out_dim==d).
+        let mut out = vec![0.0f32; d];
+        for j in 0..d.min(out_dim) {
+            let mut max_s = f32::NEG_INFINITY;
+            for r in 0..ratio {
+                max_s = max_s.max(state.score_state[r * out_dim + j]);
+            }
+            let mut sum = 0.0f32;
+            let mut acc = 0.0f32;
+            for r in 0..ratio {
+                let e = (state.score_state[r * out_dim + j] - max_s).exp();
+                sum += e;
+                acc += e * state.kv_state[r * out_dim + j];
+            }
+            out[j] = if sum > 0.0 { acc / sum } else { 0.0 };
+        }
+        // RMSNorm with compressor.norm
+        let mut ss = 0.0f32;
+        for v in &out {
+            ss += v * v;
+        }
+        let inv = (ss / d as f32 + 1e-6).sqrt().recip();
+        for (j, v) in out.iter_mut().enumerate() {
+            let g = comp.norm.get(j).copied().unwrap_or(1.0);
+            *v = *v * inv * g;
+        }
+        // RoPE at last token of the block
+        rope.apply_slice(&mut out, pos, false);
+        return Some(out);
+    }
+
+    // Overlap path (ratio==4): store current half at slots [ratio + pos%ratio].
+    let r = pos % ratio;
+    let ape_off = r * out_dim;
+    for j in 0..out_dim {
+        let a = comp.ape.get(ape_off + j).copied().unwrap_or(0.0);
+        score[j] += a;
+    }
+    let slot = ratio + r;
+    let base = slot * out_dim;
+    if base + out_dim <= state.kv_state.len() {
+        state.kv_state[base..base + out_dim].copy_from_slice(&kv);
+        state.score_state[base..base + out_dim].copy_from_slice(&score);
+    }
+    state.tokens_seen = pos + 1;
+    if (pos + 1) % ratio != 0 {
+        return None;
+    }
+    // cat: first half dims from slots[:ratio], second half from slots[ratio:]
+    // → [2*ratio, d], then softmax over 2*ratio and sum.
+    let n_pool = 2 * ratio;
+    let mut pool_kv = vec![0.0f32; n_pool * d];
+    let mut pool_sc = vec![f32::NEG_INFINITY; n_pool * d];
+    for i in 0..ratio {
+        let src0 = i * out_dim;
+        let src1 = (ratio + i) * out_dim;
+        for j in 0..d {
+            // first half of out_dim from early slots, second half from late slots
+            pool_kv[i * d + j] = state.kv_state.get(src0 + j).copied().unwrap_or(0.0);
+            pool_sc[i * d + j] = state.score_state.get(src0 + j).copied().unwrap_or(f32::NEG_INFINITY);
+            pool_kv[(ratio + i) * d + j] = state
+                .kv_state
+                .get(src1 + d + j)
+                .copied()
+                .unwrap_or(0.0);
+            pool_sc[(ratio + i) * d + j] = state
+                .score_state
+                .get(src1 + d + j)
+                .copied()
+                .unwrap_or(f32::NEG_INFINITY);
+        }
+    }
+    let mut out = vec![0.0f32; d];
+    for j in 0..d {
+        let mut max_s = f32::NEG_INFINITY;
+        for i in 0..n_pool {
+            max_s = max_s.max(pool_sc[i * d + j]);
+        }
+        let mut sum = 0.0f32;
+        let mut acc = 0.0f32;
+        for i in 0..n_pool {
+            let e = (pool_sc[i * d + j] - max_s).exp();
+            sum += e;
+            acc += e * pool_kv[i * d + j];
+        }
+        out[j] = if sum > 0.0 { acc / sum } else { 0.0 };
+    }
+    // Shift: slots[:ratio] = previous current window (slots[ratio:])
+    for i in 0..ratio {
+        let dst = i * out_dim;
+        let src = (ratio + i) * out_dim;
+        if src + out_dim <= state.kv_state.len() {
+            let kv_slice = state.kv_state[src..src + out_dim].to_vec();
+            let sc_slice = state.score_state[src..src + out_dim].to_vec();
+            state.kv_state[dst..dst + out_dim].copy_from_slice(&kv_slice);
+            state.score_state[dst..dst + out_dim].copy_from_slice(&sc_slice);
+        }
+    }
+    let mut ss = 0.0f32;
+    for v in &out {
+        ss += v * v;
+    }
+    let inv = (ss / d as f32 + 1e-6).sqrt().recip();
+    for (j, v) in out.iter_mut().enumerate() {
+        let g = comp.norm.get(j).copied().unwrap_or(1.0);
+        *v = *v * inv * g;
+    }
+    rope.apply_slice(&mut out, pos, false);
+    Some(out)
+}
+
+fn maybe_append_compress(
+    kv: &Mutex<PagedKvPool>,
+    compress_states: &Mutex<HashMap<String, CompressLayerState>>,
+    pfx: &str,
+    block: &crate::weights::LayerBlock,
+    x: &[f32],
+    pos: usize,
+    kv_width: usize,
+) {
+    let Some(ref comp) = block.attn.compressor else {
+        return;
+    };
+    let ckey = format!("{pfx}:C");
+    let mut map = compress_states.lock();
+    let st = map
+        .entry(ckey.clone())
+        .or_insert_with(|| CompressLayerState::new(comp));
+    if let Some(mut ckv) = compressor_push(comp, st, x, pos, &block.attn.rope) {
+        ckv.resize(kv_width, 0.0);
+        let v = ckv.clone();
+        kv.lock().append_kv(&ckey, &ckv, &v);
+    }
+}
+
+fn materialize_compress_pool(
+    kv: &Mutex<PagedKvPool>,
+    pfx: &str,
+) -> Option<(Vec<f32>, Vec<f32>, u32)> {
+    let ckey = format!("{pfx}:C");
+    let (k, v, n) = kv.lock().materialize_kv(&ckey);
+    if n == 0 {
+        None
+    } else {
+        Some((k, v, n))
     }
 }
 
@@ -1342,6 +1569,8 @@ pub struct LocalWeightRunner {
     head_dim: usize,
     /// Sliding-window size for attention (0 = full context).
     sliding_window: usize,
+    /// Incremental compressor state keyed by `{prefix}:L{i}:C`.
+    compress_states: Mutex<HashMap<String, CompressLayerState>>,
 }
 
 impl LocalWeightRunner {
@@ -1404,6 +1633,7 @@ impl LocalWeightRunner {
             n_q_heads,
             head_dim,
             sliding_window,
+            compress_states: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1610,6 +1840,16 @@ impl InferenceBackend for LocalWeightRunner {
                             apply_rope_latent(&mut kk, head_dim, &block.attn.rope, pos);
                             let vv = kk.clone();
                             self.kv.lock().append_kv(&pfx, &kk, &vv);
+                            let hn = self.weights.rms_norm_with(&x, Some(&block.attn.attn_norm));
+                            maybe_append_compress(
+                                &self.kv,
+                                &self.compress_states,
+                                &pfx,
+                                block,
+                                &hn,
+                                pos,
+                                kv_width,
+                            );
                             let mut qq = self.weights.project_q_layer(&block.attn, &x);
                             qq.resize(q_width, 0.0);
                             apply_rope_heads(&mut qq, n_q, head_dim, &block.attn.rope, pos, false);
@@ -1625,6 +1865,7 @@ impl InferenceBackend for LocalWeightRunner {
                                     head_dim,
                                     self.sliding_window,
                                     block.attn.rope.compress_ratio,
+                                    materialize_compress_pool(&self.kv, &pfx),
                                 );
                                 if let Ok(dec) = self
                                     .kernel
@@ -1685,6 +1926,16 @@ impl InferenceBackend for LocalWeightRunner {
                             apply_rope_latent(&mut kk, head_dim, &block.attn.rope, pos);
                             let vv = kk.clone();
                             self.kv.lock().append_kv(&pfx, &kk, &vv);
+                            let hn = self.weights.rms_norm_with(&h, Some(&block.attn.attn_norm));
+                            maybe_append_compress(
+                                &self.kv,
+                                &self.compress_states,
+                                &pfx,
+                                block,
+                                &hn,
+                                pos,
+                                kv_width,
+                            );
                             let mut qq = self.weights.project_q_layer(&block.attn, &h);
                             qq.resize(q_width, 0.0);
                             apply_rope_heads(&mut qq, n_q, head_dim, &block.attn.rope, pos, false);
@@ -1699,6 +1950,7 @@ impl InferenceBackend for LocalWeightRunner {
                                     head_dim,
                                     self.sliding_window,
                                     block.attn.rope.compress_ratio,
+                                    materialize_compress_pool(&self.kv, &pfx),
                                 );
                                 if let Ok(dec) = self
                                     .kernel
@@ -1787,6 +2039,7 @@ impl InferenceBackend for LocalWeightRunner {
                     head_dim,
                     self.sliding_window,
                     0,
+                    None,
                 );
                 let dec = self
                     .kernel
@@ -1831,6 +2084,16 @@ impl InferenceBackend for LocalWeightRunner {
                             apply_rope_latent(&mut kk, head_dim, &block.attn.rope, 0);
                             let vv = kk.clone();
                             self.kv.lock().append_kv(&pfx, &kk, &vv);
+                            let hn = self.weights.rms_norm_with(&x, Some(&block.attn.attn_norm));
+                            maybe_append_compress(
+                                &self.kv,
+                                &self.compress_states,
+                                &pfx,
+                                block,
+                                &hn,
+                                0,
+                                kv_width,
+                            );
                             streams = residual;
                             continue;
                         }
@@ -1847,6 +2110,7 @@ impl InferenceBackend for LocalWeightRunner {
                             head_dim,
                             self.sliding_window,
                             block.attn.rope.compress_ratio,
+                            materialize_compress_pool(&self.kv, &pfx),
                         );
                         let dec = self
                             .kernel
@@ -1902,6 +2166,16 @@ impl InferenceBackend for LocalWeightRunner {
                             apply_rope_latent(&mut kk, head_dim, &block.attn.rope, 0);
                             let vv = kk.clone();
                             self.kv.lock().append_kv(&pfx, &kk, &vv);
+                            let hn = self.weights.rms_norm_with(&h, Some(&block.attn.attn_norm));
+                            maybe_append_compress(
+                                &self.kv,
+                                &self.compress_states,
+                                &pfx,
+                                block,
+                                &hn,
+                                0,
+                                kv_width,
+                            );
                             streams = h;
                             continue;
                         }
@@ -1916,6 +2190,7 @@ impl InferenceBackend for LocalWeightRunner {
                             head_dim,
                             self.sliding_window,
                             block.attn.rope.compress_ratio,
+                            materialize_compress_pool(&self.kv, &pfx),
                         );
                         let dec = self
                             .kernel
@@ -1994,6 +2269,16 @@ impl InferenceBackend for LocalWeightRunner {
                     apply_rope_latent(&mut k, head_dim, &block.attn.rope, pos);
                     let v = k.clone();
                     self.kv.lock().append_kv(&pfx, &k, &v);
+                    let hn = self.weights.rms_norm_with(&hh, Some(&block.attn.attn_norm));
+                    maybe_append_compress(
+                        &self.kv,
+                        &self.compress_states,
+                        &pfx,
+                        block,
+                        &hn,
+                        pos,
+                        kv_width,
+                    );
                     // Advance residual lightly so deeper layers see something non-constant.
                     if let Some(ref ffn) = block.ffn {
                         hh = self.weights.shared_ffn_residual_block(ffn, &hh);
@@ -2068,6 +2353,11 @@ impl InferenceBackend for LocalWeightRunner {
             has_hc_head = self.weights.hc_head.is_some(),
             hc_mult = hc_mult,
             sliding_window = self.sliding_window,
+            has_compressor = self
+                .weights
+                .layers
+                .iter()
+                .any(|l| l.attn.compressor.is_some()),
             moe_cache = ?self.weights.layers.first().and_then(|l| {
                 l.moe.as_ref().map(|m| m.cache_stats())
             }),
@@ -2098,10 +2388,13 @@ impl InferenceBackend for LocalWeightRunner {
     async fn free_prefix(&self, prefix_id: &str, _session_id: Option<&str>) -> Result<()> {
         let mut total = 0;
         total += self.kv.lock().free_prefix(prefix_id);
-        // Per-layer KV keys used by multi-layer stack.
+        // Per-layer KV keys used by multi-layer stack (+ compress pools).
         for li in 0..self.weights.n_layers().max(1) {
             let pfx = format!("{prefix_id}:L{li}");
             total += self.kv.lock().free_prefix(&pfx);
+            let cpfx = format!("{pfx}:C");
+            total += self.kv.lock().free_prefix(&cpfx);
+            self.compress_states.lock().remove(&cpfx);
         }
         info!(%prefix_id, pages_zeroed = total, "local runner physical KV free");
         Ok(())
@@ -2286,5 +2579,41 @@ mod tests {
         assert_eq!(n, 2);
         assert_eq!(k2, vec![0.0, 1.0, 4.0, 5.0]);
         assert_eq!(v2, vec![10.0, 11.0, 14.0, 15.0]);
+    }
+
+    #[test]
+    fn compressor_nonoverlap_emits_every_ratio() {
+        use crate::weights::{CompressorWeights, LinearMat, RopeParams, TensorF32};
+        let hidden = 4usize;
+        let head_dim = 2usize;
+        let ratio = 2usize;
+        // Identity-ish dense mats: out = first head_dim of padded hidden.
+        let w = TensorF32 {
+            data: {
+                let mut m = vec![0.0f32; head_dim * hidden];
+                for i in 0..head_dim {
+                    m[i * hidden + i] = 1.0;
+                }
+                m
+            },
+            shape: vec![head_dim, hidden],
+        };
+        let comp = CompressorWeights {
+            ratio,
+            head_dim,
+            hidden,
+            overlap: false,
+            ape: vec![0.0; ratio * head_dim],
+            wkv: LinearMat::F32(w.clone()),
+            wgate: LinearMat::F32(w),
+            norm: vec![1.0; head_dim],
+        };
+        let rope = RopeParams::base(2, 10000.0);
+        let mut st = CompressLayerState::new(&comp);
+        let x = vec![1.0f32, 2.0, 0.0, 0.0];
+        assert!(compressor_push(&comp, &mut st, &x, 0, &rope).is_none());
+        let out = compressor_push(&comp, &mut st, &x, 1, &rope).expect("emit");
+        assert_eq!(out.len(), head_dim);
+        assert!(out.iter().all(|v| v.is_finite()));
     }
 }
