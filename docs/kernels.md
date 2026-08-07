@@ -91,27 +91,27 @@ toy char-hash encode and id-list decode.
 Loads the first **N** DeepSeek-V4 blocks (`TRAJECT_LOCAL_LAYERS`, default **2**,
 max 8). Each layer:
 
-1. **Attention:** `attn_norm` + FP8 `wq_a` / `wkv` + `q_norm` / `kv_norm`  
-   + FP8 `wq_b` (mean-pooled to `kv_lora` for KernelBackend)
-2. **o_proj:** FP8 `wo_a` / `wo_b` (group inject + residual)
+1. **Attention (MQA multi-head):** `attn_norm` + FP8 `wq_a`/`wkv` + norms + `wq_b`  
+   Q keeps **H heads × D** (`TRAJECT_ATTN_HEADS`, default 8; model has 64×512).  
+   KV is stored compressed (`1 × D`) and **expanded** to H heads at kernel time.
+2. **o_proj:** multi-head o → group-mean → `wo_a`/`wo_b`
 3. **Shared expert FFN:** SwiGLU residual
-4. **Routed MoE:** gate top-k + lazy FP4 experts
+4. **Routed MoE:** gate top-k + packed FP4 experts (lazy f32 expand)
 
 Per-layer KV is keyed `{prefix}:L{i}`. Free drops base + all layer keys.
 
-**Not loaded yet:** full 43-layer production stack (memory), true multi-head
-attention without mean-pool.
+**Not loaded yet:** full 43-layer production stack (memory).
 
 ```bash
 export TRAJECT_LOCAL_LAYERS=2   # or 1..8
-export TRAJECT_MOE_CACHE=32     # LRU dequantized experts per MoE layer
+export TRAJECT_ATTN_HEADS=8     # Q heads (MQA); max 64 for V4 Flash
+export TRAJECT_MOE_CACHE=32     # LRU packed experts per MoE layer
 cargo run -p traject-cli --release -- \
   --local-runner --model /path/to/ds-v4-flash --max-tokens 4 "hello"
 ```
 
 Routed MoE keeps a **live `SafetensorCatalog`** (mmap reuse) and an **LRU** of
-**packed FP4** experts (`TRAJECT_MOE_CACHE`, default 32). SwiGLU uses **fused
-FP4 matvec** (no full f32 expand). Chunk logs report `moe_cache=(hits, misses)`.
+**packed FP4** experts. Chunk logs report `multihead`, `n_q_heads`, `moe_cache`.
 
 ## Status
 
@@ -128,4 +128,5 @@ FP4 matvec** (no full f32 expand). Chunk logs report `moe_cache=(hits, misses)`.
 - [x] Multi-layer stack (`TRAJECT_LOCAL_LAYERS`, per-layer KV)  
 - [x] MoE kept-open catalog + true LRU expert cache  
 - [x] Packed FP4 experts + fused matvec (no full f32 dequant)  
+- [x] Multi-head Q + MQA KV expand (no Q mean-pool; `TRAJECT_ATTN_HEADS`)  
 - [ ] Full 43-layer production parity (still sglang for prod MoE)  

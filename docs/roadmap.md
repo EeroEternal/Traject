@@ -38,6 +38,7 @@
 - [x] Multi-layer local stack (`TRAJECT_LOCAL_LAYERS`, default 2; per-layer KV)
 - [x] MoE kept-open safetensors catalog + LRU expert dequant cache
 - [x] Packed FP4 experts + fused matvec (skip full f32 expand)
+- [x] Multi-head Q + MQA KV expand (`TRAJECT_ATTN_HEADS`, no Q mean-pool)
 - [ ] Full 43-layer production parity in-process (prod MoE remains sglang-lite)
 - [x] Tool latency-aware pin TTL from histograms (`ToolLatencyTracker` p95)
 - [x] Prefetch pin after tool return (`PinReason::Prefetch`)
