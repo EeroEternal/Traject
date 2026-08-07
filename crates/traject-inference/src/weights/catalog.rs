@@ -250,6 +250,56 @@ impl SafetensorCatalog {
         Ok(TensorF32 { data, shape })
     }
 
+    /// Load a tensor as little-endian `i64` (e.g. `gate.tid2eid`).
+    pub fn load_i64(&mut self, name: &str) -> Result<(Vec<i64>, Vec<usize>)> {
+        let (bytes, shape, dtype) = self.load_raw(name)?;
+        let data: Vec<i64> = match dtype {
+            safetensors::Dtype::I64 => {
+                if bytes.len() % 8 != 0 {
+                    return Err(TrajectError::Other(format!(
+                        "I64 tensor `{name}` byte len {} not multiple of 8",
+                        bytes.len()
+                    )));
+                }
+                bytes
+                    .chunks_exact(8)
+                    .map(|c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+                    .collect()
+            }
+            safetensors::Dtype::I32 => {
+                if bytes.len() % 4 != 0 {
+                    return Err(TrajectError::Other(format!(
+                        "I32 tensor `{name}` byte len {} not multiple of 4",
+                        bytes.len()
+                    )));
+                }
+                bytes
+                    .chunks_exact(4)
+                    .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as i64)
+                    .collect()
+            }
+            other => {
+                return Err(TrajectError::Other(format!(
+                    "tensor `{name}` dtype {other:?}, expected I64/I32"
+                )));
+            }
+        };
+        let expected: usize = shape.iter().product();
+        if data.len() != expected {
+            return Err(TrajectError::Other(format!(
+                "tensor `{name}` numel mismatch: got {} expect {expected} shape={shape:?}",
+                data.len()
+            )));
+        }
+        info!(
+            tensor = name,
+            shape = ?shape,
+            dtype = ?dtype,
+            "loaded safetensor as i64"
+        );
+        Ok((data, shape))
+    }
+
     /// Load DeepSeek-style block-scaled FP8 weight (`*.weight` + sibling `*.scale`).
     ///
     /// Weight is F8_E4M3, scale is F8_E8M0, block size 128 (V4 default).
@@ -1289,11 +1339,20 @@ impl ExpertPacked {
     }
 
     /// SwiGLU via lazy f32 expand (first call dequants; later calls are pure GEMV).
-    pub fn swiglu(&self, x: &[f32]) -> Result<Vec<f32>> {
+    ///
+    /// `limit > 0` clamps gate (max) and up (min/max) to match official `swiglu_limit`.
+    pub fn swiglu(&self, x: &[f32], limit: f32) -> Result<Vec<f32>> {
         let m = self.ensure_f32()?;
-        // Prefer f32 matvec after expand.
-        let u = matvec_f32(&m.w1, m.w1_rows, m.w1_cols, x);
-        let g = matvec_f32(&m.w3, m.w3_rows, m.w3_cols, x);
+        let mut u = matvec_f32(&m.w1, m.w1_rows, m.w1_cols, x);
+        let mut g = matvec_f32(&m.w3, m.w3_rows, m.w3_cols, x);
+        if limit > 0.0 {
+            for v in &mut u {
+                *v = v.min(limit);
+            }
+            for v in &mut g {
+                *v = (*v).clamp(-limit, limit);
+            }
+        }
         let inter = u.len().min(g.len());
         let mut gated = vec![0.0f32; inter];
         for i in 0..inter {
@@ -1305,9 +1364,17 @@ impl ExpertPacked {
     }
 
     /// One-shot fused path without caching f32 (used in unit tests / tiny mats).
-    pub fn swiglu_fused(&self, x: &[f32]) -> Result<Vec<f32>> {
-        let u = self.w1.matvec(x)?;
-        let g = self.w3.matvec(x)?;
+    pub fn swiglu_fused(&self, x: &[f32], limit: f32) -> Result<Vec<f32>> {
+        let mut u = self.w1.matvec(x)?;
+        let mut g = self.w3.matvec(x)?;
+        if limit > 0.0 {
+            for v in &mut u {
+                *v = v.min(limit);
+            }
+            for v in &mut g {
+                *v = (*v).clamp(-limit, limit);
+            }
+        }
         let inter = u.len().min(g.len());
         let mut gated = vec![0.0f32; inter];
         for i in 0..inter {
@@ -1427,6 +1494,26 @@ mod expert_lru_tests {
     }
 }
 
+/// MoE gate score function (DeepSeek-V4 `scoring_func`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoeScoreFunc {
+    Softmax,
+    Sigmoid,
+    /// `sqrt(softplus(x))` — V4 Flash default.
+    SqrtSoftplus,
+}
+
+impl MoeScoreFunc {
+    pub fn parse(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "softmax" => Self::Softmax,
+            "sigmoid" => Self::Sigmoid,
+            "sqrtsoftplus" | "softplus" | "sqrt_softplus" => Self::SqrtSoftplus,
+            _ => Self::SqrtSoftplus,
+        }
+    }
+}
+
 /// Routed MoE: gate + lazy **packed FP4** expert cache (kept-open catalog + LRU).
 ///
 /// Expert miss loads packed weights only (~12MB); matvec dequants on the fly.
@@ -1435,9 +1522,16 @@ pub struct Layer0RoutedMoe {
     pub layer: usize,
     /// [n_experts, hidden]
     pub gate: TensorF32,
+    /// Optional expert selection bias `[n_experts]` (non-hash layers).
+    pub gate_bias: Option<Vec<f32>>,
+    /// Hash routing table `[vocab, top_k]` i64 expert ids (first `num_hash_layers`).
+    pub tid2eid: Option<(Vec<i64>, usize /* top_k cols */)>,
     pub n_experts: usize,
     pub top_k: usize,
     pub route_scale: f32,
+    pub score_func: MoeScoreFunc,
+    /// Clamp for SwiGLU gate/up (0 = disabled).
+    pub swiglu_limit: f32,
     pub hidden: usize,
     pub intermediate: usize,
     /// Shared across layers when loaded via [`load_layer_stack`].
@@ -1453,6 +1547,10 @@ impl std::fmt::Debug for Layer0RoutedMoe {
             .field("n_experts", &self.n_experts)
             .field("top_k", &self.top_k)
             .field("route_scale", &self.route_scale)
+            .field("score_func", &self.score_func)
+            .field("has_bias", &self.gate_bias.is_some())
+            .field("has_hash", &self.tid2eid.is_some())
+            .field("swiglu_limit", &self.swiglu_limit)
             .field("hidden", &self.hidden)
             .field("intermediate", &self.intermediate)
             .finish_non_exhaustive()
@@ -1467,9 +1565,13 @@ impl Clone for Layer0RoutedMoe {
             model_dir: self.model_dir.clone(),
             layer: self.layer,
             gate: self.gate.clone(),
+            gate_bias: self.gate_bias.clone(),
+            tid2eid: self.tid2eid.clone(),
             n_experts: self.n_experts,
             top_k: self.top_k,
             route_scale: self.route_scale,
+            score_func: self.score_func,
+            swiglu_limit: self.swiglu_limit,
             hidden: self.hidden,
             intermediate: self.intermediate,
             catalog: std::sync::Arc::clone(&self.catalog),
@@ -1478,10 +1580,26 @@ impl Clone for Layer0RoutedMoe {
     }
 }
 
+fn softplus(x: f32) -> f32 {
+    // log(1 + exp(x)), stable
+    if x > 20.0 {
+        x
+    } else if x < -20.0 {
+        x.exp()
+    } else {
+        (1.0 + x.exp()).ln()
+    }
+}
+
 impl Layer0RoutedMoe {
-    /// Softmax gate → top-k (id, weight) pairs.
-    pub fn route(&self, h: &[f32]) -> Vec<(usize, f32)> {
+    /// Official gate: score → (bias-aided top-k or hash) → renorm weights × `route_scale`.
+    ///
+    /// `token_id` is required for hash layers (`tid2eid`); ignored otherwise.
+    pub fn route(&self, h: &[f32], token_id: Option<u32>) -> Vec<(usize, f32)> {
         let n = self.n_experts.min(self.gate.rows());
+        if n == 0 {
+            return Vec::new();
+        }
         let mut logits = vec![0.0f32; n];
         for i in 0..n {
             let row = &self.gate.data[i * self.hidden..(i + 1) * self.hidden];
@@ -1491,24 +1609,86 @@ impl Layer0RoutedMoe {
             }
             logits[i] = s;
         }
+        // Score function → original_scores (routing weights come from these).
+        let mut original = vec![0.0f32; n];
+        match self.score_func {
+            MoeScoreFunc::Softmax => {
+                let max_l = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for i in 0..n {
+                    original[i] = (logits[i] - max_l).exp();
+                    sum += original[i];
+                }
+                let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+                for v in &mut original {
+                    *v *= inv;
+                }
+            }
+            MoeScoreFunc::Sigmoid => {
+                for i in 0..n {
+                    original[i] = 1.0 / (1.0 + (-logits[i]).exp());
+                }
+            }
+            MoeScoreFunc::SqrtSoftplus => {
+                for i in 0..n {
+                    original[i] = softplus(logits[i]).sqrt();
+                }
+            }
+        }
+
         let k = self.top_k.min(n).max(1);
-        let mut idx: Vec<usize> = (0..n).collect();
-        idx.sort_by(|&a, &b| {
-            logits[b]
-                .partial_cmp(&logits[a])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        idx.truncate(k);
-        let max_l = idx
-            .iter()
-            .map(|&i| logits[i])
-            .fold(f32::NEG_INFINITY, f32::max);
-        let mut weights: Vec<f32> = idx.iter().map(|&i| (logits[i] - max_l).exp()).collect();
-        let sum: f32 = weights.iter().sum::<f32>().max(1e-9);
+        let idx: Vec<usize> = if let Some((ref table, cols)) = self.tid2eid {
+            // Hash routing: predetermined expert ids per token.
+            let tid = token_id.unwrap_or(0) as usize;
+            let vocab = if cols > 0 { table.len() / cols } else { 0 };
+            let row = tid.min(vocab.saturating_sub(1));
+            let mut out = Vec::with_capacity(k);
+            for j in 0..k.min(cols) {
+                let eid = table[row * cols + j];
+                if eid >= 0 {
+                    out.push((eid as usize).min(n.saturating_sub(1)));
+                }
+            }
+            if out.is_empty() {
+                // Fallback top-k if table empty.
+                self.topk_indices(&original, k)
+            } else {
+                out
+            }
+        } else {
+            // Bias shifts scores for selection only (not weight values).
+            let mut for_topk = original.clone();
+            if let Some(ref bias) = self.gate_bias {
+                for i in 0..n.min(bias.len()) {
+                    for_topk[i] += bias[i];
+                }
+            }
+            self.topk_indices(&for_topk, k)
+        };
+
+        let mut weights: Vec<f32> = idx.iter().map(|&i| original[i.min(n - 1)]).collect();
+        if self.score_func != MoeScoreFunc::Softmax {
+            let sum: f32 = weights.iter().sum::<f32>().max(1e-9);
+            for w in &mut weights {
+                *w /= sum;
+            }
+        }
         for w in &mut weights {
-            *w /= sum;
+            *w *= self.route_scale;
         }
         idx.into_iter().zip(weights).collect()
+    }
+
+    fn topk_indices(&self, scores: &[f32], k: usize) -> Vec<usize> {
+        let n = scores.len();
+        let mut idx: Vec<usize> = (0..n).collect();
+        idx.sort_by(|&a, &b| {
+            scores[b]
+                .partial_cmp(&scores[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        idx.truncate(k.min(n).max(1));
+        idx
     }
 
     /// Cache stats `(hits, misses)` for diagnostics.
@@ -1570,14 +1750,28 @@ pub fn load_layer_routed_moe_with_catalog(
     catalog: std::sync::Arc<std::sync::Mutex<SafetensorCatalog>>,
 ) -> Result<Layer0RoutedMoe> {
     let gate_name = format!("layers.{layer}.ffn.gate.weight");
-    let (gate, e0) = {
+    let bias_name = format!("layers.{layer}.ffn.gate.bias");
+    let tid_name = format!("layers.{layer}.ffn.gate.tid2eid");
+    let (gate, gate_bias, tid2eid, e0) = {
         let mut cat = catalog.lock().unwrap_or_else(|e| e.into_inner());
         if !cat.has(&gate_name) {
             return Err(TrajectError::Other(format!("{gate_name} not found")));
         }
         let gate = cat.load_f32(&gate_name)?;
+        let gate_bias = if cat.has(&bias_name) {
+            Some(cat.load_f32(&bias_name)?.data)
+        } else {
+            None
+        };
+        let tid2eid = if cat.has(&tid_name) {
+            let (data, shape) = cat.load_i64(&tid_name)?;
+            let cols = if shape.len() >= 2 { shape[1] } else { 0 };
+            Some((data, cols))
+        } else {
+            None
+        };
         let e0 = load_fp4_expert_packed(&mut cat, layer, 0)?;
-        (gate, e0)
+        (gate, gate_bias, tid2eid, e0)
     };
     if gate.shape.len() != 2 {
         return Err(TrajectError::Other(format!(
@@ -1604,14 +1798,16 @@ pub fn load_layer_routed_moe_with_catalog(
         )));
     }
 
-    let (top_k, route_scale) = {
+    let (top_k, route_scale, score_func, swiglu_limit) = {
         use crate::weights::HfModelConfig;
         match HfModelConfig::load(model_dir) {
             Ok(cfg) => (
                 cfg.num_experts_per_tok.unwrap_or(6) as usize,
                 cfg.routed_scaling_factor.unwrap_or(1.5),
+                MoeScoreFunc::parse(cfg.scoring_func.as_deref().unwrap_or("sqrtsoftplus")),
+                cfg.swiglu_limit.unwrap_or(10.0),
             ),
-            Err(_) => (6, 1.5),
+            Err(_) => (6, 1.5, MoeScoreFunc::SqrtSoftplus, 10.0),
         }
     };
 
@@ -1628,6 +1824,10 @@ pub fn load_layer_routed_moe_with_catalog(
         n_experts,
         top_k,
         route_scale,
+        ?score_func,
+        has_bias = gate_bias.is_some(),
+        has_hash = tid2eid.is_some(),
+        swiglu_limit,
         hidden,
         intermediate,
         layer,
@@ -1640,9 +1840,13 @@ pub fn load_layer_routed_moe_with_catalog(
         model_dir: model_dir.to_path_buf(),
         layer,
         gate,
+        gate_bias,
+        tid2eid,
         n_experts,
         top_k,
         route_scale,
+        score_func,
+        swiglu_limit,
         hidden,
         intermediate,
         catalog,
@@ -2055,6 +2259,7 @@ mod tests {
     use super::*;
     use safetensors::tensor::{serialize, TensorView};
     use safetensors::Dtype;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn load_single_file_roundtrip() {
@@ -2074,6 +2279,87 @@ mod tests {
         assert_eq!(head.shape, vec![4, 3]);
         assert!((embed.data[0] - 0.0).abs() < 1e-5);
         assert!((embed.data[1] - 1.0).abs() < 1e-5);
+    }
+
+    fn toy_moe(
+        n_experts: usize,
+        top_k: usize,
+        score_func: MoeScoreFunc,
+        gate_bias: Option<Vec<f32>>,
+        tid2eid: Option<(Vec<i64>, usize)>,
+        route_scale: f32,
+    ) -> Layer0RoutedMoe {
+        let hidden = n_experts.max(4);
+        let mut gate = vec![0.0f32; n_experts * hidden];
+        for i in 0..n_experts {
+            gate[i * hidden + (i % hidden)] = 4.0;
+        }
+        let dir = tempfile_dir();
+        let cat = SafetensorCatalog::open(&dir).unwrap();
+        Layer0RoutedMoe {
+            model_dir: dir,
+            layer: 0,
+            gate: TensorF32 {
+                data: gate,
+                shape: vec![n_experts, hidden],
+            },
+            gate_bias,
+            tid2eid,
+            n_experts,
+            top_k,
+            route_scale,
+            score_func,
+            swiglu_limit: 10.0,
+            hidden,
+            intermediate: 8,
+            catalog: Arc::new(Mutex::new(cat)),
+            cache: Mutex::new(ExpertLru::new(4)),
+        }
+    }
+
+    #[test]
+    fn route_sqrtsoftplus_bias_selects_without_tainting_weights() {
+        let n = 4usize;
+        let mut h = vec![0.0f32; n.max(4)];
+        h[0] = 1.0;
+        let moe = toy_moe(n, 1, MoeScoreFunc::SqrtSoftplus, None, None, 1.0);
+        let r = moe.route(&h, None);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].0, 0);
+
+        let bias = vec![0.0, 0.0, 0.0, 100.0];
+        let moe = toy_moe(n, 1, MoeScoreFunc::SqrtSoftplus, Some(bias), None, 1.5);
+        let r = moe.route(&h, None);
+        assert_eq!(r[0].0, 3);
+        // Single selected expert → renormed weight 1.0 * route_scale
+        assert!((r[0].1 - 1.5).abs() < 1e-4, "w={}", r[0].1);
+    }
+
+    #[test]
+    fn route_hash_tid2eid() {
+        let table = vec![0i64, 1, 2, 0]; // vocab=2, top_k=2
+        let moe = toy_moe(
+            4,
+            2,
+            MoeScoreFunc::SqrtSoftplus,
+            None,
+            Some((table, 2)),
+            1.0,
+        );
+        let h = vec![1.0f32; 4];
+        let r = moe.route(&h, Some(1));
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].0, 2);
+        assert_eq!(r[1].0, 0);
+        let sum: f32 = r.iter().map(|(_, w)| *w).sum();
+        assert!((sum - 1.0).abs() < 1e-4, "sum={sum}");
+    }
+
+    #[test]
+    fn score_func_parse() {
+        assert_eq!(MoeScoreFunc::parse("sqrtsoftplus"), MoeScoreFunc::SqrtSoftplus);
+        assert_eq!(MoeScoreFunc::parse("softmax"), MoeScoreFunc::Softmax);
+        assert_eq!(MoeScoreFunc::parse("sigmoid"), MoeScoreFunc::Sigmoid);
     }
 
     fn tempfile_dir() -> PathBuf {

@@ -556,13 +556,14 @@ impl ModelWeights {
         out
     }
 
-    /// Pure routed MoE sum (no residual). Applies `route_scale`.
+    /// Pure routed MoE sum (no residual). Weights already include `route_scale`.
     fn routed_moe_delta(
         &self,
         moe: &crate::weights::Layer0RoutedMoe,
         ffn_norm: Option<&[f32]>,
         h: &[f32],
         already_normed: bool,
+        token_id: Option<u32>,
     ) -> Vec<f32> {
         let n = if already_normed {
             h.to_vec()
@@ -571,10 +572,13 @@ impl ModelWeights {
         } else {
             h.to_vec()
         };
-        let routes = moe.route(&n);
+        let routes = moe.route(&n, token_id);
         let mut delta = vec![0.0f32; moe.hidden];
         for (eid, w) in routes {
-            match moe.expert(eid).and_then(|ex| ex.swiglu(&n)) {
+            match moe
+                .expert(eid)
+                .and_then(|ex| ex.swiglu(&n, moe.swiglu_limit))
+            {
                 Ok(d) => {
                     for (o, x) in delta.iter_mut().zip(d.iter()) {
                         *o += w * *x;
@@ -585,10 +589,6 @@ impl ModelWeights {
                 }
             }
         }
-        let scale = moe.route_scale;
-        for d in delta.iter_mut() {
-            *d *= scale;
-        }
         delta
     }
 
@@ -597,8 +597,9 @@ impl ModelWeights {
         moe: &crate::weights::Layer0RoutedMoe,
         ffn_norm: Option<&[f32]>,
         h: &[f32],
+        token_id: Option<u32>,
     ) -> Vec<f32> {
-        let delta = self.routed_moe_delta(moe, ffn_norm, h, false);
+        let delta = self.routed_moe_delta(moe, ffn_norm, h, false, token_id);
         let mut out = h.to_vec();
         for (o, d) in out.iter_mut().zip(delta.iter()) {
             *o += *d;
@@ -612,6 +613,7 @@ impl ModelWeights {
         ffn: Option<&crate::weights::Layer0SharedFfn>,
         moe: Option<&crate::weights::Layer0RoutedMoe>,
         h: &[f32],
+        token_id: Option<u32>,
     ) -> Vec<f32> {
         let mut y = vec![0.0f32; h.len()];
         if let Some(ffn) = ffn {
@@ -622,13 +624,13 @@ impl ModelWeights {
             if let Some(moe) = moe {
                 // Shared already applied ffn_norm; route on same normed activations.
                 let n = self.rms_norm_with(h, Some(&ffn.ffn_norm));
-                let d = self.routed_moe_delta(moe, None, &n, true);
+                let d = self.routed_moe_delta(moe, None, &n, true, token_id);
                 for (o, x) in y.iter_mut().zip(d.iter()) {
                     *o += *x;
                 }
             }
         } else if let Some(moe) = moe {
-            y = self.routed_moe_delta(moe, None, h, false);
+            y = self.routed_moe_delta(moe, None, h, false, token_id);
         }
         y
     }
@@ -2106,6 +2108,7 @@ impl InferenceBackend for LocalWeightRunner {
                                 block.ffn.as_ref(),
                                 block.moe.as_ref(),
                                 &x,
+                                Some(tid as u32),
                             );
                             streams =
                                 hc_post(&y, &residual, &post, &comb, hc.hc_mult, hc.hidden);
@@ -2197,7 +2200,7 @@ impl InferenceBackend for LocalWeightRunner {
                             }
                             if let Some(ref moe) = block.moe {
                                 let norm = block.ffn.as_ref().map(|f| f.ffn_norm.as_slice());
-                                h = self.weights.routed_moe_residual_block(moe, norm, &h);
+                                h = self.weights.routed_moe_residual_block(moe, norm, &h, Some(tid as u32));
                             }
                             streams = h;
                         }
@@ -2372,6 +2375,7 @@ impl InferenceBackend for LocalWeightRunner {
                             block.ffn.as_ref(),
                             block.moe.as_ref(),
                             &x,
+                            Some(last_tid as u32),
                         );
                         streams = hc_post(&y, &residual, &post, &comb, hc.hc_mult, hc.hidden);
                     } else {
@@ -2464,7 +2468,7 @@ impl InferenceBackend for LocalWeightRunner {
                         }
                         if let Some(ref moe) = block.moe {
                             let norm = block.ffn.as_ref().map(|f| f.ffn_norm.as_slice());
-                            h = self.weights.routed_moe_residual_block(moe, norm, &h);
+                            h = self.weights.routed_moe_residual_block(moe, norm, &h, Some(last_tid as u32));
                         }
                         streams = h;
                     }

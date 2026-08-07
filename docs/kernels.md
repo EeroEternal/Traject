@@ -112,7 +112,10 @@ full f32 expand). Each layer:
 4. **Hyper-Connections (HC):** embed expands to `hc_mult` (4) streams; each block
    does `hc_pre → (attn|ffn) → hc_post` with Sinkhorn `comb`; final `hc_head`
    collapses streams before lm_head.
-5. **Shared + routed MoE:** under the FFN HC branch (pure delta, residual via HC)
+5. **Shared + routed MoE:** under the FFN HC branch (pure delta, residual via HC).
+   Gate matches official V4: `scoring_func` (default **sqrtsoftplus**), optional
+   `gate.bias` for top-k only, first `num_hash_layers` use `gate.tid2eid[token]`,
+   weights renormed then × `routed_scaling_factor`; experts apply `swiglu_limit`.
 
 Per-layer KV is keyed `{prefix}:L{i}`. Free drops base + all layer keys.
 
@@ -163,4 +166,5 @@ safetensors catalog; routed experts use **packed FP4**. Chunk logs report
 - [x] Shared MoE safetensors catalog across layers + full-depth layer cap (43)  
 - [x] Indexer Hadamard rotate + FP4 QAT sim (`rotate_activation` / `fp4_act_quant`)  
 - [x] Main KV + compressor FP8 `act_quant` on no-RoPE dims (block 64, ue8m0)  
+- [x] Official MoE gate: sqrtsoftplus + bias + hash tid2eid + swiglu_limit  
 - [ ] Quality/perf parity with sglang-lite (GPU kernels, full eval)  
