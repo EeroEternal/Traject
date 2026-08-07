@@ -93,14 +93,19 @@ max 8). Each layer:
 
 1. **Attention (MQA multi-head):** `attn_norm` + FP8 `wq_a`/`wkv` + norms + `wq_b`  
    Q keeps **H heads × D** (`TRAJECT_ATTN_HEADS`, default 8; model has 64×512).  
-   KV is stored compressed (`1 × D`) and **expanded** to H heads at kernel time.
-2. **o_proj:** multi-head o → group-mean → `wo_a`/`wo_b`
-3. **Shared expert FFN:** SwiGLU residual
-4. **Routed MoE:** gate top-k + packed FP4 experts (lazy f32 expand)
+   Per-head RMSNorm after `wq_b`. KV is a **single latent (K=V)**, stored compressed
+   (`1 × D`) and expanded to H heads at kernel time.
+2. **RoPE + attn_sink:** last `qk_rope_head_dim` (64) dims get base RoPE; inverse RoPE
+   on attention output. Per-head `attn_sink` absorbs softmax mass (CPU kernel).
+3. **o_proj:** group-concat heads → `wo_a` → `wo_b` (official layout; residual is
+   `x += o`, not residual-through-`wo_a`).
+4. **Shared expert FFN:** SwiGLU residual
+5. **Routed MoE:** gate top-k + packed FP4 experts (lazy f32 expand)
 
 Per-layer KV is keyed `{prefix}:L{i}`. Free drops base + all layer keys.
 
-**Not loaded yet:** full 43-layer production stack (memory).
+**Not loaded yet:** full 43-layer production stack (memory); YaRN for compressed
+layers; sparse top-k / indexer / HC residual.
 
 ```bash
 export TRAJECT_LOCAL_LAYERS=2   # or 1..8
@@ -129,4 +134,6 @@ Routed MoE keeps a **live `SafetensorCatalog`** (mmap reuse) and an **LRU** of
 - [x] MoE kept-open catalog + true LRU expert cache  
 - [x] Packed FP4 experts + fused matvec (no full f32 dequant)  
 - [x] Multi-head Q + MQA KV expand (no Q mean-pool; `TRAJECT_ATTN_HEADS`)  
+- [x] MLA RoPE (last 64 dims) + inverse RoPE on o + `attn_sink` + K=V  
+- [x] o_proj group-concat (official `wo_a` layout)  
 - [ ] Full 43-layer production parity (still sglang for prod MoE)  

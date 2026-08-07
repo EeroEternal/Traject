@@ -303,7 +303,7 @@ pub struct Layer0AttnWeights {
     pub hidden: usize,
     /// `wq_a`: [q_lora, hidden] — Q down-projection.
     pub wq_a: TensorF32,
-    /// `wkv`: [kv_lora, hidden] — compressed KV projection.
+    /// `wkv`: [kv_lora / head_dim, hidden] — shared MQA latent (K=V).
     pub wkv: TensorF32,
     /// Optional RMSNorm on q_lora (after `wq_a`).
     pub q_norm: Option<Vec<f32>>,
@@ -313,7 +313,8 @@ pub struct Layer0AttnWeights {
     pub wq_b: Option<TensorF32>,
     /// Head count implied by `wq_b` rows / `kv_lora` (when present).
     pub n_heads: Option<usize>,
-    /// Optional `wo_a`: [o_groups * o_lora, hidden] — residual-side factor (V4).
+    /// Optional `wo_a`: [o_groups * o_lora, heads_per_group * head_dim] —
+    /// maps concatenated group heads → o_lora (V4 Flash; often 4096 == hidden).
     pub wo_a: Option<TensorF32>,
     /// Optional `wo_b`: [hidden, o_groups * o_lora] — maps o-intermediate → hidden.
     pub wo_b: Option<TensorF32>,
@@ -321,6 +322,10 @@ pub struct Layer0AttnWeights {
     pub o_groups: usize,
     /// `o_lora_rank` per group (default 1024).
     pub o_lora_rank: usize,
+    /// Per-head attention-sink logits (`attn_sink`), length `n_heads` when present.
+    pub attn_sink: Option<Vec<f32>>,
+    /// RoPE dims applied on the last slice of each head (`qk_rope_head_dim`, default 64).
+    pub rope_head_dim: usize,
 }
 
 impl Layer0AttnWeights {
@@ -510,17 +515,23 @@ pub fn load_layer_attn(model_dir: &Path, layer: usize) -> Result<Layer0AttnWeigh
     }
 
     // o_proj factors (V4 Flash defaults: o_groups=8, o_lora_rank=1024 → 8192).
-    let (o_groups, o_lora_rank) = {
+    let (o_groups, o_lora_rank, rope_head_dim) = {
         use crate::weights::HfModelConfig;
         match HfModelConfig::load(model_dir) {
             Ok(cfg) => (
                 cfg.o_groups.unwrap_or(8) as usize,
                 cfg.o_lora_rank.unwrap_or(1024) as usize,
+                cfg.qk_rope_head_dim.unwrap_or(64) as usize,
             ),
-            Err(_) => (8, 1024),
+            Err(_) => (8, 1024, 64),
         }
     };
     let o_inter = o_groups * o_lora_rank;
+    // Group input width = (n_heads / o_groups) * head_dim; equals hidden on V4 Flash (8×512).
+    let head_dim = wkv.rows().max(1);
+    let n_heads_guess = n_heads.unwrap_or(o_groups.max(1));
+    let heads_per_group = (n_heads_guess / o_groups.max(1)).max(1);
+    let group_in = heads_per_group * head_dim;
 
     let wo_a_names = [
         format!("layers.{layer}.attn.wo_a.weight"),
@@ -529,9 +540,13 @@ pub fn load_layer_attn(model_dir: &Path, layer: usize) -> Result<Layer0AttnWeigh
     ];
     let wo_a_refs: Vec<&str> = wo_a_names.iter().map(|s| s.as_str()).collect();
     let wo_a = match load_weight_fp8_or_f32(&mut cat, &wo_a_refs) {
-        Ok(t) if t.shape == [o_inter, hidden] => Some(t),
+        Ok(t) if t.shape == [o_inter, group_in] || t.shape == [o_inter, hidden] => Some(t),
         Ok(t) => {
-            warn!(shape = ?t.shape, want = ?[o_inter, hidden], "wo_a shape mismatch; skip");
+            warn!(
+                shape = ?t.shape,
+                want_group = ?[o_inter, group_in],
+                "wo_a shape mismatch; skip"
+            );
             None
         }
         Err(e) => {
@@ -539,6 +554,11 @@ pub fn load_layer_attn(model_dir: &Path, layer: usize) -> Result<Layer0AttnWeigh
             None
         }
     };
+
+    let attn_sink = cat
+        .load_f32(&format!("layers.{layer}.attn.attn_sink"))
+        .ok()
+        .map(|t| t.data);
     let wo_b_names = [
         format!("layers.{layer}.attn.wo_b.weight"),
         format!("layers.{layer}.attn.wo_b"),
@@ -567,6 +587,8 @@ pub fn load_layer_attn(model_dir: &Path, layer: usize) -> Result<Layer0AttnWeigh
         has_wq_b = wq_b.is_some(),
         has_wo_a = wo_a.is_some(),
         has_wo_b = wo_b.is_some(),
+        has_attn_sink = attn_sink.is_some(),
+        rope_head_dim,
         q_full = wq_b.as_ref().map(|t| t.rows()),
         n_heads = ?n_heads,
         o_groups,
@@ -588,6 +610,8 @@ pub fn load_layer_attn(model_dir: &Path, layer: usize) -> Result<Layer0AttnWeigh
         wo_b,
         o_groups,
         o_lora_rank,
+        attn_sink,
+        rope_head_dim,
     })
 }
 

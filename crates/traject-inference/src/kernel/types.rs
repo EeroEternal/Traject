@@ -44,6 +44,10 @@ pub struct DecodeRequest {
     pub num_heads: u32,
     pub head_dim: u32,
     pub layout: KvLayout,
+    /// Optional per-head attention-sink logits (DeepSeek-V4 `attn_sink`).
+    /// When set, each head adds `exp(sink[h] - max)` to the softmax denominator
+    /// (sink absorbs probability; does not contribute to the value mix).
+    pub attn_sink: Option<Vec<f32>>,
 }
 
 #[derive(Debug, Clone)]

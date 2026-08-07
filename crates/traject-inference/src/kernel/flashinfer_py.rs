@@ -234,6 +234,8 @@ impl KernelBackend for FlashInferKernel {
                 num_heads: h,
                 head_dim: d,
                 layout: req.layout,
+                // FlashInfer single_decode path does not yet consume attn_sink.
+                attn_sink: None,
             };
             let r = self.decode(dec).await?;
             o.extend(r.o);

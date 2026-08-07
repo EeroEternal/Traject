@@ -40,6 +40,12 @@ pub struct HfModelConfig {
     /// Multiplier on routed expert sum (e.g. 1.5).
     #[serde(default)]
     pub routed_scaling_factor: Option<f32>,
+    /// RoPE dims on the last slice of each head (V4 Flash: 64).
+    #[serde(default)]
+    pub qk_rope_head_dim: Option<u32>,
+    /// Base RoPE theta (default 10000).
+    #[serde(default)]
+    pub rope_theta: Option<f32>,
 }
 
 fn default_vocab() -> u32 {
