@@ -50,6 +50,8 @@ pub struct PackedFp8Mat {
 
 impl PackedFp8Mat {
     pub fn matvec(&self, x: &[f32]) -> Result<Vec<f32>> {
+        // Official linear(): act_quant(x, 128, ue8m0) then fp8_gemm.
+        let xq = crate::weights::dtype::quantize_linear_activation(x);
         matvec_fp8_block_scaled(
             &self.weight,
             self.rows,
@@ -58,12 +60,13 @@ impl PackedFp8Mat {
             self.scale_rows,
             self.scale_cols,
             self.block,
-            x,
+            &xq,
         )
         .map_err(|e| TrajectError::Other(e))
     }
 
     pub fn row_dot(&self, row: usize, x: &[f32]) -> Result<f32> {
+        let xq = crate::weights::dtype::quantize_linear_activation(x);
         row_dot_fp8_block_scaled(
             &self.weight,
             self.rows,
@@ -72,7 +75,7 @@ impl PackedFp8Mat {
             self.scale_cols,
             self.block,
             row,
-            x,
+            &xq,
         )
         .map_err(|e| TrajectError::Other(e))
     }
@@ -1245,6 +1248,8 @@ impl PackedFp4Mat {
     }
 
     pub fn matvec(&self, x: &[f32]) -> Result<Vec<f32>> {
+        // Official linear() FP4 path: act_quant(x, 128) then fp4_gemm.
+        let xq = crate::weights::dtype::quantize_linear_activation(x);
         matvec_fp4_block_scaled(
             &self.packed,
             self.rows,
@@ -1252,7 +1257,7 @@ impl PackedFp4Mat {
             &self.scale,
             self.scale_cols,
             self.block_k,
-            x,
+            &xq,
         )
         .map_err(|e| TrajectError::Other(e))
     }
@@ -1341,10 +1346,13 @@ impl ExpertPacked {
     /// SwiGLU via lazy f32 expand (first call dequants; later calls are pure GEMV).
     ///
     /// `limit > 0` clamps gate (max) and up (min/max) to match official `swiglu_limit`.
+    /// Activations are FP8-quantized before each GEMV (official `linear` path).
     pub fn swiglu(&self, x: &[f32], limit: f32) -> Result<Vec<f32>> {
+        use crate::weights::dtype::quantize_linear_activation;
         let m = self.ensure_f32()?;
-        let mut u = matvec_f32(&m.w1, m.w1_rows, m.w1_cols, x);
-        let mut g = matvec_f32(&m.w3, m.w3_rows, m.w3_cols, x);
+        let xq = quantize_linear_activation(x);
+        let mut u = matvec_f32(&m.w1, m.w1_rows, m.w1_cols, &xq);
+        let mut g = matvec_f32(&m.w3, m.w3_rows, m.w3_cols, &xq);
         if limit > 0.0 {
             for v in &mut u {
                 *v = v.min(limit);
@@ -1360,10 +1368,13 @@ impl ExpertPacked {
             let silu = ui / (1.0 + (-ui).exp());
             gated[i] = silu * g[i];
         }
-        Ok(matvec_f32(&m.w2, m.w2_rows, m.w2_cols, &gated))
+        let gq = quantize_linear_activation(&gated);
+        Ok(matvec_f32(&m.w2, m.w2_rows, m.w2_cols, &gq))
     }
 
     /// One-shot fused path without caching f32 (used in unit tests / tiny mats).
+    ///
+    /// Each `PackedFp4Mat::matvec` already applies linear act_quant.
     pub fn swiglu_fused(&self, x: &[f32], limit: f32) -> Result<Vec<f32>> {
         let mut u = self.w1.matvec(x)?;
         let mut g = self.w3.matvec(x)?;

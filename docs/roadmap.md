@@ -51,6 +51,7 @@
 - [x] Indexer Hadamard + FP4 QAT sim (official lightning-indexer QK path)
 - [x] Main attn/compressor FP8 act_quant QAT on no-RoPE dims
 - [x] Official MoE gate (sqrtsoftplus / bias / hash tid2eid / swiglu_limit)
+- [x] Linear act_quant on packed FP8/FP4 matvec inputs (official `linear()`)
 - [ ] Quality/perf parity with sglang-lite for in-process 43-layer runs
 - [x] Tool latency-aware pin TTL from histograms (`ToolLatencyTracker` p95)
 - [x] Prefetch pin after tool return (`PinReason::Prefetch`)

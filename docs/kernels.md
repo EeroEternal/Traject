@@ -119,8 +119,8 @@ full f32 expand). Each layer:
 
 Per-layer KV is keyed `{prefix}:L{i}`. Free drops base + all layer keys.
 
-**Remaining gaps vs full production:** GPU dense FP8 matvec; quality/perf
-parity with sglang-lite (full 43-layer eval).
+**Remaining gaps vs full production:** true GPU FP8/FP4 GEMM kernels;
+quality/perf parity with sglang-lite (full 43-layer eval).
 
 ```bash
 export TRAJECT_LOCAL_LAYERS=2      # 1..num_hidden_layers (V4 Flash: 43)
@@ -133,9 +133,10 @@ cargo run -p traject-cli --release -- \
   --local-runner --model /path/to/ds-v4-flash --max-tokens 4 "hello"
 ```
 
-Dense attn/FFN use **packed FP8** fused matvec; all MoE layers share **one**
-safetensors catalog; routed experts use **packed FP4**. Chunk logs report
-`multihead`, `sliding_window`, `n_layers`, `moe_cache`.
+Dense attn/FFN use **packed FP8** fused matvec with **FP8 act_quant** on
+inputs (block 128, ue8m0 — official `linear()`); all MoE layers share **one**
+safetensors catalog; routed experts use **packed FP4** (same act_quant on x).
+Chunk logs report `multihead`, `sliding_window`, `n_layers`, `moe_cache`.
 
 ## Status
 
@@ -167,4 +168,5 @@ safetensors catalog; routed experts use **packed FP4**. Chunk logs report
 - [x] Indexer Hadamard rotate + FP4 QAT sim (`rotate_activation` / `fp4_act_quant`)  
 - [x] Main KV + compressor FP8 `act_quant` on no-RoPE dims (block 64, ue8m0)  
 - [x] Official MoE gate: sqrtsoftplus + bias + hash tid2eid + swiglu_limit  
+- [x] Linear act_quant on FP8/FP4 matvec inputs (block 128, ue8m0)  
 - [ ] Quality/perf parity with sglang-lite (GPU kernels, full eval)  

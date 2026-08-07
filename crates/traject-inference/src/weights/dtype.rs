@@ -515,10 +515,24 @@ fn fp8_round_scale(amax: f32) -> f32 {
     2f32.powi(fast_log2_ceil(t))
 }
 
+/// Official `linear()` activation quant block size (FP8/FP4 weight paths).
+pub const LINEAR_ACT_BLOCK: usize = 128;
+
+/// Clone `x` and apply FP8 act_quant (ue8m0, block 128) for quantized Linear.
+///
+/// Matches `act_quant(x, block_size=128, scale_fmt="ue8m0")` before
+/// `fp8_gemm` / `fp4_gemm` in the official inference `linear()`.
+pub fn quantize_linear_activation(x: &[f32]) -> Vec<f32> {
+    let mut y = x.to_vec();
+    fp8_act_quant_inplace(&mut y, LINEAR_ACT_BLOCK);
+    y
+}
+
 /// Block-wise FP8 e4m3 quant → dequant (QAT simulation).
 ///
-/// Matches official `act_quant(..., scale_fmt="ue8m0", inplace=True)` used on
-/// attention/compressor **no-RoPE** dims with `block_size=64`.
+/// Matches official `act_quant(..., scale_fmt="ue8m0", inplace=True)`.
+/// Used on attention/compressor **no-RoPE** dims with `block_size=64`, and on
+/// Linear activations with [`LINEAR_ACT_BLOCK`] (128).
 ///
 /// When `len % block_size != 0`, falls back to a single full-length block.
 pub fn fp8_act_quant_inplace(x: &mut [f32], block_size: usize) {
@@ -828,5 +842,18 @@ mod tests {
         fp8_act_quant_nope_inplace(&mut x, 4, 4);
         assert_eq!(&x[12..], &tail[..]);
         assert!(x[..12].iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn quantize_linear_activation_block128() {
+        let mut x = vec![1.0f32; 256];
+        x[0] = 100.0;
+        let y = quantize_linear_activation(&x);
+        assert_eq!(y.len(), 256);
+        assert!(y.iter().all(|v| v.is_finite()));
+        // First block amax=100 → quantized; value stays near 100 on e4m3×scale lattice
+        assert!((y[0] - 100.0).abs() < 5.0, "y0={}", y[0]);
+        // Second block all 1.0 — still finite and close to 1
+        assert!((y[128] - 1.0).abs() < 0.5, "y128={}", y[128]);
     }
 }
