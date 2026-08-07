@@ -41,6 +41,7 @@
 - [x] Multi-head Q + MQA KV expand (`TRAJECT_ATTN_HEADS`, no Q mean-pool)
 - [x] MLA RoPE + attn_sink + K=V + o_proj group-concat (official V4 path)
 - [x] Hyper-Connections residual (`hc_mult` streams + Sinkhorn + `hc_head`)
+- [x] Shared dense catalog + layer cap (`TRAJECT_LOCAL_LAYERS_MAX`) + sliding-window attn
 - [ ] Full 43-layer production parity in-process (prod MoE remains sglang-lite)
 - [x] Tool latency-aware pin TTL from histograms (`ToolLatencyTracker` p95)
 - [x] Prefetch pin after tool return (`PinReason::Prefetch`)
