@@ -692,12 +692,15 @@ fn random_projections(hidden: usize, attn_dim: usize, seed: u64) -> (Vec<f32>, V
 }
 
 
-/// Q heads for KernelBackend (`TRAJECT_ATTN_HEADS`, default 8, max model heads).
+/// Q heads for KernelBackend (`TRAJECT_ATTN_HEADS`).
+///
+/// Default = **all model heads** (V4 Flash: 64). Set `TRAJECT_ATTN_HEADS=8` etc.
+/// for faster CPU smoke.
 fn attn_heads_to_use(model_heads: usize) -> usize {
     let env = std::env::var("TRAJECT_ATTN_HEADS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok());
-    let want = env.unwrap_or(8).max(1);
+    let want = env.unwrap_or(model_heads.max(1)).max(1);
     want.min(model_heads.max(1))
 }
 

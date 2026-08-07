@@ -181,23 +181,26 @@ pub fn matvec_fp4_block_scaled(
             rows * scale_cols
         ));
     }
-    let mut y = vec![0.0f32; rows];
-    for i in 0..rows {
-        let mut acc = 0.0f32;
-        let row_off = i * packed_cols;
-        let scale_row = i * scale_cols;
-        for jb in 0..packed_cols {
-            let b = packed[row_off + jb];
-            let j0 = jb * 2;
-            let j1 = j0 + 1;
-            let s0 = e8m0_bits_to_f32(scale_e8m0[scale_row + j0 / block_k]);
-            let s1 = e8m0_bits_to_f32(scale_e8m0[scale_row + j1 / block_k]);
-            let w0 = e2m1_nibble_to_f32(b & 0x0f) * s0;
-            let w1 = e2m1_nibble_to_f32(b >> 4) * s1;
-            acc += w0 * x[j0] + w1 * x[j1];
-        }
-        y[i] = acc;
-    }
+    use rayon::prelude::*;
+    let y: Vec<f32> = (0..rows)
+        .into_par_iter()
+        .map(|i| {
+            let mut acc = 0.0f32;
+            let row_off = i * packed_cols;
+            let scale_row = i * scale_cols;
+            for jb in 0..packed_cols {
+                let b = packed[row_off + jb];
+                let j0 = jb * 2;
+                let j1 = j0 + 1;
+                let s0 = e8m0_bits_to_f32(scale_e8m0[scale_row + j0 / block_k]);
+                let s1 = e8m0_bits_to_f32(scale_e8m0[scale_row + j1 / block_k]);
+                let w0 = e2m1_nibble_to_f32(b & 0x0f) * s0;
+                let w1 = e2m1_nibble_to_f32(b >> 4) * s1;
+                acc += w0 * x[j0] + w1 * x[j1];
+            }
+            acc
+        })
+        .collect();
     Ok(y)
 }
 
@@ -256,6 +259,7 @@ pub fn bytes_to_f32_vec(data: &[u8], dtype: safetensors::Dtype) -> Result<Vec<f3
 /// Fused matvec for block-scaled FP8: `y = (e4m3 * e8m0_scale) @ x` without full dequant.
 ///
 /// Weight `[rows, cols]` e4m3, scale `[ceil(rows/B), ceil(cols/B)]` e8m0, block `B` (V4: 128).
+/// Rows are reduced in parallel via rayon.
 pub fn matvec_fp8_block_scaled(
     weight_e4m3: &[u8],
     rows: usize,
@@ -266,6 +270,7 @@ pub fn matvec_fp8_block_scaled(
     block: usize,
     x: &[f32],
 ) -> Result<Vec<f32>, String> {
+    use rayon::prelude::*;
     let block = block.max(1);
     if x.len() < cols {
         return Err(format!("fp8 matvec x len {} < cols {cols}", x.len()));
@@ -284,19 +289,21 @@ pub fn matvec_fp8_block_scaled(
             scale_rows * scale_cols
         ));
     }
-    let mut y = vec![0.0f32; rows];
-    for i in 0..rows {
-        let si = i / block;
-        let mut acc = 0.0f32;
-        let row_off = i * cols;
-        for j in 0..cols {
-            let sj = j / block;
-            let w = e4m3_bits_to_f32(weight_e4m3[row_off + j]);
-            let s = e8m0_bits_to_f32(scale_e8m0[si * scale_cols + sj]);
-            acc += w * s * x[j];
-        }
-        y[i] = acc;
-    }
+    let y: Vec<f32> = (0..rows)
+        .into_par_iter()
+        .map(|i| {
+            let si = i / block;
+            let mut acc = 0.0f32;
+            let row_off = i * cols;
+            for j in 0..cols {
+                let sj = j / block;
+                let w = e4m3_bits_to_f32(weight_e4m3[row_off + j]);
+                let s = e8m0_bits_to_f32(scale_e8m0[si * scale_cols + sj]);
+                acc += w * s * x[j];
+            }
+            acc
+        })
+        .collect();
     Ok(y)
 }
 

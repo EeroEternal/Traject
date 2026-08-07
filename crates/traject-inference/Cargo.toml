@@ -27,4 +27,6 @@ memmap2 = "0.9"
 # HF tokenizer.json (BPE etc.) — DeepSeek-V4-Flash and other HF models.
 # fancy-regex avoids onig_sys (native) for easier cross-machine builds.
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+# Parallel dense/expert matvec + multi-head attention (CPU LocalWeightRunner).
+rayon = "1.10"
 pyo3 = { version = "0.22", features = ["auto-initialize"], optional = true }

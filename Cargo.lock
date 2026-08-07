@@ -3830,6 +3830,7 @@ dependencies = [
  "memmap2",
  "parking_lot",
  "pyo3",
+ "rayon",
  "reqwest 0.12.28",
  "safetensors",
  "serde",

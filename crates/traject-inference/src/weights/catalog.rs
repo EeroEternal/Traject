@@ -108,18 +108,20 @@ impl LinearMat {
     pub fn matvec(&self, x: &[f32]) -> Vec<f32> {
         match self {
             LinearMat::F32(t) => {
+                use rayon::prelude::*;
                 let rows = t.rows();
                 let cols = t.cols().max(1);
-                let mut y = vec![0.0f32; rows];
-                for i in 0..rows {
-                    let row = &t.data[i * cols..(i + 1) * cols];
-                    let mut s = 0.0f32;
-                    for (a, b) in row.iter().zip(x.iter()) {
-                        s += a * b;
-                    }
-                    y[i] = s;
-                }
-                y
+                (0..rows)
+                    .into_par_iter()
+                    .map(|i| {
+                        let row = &t.data[i * cols..(i + 1) * cols];
+                        let mut s = 0.0f32;
+                        for (a, b) in row.iter().zip(x.iter()) {
+                            s += a * b;
+                        }
+                        s
+                    })
+                    .collect()
             }
             LinearMat::Fp8(p) => p.matvec(x).unwrap_or_else(|_| vec![0.0; p.rows]),
         }
@@ -1398,16 +1400,18 @@ impl ExpertPacked {
 }
 
 fn matvec_f32(w: &[f32], out_dim: usize, in_dim: usize, x: &[f32]) -> Vec<f32> {
-    let mut y = vec![0.0f32; out_dim];
-    for i in 0..out_dim {
-        let row = &w[i * in_dim..(i + 1) * in_dim];
-        let mut s = 0.0f32;
-        for (a, b) in row.iter().zip(x.iter()) {
-            s += a * b;
-        }
-        y[i] = s;
-    }
-    y
+    use rayon::prelude::*;
+    (0..out_dim)
+        .into_par_iter()
+        .map(|i| {
+            let row = &w[i * in_dim..(i + 1) * in_dim];
+            let mut s = 0.0f32;
+            for (a, b) in row.iter().zip(x.iter()) {
+                s += a * b;
+            }
+            s
+        })
+        .collect()
 }
 
 /// Backward-compat alias: experts are packed, not fully dequantized.

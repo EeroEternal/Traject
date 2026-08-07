@@ -30,45 +30,54 @@ fn softmax_attn(
     if k.len() != seq_len * num_heads * head_dim || v.len() != k.len() {
         return Err(TrajectError::Inference("k/v shape mismatch".into()));
     }
+    use rayon::prelude::*;
     let scale = 1.0 / (head_dim as f32).sqrt();
-    let mut out = vec![0.0f32; num_heads * head_dim];
-    for h in 0..num_heads {
-        let qh = &q[h * head_dim..(h + 1) * head_dim];
-        let mut scores = vec![0.0f32; seq_len];
-        let mut max_s = f32::NEG_INFINITY;
-        for s in 0..seq_len {
-            let kh = &k[(s * num_heads + h) * head_dim..(s * num_heads + h + 1) * head_dim];
-            let mut dot = 0.0f32;
-            for d in 0..head_dim {
-                dot += qh[d] * kh[d];
+    // Parallel over heads (independent softmax + V weighted sum).
+    let head_outs: Vec<Vec<f32>> = (0..num_heads)
+        .into_par_iter()
+        .map(|h| {
+            let qh = &q[h * head_dim..(h + 1) * head_dim];
+            let mut scores = vec![0.0f32; seq_len];
+            let mut max_s = f32::NEG_INFINITY;
+            for s in 0..seq_len {
+                let kh = &k[(s * num_heads + h) * head_dim..(s * num_heads + h + 1) * head_dim];
+                let mut dot = 0.0f32;
+                for d in 0..head_dim {
+                    dot += qh[d] * kh[d];
+                }
+                scores[s] = dot * scale;
+                max_s = max_s.max(scores[s]);
             }
-            scores[s] = dot * scale;
-            max_s = max_s.max(scores[s]);
-        }
-        let sink = attn_sink.and_then(|s| s.get(h).copied());
-        if let Some(sk) = sink {
-            max_s = max_s.max(sk);
-        }
-        let mut sum = 0.0f32;
-        for s in scores.iter_mut() {
-            *s = (*s - max_s).exp();
-            sum += *s;
-        }
-        // Attention sink: absorb probability mass, no value contribution.
-        if let Some(sk) = sink {
-            sum += (sk - max_s).exp();
-        }
-        let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
-        for s in scores.iter_mut() {
-            *s *= inv;
-        }
-        let oh = &mut out[h * head_dim..(h + 1) * head_dim];
-        for s in 0..seq_len {
-            let vh = &v[(s * num_heads + h) * head_dim..(s * num_heads + h + 1) * head_dim];
-            for d in 0..head_dim {
-                oh[d] += scores[s] * vh[d];
+            let sink = attn_sink.and_then(|s| s.get(h).copied());
+            if let Some(sk) = sink {
+                max_s = max_s.max(sk);
             }
-        }
+            let mut sum = 0.0f32;
+            for s in scores.iter_mut() {
+                *s = (*s - max_s).exp();
+                sum += *s;
+            }
+            // Attention sink: absorb probability mass, no value contribution.
+            if let Some(sk) = sink {
+                sum += (sk - max_s).exp();
+            }
+            let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+            for s in scores.iter_mut() {
+                *s *= inv;
+            }
+            let mut oh = vec![0.0f32; head_dim];
+            for s in 0..seq_len {
+                let vh = &v[(s * num_heads + h) * head_dim..(s * num_heads + h + 1) * head_dim];
+                for d in 0..head_dim {
+                    oh[d] += scores[s] * vh[d];
+                }
+            }
+            oh
+        })
+        .collect();
+    let mut out = Vec::with_capacity(num_heads * head_dim);
+    for oh in head_outs {
+        out.extend_from_slice(&oh);
     }
     Ok(out)
 }
