@@ -737,39 +737,16 @@ fn expand_kv_mqa(kv: &[f32], seq: usize, n_q_heads: usize, head_dim: usize) -> V
     out
 }
 
-/// Apply rotary embeddings to the last `rope_dim` of a single head vector.
-///
-/// Matches official `apply_rotary_emb` (complex multiply on consecutive pairs).
-fn apply_rope_slice(x: &mut [f32], pos: usize, rope_dim: usize, theta: f32, inverse: bool) {
-    if rope_dim == 0 || x.len() < rope_dim {
-        return;
-    }
-    let start = x.len() - rope_dim;
-    let half = rope_dim / 2;
-    let sign = if inverse { -1.0f32 } else { 1.0f32 };
-    for i in 0..half {
-        let freq = 1.0 / theta.powf((2 * i) as f32 / rope_dim as f32);
-        let angle = (pos as f32) * freq;
-        let (c, s) = (angle.cos(), angle.sin() * sign);
-        let a = x[start + 2 * i];
-        let b = x[start + 2 * i + 1];
-        x[start + 2 * i] = a * c - b * s;
-        x[start + 2 * i + 1] = a * s + b * c;
-    }
-}
-
-/// RoPE on multi-head layout `[H * D]` (last `rope_dim` of each head).
+/// RoPE on multi-head layout `[H * D]` using per-layer [`RopeParams`] (base or YaRN).
 fn apply_rope_heads(
     x: &mut [f32],
     n_heads: usize,
     head_dim: usize,
-    rope_dim: usize,
+    rope: &crate::weights::RopeParams,
     pos: usize,
-    theta: f32,
     inverse: bool,
 ) {
-    let rd = rope_dim.min(head_dim);
-    if rd == 0 || n_heads == 0 {
+    if n_heads == 0 || head_dim == 0 {
         return;
     }
     for h in 0..n_heads {
@@ -777,16 +754,21 @@ fn apply_rope_heads(
         if base + head_dim > x.len() {
             break;
         }
-        apply_rope_slice(&mut x[base..base + head_dim], pos, rd, theta, inverse);
+        rope.apply_slice(&mut x[base..base + head_dim], pos, inverse);
     }
 }
 
 /// RoPE on a single MQA latent of length `head_dim`.
-fn apply_rope_latent(x: &mut [f32], head_dim: usize, rope_dim: usize, pos: usize, theta: f32) {
+fn apply_rope_latent(
+    x: &mut [f32],
+    head_dim: usize,
+    rope: &crate::weights::RopeParams,
+    pos: usize,
+) {
     if x.len() < head_dim {
         return;
     }
-    apply_rope_slice(&mut x[..head_dim], pos, rope_dim.min(head_dim), theta, false);
+    rope.apply_slice(&mut x[..head_dim], pos, false);
 }
 
 /// First `n_q` entries of layer `attn_sink`, if present.
@@ -1503,8 +1485,9 @@ impl InferenceBackend for LocalWeightRunner {
             .layers
             .first()
             .map(|b| b.attn.rope_head_dim)
-            .unwrap_or(0)
-            .min(head_dim);
+            .unwrap_or(64)
+            .min(head_dim.max(64));
+        let toy_rope = crate::weights::RopeParams::base(rope_dim.max(2), rope_theta);
 
         let hc_mult = self
             .weights
@@ -1531,7 +1514,6 @@ impl InferenceBackend for LocalWeightRunner {
                     };
                     for (li, block) in self.weights.layers.iter().enumerate() {
                         let pfx = format!("{prefix}:L{li}");
-                        let rd = block.attn.rope_head_dim.min(head_dim);
                         if let Some(ref hc) = block.hc {
                             let residual = streams.clone();
                             let (x, post, comb) = hc_pre(
@@ -1545,12 +1527,12 @@ impl InferenceBackend for LocalWeightRunner {
                             );
                             let (mut kk, _) = self.weights.project_kv_layer(&block.attn, &x);
                             kk.resize(kv_width, 0.0);
-                            apply_rope_latent(&mut kk, head_dim, rd, pos, rope_theta);
+                            apply_rope_latent(&mut kk, head_dim, &block.attn.rope, pos);
                             let vv = kk.clone();
                             self.kv.lock().append_kv(&pfx, &kk, &vv);
                             let mut qq = self.weights.project_q_layer(&block.attn, &x);
                             qq.resize(q_width, 0.0);
-                            apply_rope_heads(&mut qq, n_q, head_dim, rd, pos, rope_theta, false);
+                            apply_rope_heads(&mut qq, n_q, head_dim, &block.attn.rope, pos, false);
                             let (k_cache, v_cache, seq_len) = self.kv.lock().materialize_kv(&pfx);
                             let mut attn_out = vec![0.0f32; self.weights.hidden];
                             if seq_len > 0 {
@@ -1579,15 +1561,7 @@ impl InferenceBackend for LocalWeightRunner {
                                 {
                                     let mut attn_o = dec.o;
                                     attn_o.resize(q_width, 0.0);
-                                    apply_rope_heads(
-                                        &mut attn_o,
-                                        n_q,
-                                        head_dim,
-                                        rd,
-                                        pos,
-                                        rope_theta,
-                                        true,
-                                    );
+                                    apply_rope_heads(&mut attn_o, n_q, head_dim, &block.attn.rope, pos, true);
                                     attn_out = self
                                         .weights
                                         .attn_to_hidden_layer(&block.attn, &attn_o, &x);
@@ -1627,12 +1601,12 @@ impl InferenceBackend for LocalWeightRunner {
                             };
                             let (mut kk, _) = self.weights.project_kv_layer(&block.attn, &h);
                             kk.resize(kv_width, 0.0);
-                            apply_rope_latent(&mut kk, head_dim, rd, pos, rope_theta);
+                            apply_rope_latent(&mut kk, head_dim, &block.attn.rope, pos);
                             let vv = kk.clone();
                             self.kv.lock().append_kv(&pfx, &kk, &vv);
                             let mut qq = self.weights.project_q_layer(&block.attn, &h);
                             qq.resize(q_width, 0.0);
-                            apply_rope_heads(&mut qq, n_q, head_dim, rd, pos, rope_theta, false);
+                            apply_rope_heads(&mut qq, n_q, head_dim, &block.attn.rope, pos, false);
                             let (k_cache, v_cache, seq_len) = self.kv.lock().materialize_kv(&pfx);
                             if seq_len > 0 {
                                 let (k_exp, v_exp, seq_len) = prepare_kv_for_decode(
@@ -1660,15 +1634,7 @@ impl InferenceBackend for LocalWeightRunner {
                                 {
                                     let mut attn_o = dec.o;
                                     attn_o.resize(q_width, 0.0);
-                                    apply_rope_heads(
-                                        &mut attn_o,
-                                        n_q,
-                                        head_dim,
-                                        rd,
-                                        pos,
-                                        rope_theta,
-                                        true,
-                                    );
+                                    apply_rope_heads(&mut attn_o, n_q, head_dim, &block.attn.rope, pos, true);
                                     let delta = self
                                         .weights
                                         .attn_to_hidden_layer(&block.attn, &attn_o, &h);
@@ -1729,7 +1695,7 @@ impl InferenceBackend for LocalWeightRunner {
                 let q_pos = (seq_len as usize).saturating_sub(1);
                 let mut q = self.weights.project_q(&h);
                 q.resize(q_width, 0.0);
-                apply_rope_heads(&mut q, n_q, head_dim, rope_dim, q_pos, rope_theta, false);
+                apply_rope_heads(&mut q, n_q, head_dim, &toy_rope, q_pos, false);
                 let (k_exp, v_exp, seq_len) = prepare_kv_for_decode(
     self.multihead,
     k_cache,
@@ -1755,7 +1721,7 @@ impl InferenceBackend for LocalWeightRunner {
                     .map_err(|e| TrajectError::Inference(format!("local decode: {e}")))?;
                 let mut attn_o = dec.o;
                 attn_o.resize(q_width, 0.0);
-                apply_rope_heads(&mut attn_o, n_q, head_dim, rope_dim, q_pos, rope_theta, true);
+                apply_rope_heads(&mut attn_o, n_q, head_dim, &toy_rope, q_pos, true);
                 let attn_h = self.weights.attn_to_hidden(&attn_o, &h);
                 for (a, b) in h.iter_mut().zip(attn_h.iter()) {
                     *a = 0.5 * *a + 0.5 * *b;
@@ -1764,7 +1730,6 @@ impl InferenceBackend for LocalWeightRunner {
             } else {
                 for (li, block) in self.weights.layers.iter().enumerate() {
                     let pfx = format!("{prefix}:L{li}");
-                    let rd = block.attn.rope_head_dim.min(head_dim);
                     if let Some(ref hc) = block.hc {
                         let residual = streams.clone();
                         let (x, post, comb) = hc_pre(
@@ -1780,7 +1745,7 @@ impl InferenceBackend for LocalWeightRunner {
                         if seq_len == 0 {
                             let (mut kk, _) = self.weights.project_kv_layer(&block.attn, &x);
                             kk.resize(kv_width, 0.0);
-                            apply_rope_latent(&mut kk, head_dim, rd, 0, rope_theta);
+                            apply_rope_latent(&mut kk, head_dim, &block.attn.rope, 0);
                             let vv = kk.clone();
                             self.kv.lock().append_kv(&pfx, &kk, &vv);
                             streams = residual;
@@ -1789,7 +1754,7 @@ impl InferenceBackend for LocalWeightRunner {
                         let q_pos = (seq_len as usize).saturating_sub(1);
                         let mut qq = self.weights.project_q_layer(&block.attn, &x);
                         qq.resize(q_width, 0.0);
-                        apply_rope_heads(&mut qq, n_q, head_dim, rd, q_pos, rope_theta, false);
+                        apply_rope_heads(&mut qq, n_q, head_dim, &block.attn.rope, q_pos, false);
                         let (k_exp, v_exp, seq_len) = prepare_kv_for_decode(
     self.multihead,
     k_cache,
@@ -1817,15 +1782,7 @@ impl InferenceBackend for LocalWeightRunner {
                             })?;
                         let mut attn_o = dec.o;
                         attn_o.resize(q_width, 0.0);
-                        apply_rope_heads(
-                            &mut attn_o,
-                            n_q,
-                            head_dim,
-                            rd,
-                            q_pos,
-                            rope_theta,
-                            true,
-                        );
+                        apply_rope_heads(&mut attn_o, n_q, head_dim, &block.attn.rope, q_pos, true);
                         let attn_out =
                             self.weights.attn_to_hidden_layer(&block.attn, &attn_o, &x);
                         streams =
@@ -1858,14 +1815,14 @@ impl InferenceBackend for LocalWeightRunner {
                         if seq_len == 0 {
                             let (mut kk, _) = self.weights.project_kv_layer(&block.attn, &h);
                             kk.resize(kv_width, 0.0);
-                            apply_rope_latent(&mut kk, head_dim, rd, 0, rope_theta);
+                            apply_rope_latent(&mut kk, head_dim, &block.attn.rope, 0);
                             let vv = kk.clone();
                             self.kv.lock().append_kv(&pfx, &kk, &vv);
                             streams = h;
                             continue;
                         }
                         let q_pos = (seq_len as usize).saturating_sub(1);
-                        apply_rope_heads(&mut qq, n_q, head_dim, rd, q_pos, rope_theta, false);
+                        apply_rope_heads(&mut qq, n_q, head_dim, &block.attn.rope, q_pos, false);
                         let (k_exp, v_exp, seq_len) = prepare_kv_for_decode(
     self.multihead,
     k_cache,
@@ -1893,15 +1850,7 @@ impl InferenceBackend for LocalWeightRunner {
                             })?;
                         let mut attn_o = dec.o;
                         attn_o.resize(q_width, 0.0);
-                        apply_rope_heads(
-                            &mut attn_o,
-                            n_q,
-                            head_dim,
-                            rd,
-                            q_pos,
-                            rope_theta,
-                            true,
-                        );
+                        apply_rope_heads(&mut attn_o, n_q, head_dim, &block.attn.rope, q_pos, true);
                         let delta =
                             self.weights.attn_to_hidden_layer(&block.attn, &attn_o, &h);
                         if block.attn.has_o_proj() {
@@ -1954,11 +1903,10 @@ impl InferenceBackend for LocalWeightRunner {
                 let mut hh = emb_n;
                 for (li, block) in self.weights.layers.iter().enumerate() {
                     let pfx = format!("{prefix}:L{li}");
-                    let rd = block.attn.rope_head_dim.min(head_dim);
                     let pos = self.kv.lock().materialize_kv(&pfx).2 as usize;
                     let (mut k, _) = self.weights.project_kv_layer(&block.attn, &hh);
                     k.resize(kv_width, 0.0);
-                    apply_rope_latent(&mut k, head_dim, rd, pos, rope_theta);
+                    apply_rope_latent(&mut k, head_dim, &block.attn.rope, pos);
                     let v = k.clone();
                     self.kv.lock().append_kv(&pfx, &k, &v);
                     // Advance residual lightly so deeper layers see something non-constant.
@@ -2138,11 +2086,12 @@ mod tests {
     #[test]
     fn rope_roundtrip_near_identity() {
         // Apply RoPE then inverse → recover original (within float noise).
+        let rope = crate::weights::RopeParams::base(4, 10000.0);
         let mut x = vec![0.5f32, -0.25, 0.1, 0.75];
         let orig = x.clone();
-        apply_rope_slice(&mut x, 7, 4, 10000.0, false);
+        rope.apply_slice(&mut x, 7, false);
         assert!((x[0] - orig[0]).abs() > 1e-6 || (x[1] - orig[1]).abs() > 1e-6);
-        apply_rope_slice(&mut x, 7, 4, 10000.0, true);
+        rope.apply_slice(&mut x, 7, true);
         for (a, b) in x.iter().zip(orig.iter()) {
             assert!((a - b).abs() < 1e-5, "{a} vs {b}");
         }
@@ -2150,12 +2099,30 @@ mod tests {
 
     #[test]
     fn rope_only_last_dims() {
+        let rope = crate::weights::RopeParams::base(2, 10000.0);
         let mut x = vec![1.0f32, 2.0, 3.0, 4.0, 0.5, -0.5];
         let head = x.clone();
-        apply_rope_slice(&mut x, 3, 2, 10000.0, false);
+        rope.apply_slice(&mut x, 3, false);
         // first 4 dims (nope) unchanged; last 2 rotated
         assert_eq!(&x[..4], &head[..4]);
         assert!((x[4] - head[4]).abs() > 1e-6 || (x[5] - head[5]).abs() > 1e-6);
+    }
+
+    #[test]
+    fn yarn_inv_freq_differs_from_base() {
+        let base = crate::weights::RopeParams::base(64, 160000.0);
+        let yarn = crate::weights::RopeParams::yarn_or_base(
+            64, 160000.0, 4, 65536, 16.0, 32.0, 1.0,
+        );
+        assert!(yarn.yarn);
+        assert!(!base.yarn);
+        // At least one frequency should change under YaRN.
+        let changed = base
+            .inv_freq
+            .iter()
+            .zip(yarn.inv_freq.iter())
+            .any(|(a, b)| (a - b).abs() > 1e-12);
+        assert!(changed);
     }
 
     #[test]

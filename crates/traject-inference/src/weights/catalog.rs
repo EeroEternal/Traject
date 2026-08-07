@@ -443,6 +443,122 @@ impl SafetensorCatalog {
     }
 }
 
+/// Per-layer RoPE parameters (base SWA or YaRN for compressed layers).
+#[derive(Debug, Clone)]
+pub struct RopeParams {
+    /// Last dims of each head that receive RoPE (V4: 64).
+    pub rope_dim: usize,
+    /// `1 / theta^(2i/dim)` after optional YaRN interpolation, length `rope_dim/2`.
+    pub inv_freq: Vec<f32>,
+    /// Layer `compress_ratios[i]` (0 = pure SWA).
+    pub compress_ratio: usize,
+    /// True when YaRN frequency interpolation was applied.
+    pub yarn: bool,
+    /// Base theta used before YaRN (for logs).
+    pub theta: f32,
+}
+
+impl RopeParams {
+    /// Pure SWA: classic RoPE with `theta` (layers with compress_ratio=0).
+    pub fn base(rope_dim: usize, theta: f32) -> Self {
+        let half = (rope_dim / 2).max(1);
+        let theta = if theta > 0.0 { theta } else { 10000.0 };
+        let mut inv_freq = Vec::with_capacity(half);
+        for i in 0..half {
+            inv_freq.push(1.0 / theta.powf((2 * i) as f32 / rope_dim.max(1) as f32));
+        }
+        Self {
+            rope_dim: rope_dim.max(2),
+            inv_freq,
+            compress_ratio: 0,
+            yarn: false,
+            theta,
+        }
+    }
+
+    /// Compressed-layer RoPE: `compress_rope_theta` + YaRN when `original_max > 0`.
+    pub fn yarn_or_base(
+        rope_dim: usize,
+        theta: f32,
+        compress_ratio: usize,
+        original_max: usize,
+        factor: f32,
+        beta_fast: f32,
+        beta_slow: f32,
+    ) -> Self {
+        let rope_dim = rope_dim.max(2);
+        let half = rope_dim / 2;
+        let theta = if theta > 0.0 { theta } else { 10000.0 };
+        let mut inv_freq = Vec::with_capacity(half);
+        for i in 0..half {
+            inv_freq.push(1.0 / theta.powf((2 * i) as f32 / rope_dim as f32));
+        }
+        let mut yarn = false;
+        if original_max > 0 && factor > 0.0 {
+            yarn = true;
+            let (low, high) =
+                yarn_correction_range(beta_fast, beta_slow, rope_dim, theta, original_max);
+            for i in 0..half {
+                // smooth in [0,1]: 0 at low, 1 at high (matches 1 - linear_ramp(low,high))
+                let smooth = if high <= low {
+                    1.0
+                } else {
+                    let t = (i as f32 - low) / (high - low);
+                    1.0 - t.clamp(0.0, 1.0)
+                };
+                // freqs = freqs/factor*(1-smooth) + freqs*smooth
+                inv_freq[i] = inv_freq[i] / factor * (1.0 - smooth) + inv_freq[i] * smooth;
+            }
+        }
+        Self {
+            rope_dim,
+            inv_freq,
+            compress_ratio,
+            yarn,
+            theta,
+        }
+    }
+
+    /// Apply RoPE to the last `rope_dim` of a head vector (complex multiply on pairs).
+    pub fn apply_slice(&self, x: &mut [f32], pos: usize, inverse: bool) {
+        let rd = self.rope_dim.min(x.len());
+        if rd < 2 || self.inv_freq.is_empty() {
+            return;
+        }
+        let start = x.len() - rd;
+        let half = rd / 2;
+        let sign = if inverse { -1.0f32 } else { 1.0f32 };
+        for i in 0..half.min(self.inv_freq.len()) {
+            let angle = (pos as f32) * self.inv_freq[i];
+            let (c, s) = (angle.cos(), angle.sin() * sign);
+            let a = x[start + 2 * i];
+            let b = x[start + 2 * i + 1];
+            x[start + 2 * i] = a * c - b * s;
+            x[start + 2 * i + 1] = a * s + b * c;
+        }
+    }
+}
+
+/// YaRN correction dim range (official DeepSeek `find_correction_range`).
+fn yarn_correction_range(
+    low_rot: f32,
+    high_rot: f32,
+    dim: usize,
+    base: f32,
+    max_seq_len: usize,
+) -> (f32, f32) {
+    let corr = |num_rotations: f32| -> f32 {
+        if num_rotations <= 0.0 || base <= 1.0 || max_seq_len == 0 {
+            return 0.0;
+        }
+        dim as f32 * (max_seq_len as f32 / (num_rotations * 2.0 * std::f32::consts::PI)).ln()
+            / (2.0 * base.ln())
+    };
+    let low = corr(low_rot).floor().max(0.0);
+    let high = corr(high_rot).ceil().min((dim.saturating_sub(1)) as f32);
+    (low, high)
+}
+
 /// Layer-0 attention projections (DeepSeek-V4 MLA compressed + Q expand + o_proj).
 ///
 /// Routed MoE experts are **not** loaded here.
@@ -476,6 +592,8 @@ pub struct Layer0AttnWeights {
     pub attn_sink: Option<Vec<f32>>,
     /// RoPE dims applied on the last slice of each head (`qk_rope_head_dim`, default 64).
     pub rope_head_dim: usize,
+    /// Per-layer RoPE table (base SWA or YaRN for compress layers).
+    pub rope: RopeParams,
 }
 
 impl Layer0AttnWeights {
@@ -671,16 +789,46 @@ fn load_layer_attn_into(
         }
     }
 
-    // o_proj factors (V4 Flash defaults: o_groups=8, o_lora_rank=1024 → 8192).
-    let (o_groups, o_lora_rank, rope_head_dim) = {
+    // o_proj + RoPE (V4 Flash defaults).
+    let (o_groups, o_lora_rank, rope_head_dim, rope) = {
         use crate::weights::HfModelConfig;
         match HfModelConfig::load(model_dir) {
-            Ok(cfg) => (
-                cfg.o_groups.unwrap_or(8) as usize,
-                cfg.o_lora_rank.unwrap_or(1024) as usize,
-                cfg.qk_rope_head_dim.unwrap_or(64) as usize,
-            ),
-            Err(_) => (8, 1024, 64),
+            Ok(cfg) => {
+                let o_groups = cfg.o_groups.unwrap_or(8) as usize;
+                let o_lora_rank = cfg.o_lora_rank.unwrap_or(1024) as usize;
+                let rope_head_dim = cfg.qk_rope_head_dim.unwrap_or(64) as usize;
+                let compress_ratio = cfg
+                    .compress_ratios
+                    .as_ref()
+                    .and_then(|v| v.get(layer).copied())
+                    .unwrap_or(0) as usize;
+                let base_theta = cfg.rope_theta.unwrap_or(10000.0);
+                let compress_theta = cfg.compress_rope_theta.unwrap_or(160000.0);
+                let rope = if compress_ratio > 0 {
+                    // Official: compress layers use compress_rope_theta + YaRN.
+                    let rs = cfg.rope_scaling.as_ref();
+                    let factor = rs.and_then(|r| r.factor).unwrap_or(16.0);
+                    let original_max = rs
+                        .and_then(|r| r.original_max_position_embeddings)
+                        .unwrap_or(65536) as usize;
+                    let beta_fast = rs.and_then(|r| r.beta_fast).unwrap_or(32.0);
+                    let beta_slow = rs.and_then(|r| r.beta_slow).unwrap_or(1.0);
+                    RopeParams::yarn_or_base(
+                        rope_head_dim,
+                        compress_theta,
+                        compress_ratio,
+                        original_max,
+                        factor,
+                        beta_fast,
+                        beta_slow,
+                    )
+                } else {
+                    // Pure SWA: base rope_theta, no YaRN.
+                    RopeParams::base(rope_head_dim, base_theta)
+                };
+                (o_groups, o_lora_rank, rope_head_dim, rope)
+            }
+            Err(_) => (8, 1024, 64, RopeParams::base(64, 10000.0)),
         }
     };
     let o_inter = o_groups * o_lora_rank;
@@ -758,6 +906,9 @@ fn load_layer_attn_into(
         has_wo_b = wo_b.is_some(),
         has_attn_sink = attn_sink.is_some(),
         rope_head_dim,
+        compress_ratio = rope.compress_ratio,
+        yarn = rope.yarn,
+        rope_theta = rope.theta,
         q_full = wq_b.as_ref().map(|t| t.rows()),
         n_heads = ?n_heads,
         o_groups,
@@ -781,6 +932,7 @@ fn load_layer_attn_into(
         o_lora_rank,
         attn_sink,
         rope_head_dim,
+        rope,
     })
 }
 
