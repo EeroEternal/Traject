@@ -9,7 +9,7 @@ pub use catalog::{
     load_layer0_shared_ffn, load_layer_attn, load_layer_hc, load_layer_routed_moe,
     load_layer_shared_ffn, load_layer_stack, ExpertF32, ExpertPacked, HcBranchWeights,
     HcHeadWeights, Layer0AttnWeights, Layer0RoutedMoe, Layer0SharedFfn, LayerBlock,
-    CompressorWeights, LayerHcWeights, LinearMat, PackedFp4Mat, PackedFp8Mat, RopeParams,
-    SafetensorCatalog, TensorF32,
+    CompressorWeights, IndexerWeights, LayerHcWeights, LinearMat, PackedFp4Mat, PackedFp8Mat,
+    RopeParams, SafetensorCatalog, TensorF32,
 };
 pub use hf_config::{HfModelConfig, RopeScalingConfig};

@@ -353,13 +353,19 @@ impl ModelWeights {
         self.rms_norm_with(x, self.norm.as_deref())
     }
 
-    /// Hidden → multi-head Q (no RoPE; caller applies position).
-    fn project_q_layer(&self, layer: &crate::weights::Layer0AttnWeights, h: &[f32]) -> Vec<f32> {
+    /// Hidden → q_lora (after attn_norm + wq_a + optional q_norm). Used by indexer.
+    fn project_q_lora(&self, layer: &crate::weights::Layer0AttnWeights, h: &[f32]) -> Vec<f32> {
         let hn = self.rms_norm_with(h, Some(&layer.attn_norm));
         let mut q = layer.wq_a.matvec(&hn);
         if let Some(ref qn) = layer.q_norm {
             q = self.rms_norm_with(&q, Some(qn));
         }
+        q
+    }
+
+    /// Hidden → multi-head Q (no RoPE; caller applies position).
+    fn project_q_layer(&self, layer: &crate::weights::Layer0AttnWeights, h: &[f32]) -> Vec<f32> {
+        let q = self.project_q_lora(layer, h);
         if let Some(ref wq_b) = layer.wq_b {
             let q_full = wq_b.matvec(&q);
             // Keep multi-head Q: first n_q_heads × head_dim (no mean-pool).
@@ -1390,24 +1396,38 @@ fn compressor_push(
 fn maybe_append_compress(
     kv: &Mutex<PagedKvPool>,
     compress_states: &Mutex<HashMap<String, CompressLayerState>>,
+    index_kv: &Mutex<HashMap<String, (Vec<f32>, usize)>>,
     pfx: &str,
     block: &crate::weights::LayerBlock,
     x: &[f32],
     pos: usize,
     kv_width: usize,
 ) {
-    let Some(ref comp) = block.attn.compressor else {
-        return;
-    };
-    let ckey = format!("{pfx}:C");
-    let mut map = compress_states.lock();
-    let st = map
-        .entry(ckey.clone())
-        .or_insert_with(|| CompressLayerState::new(comp));
-    if let Some(mut ckv) = compressor_push(comp, st, x, pos, &block.attn.rope) {
-        ckv.resize(kv_width, 0.0);
-        let v = ckv.clone();
-        kv.lock().append_kv(&ckey, &ckv, &v);
+    if let Some(ref comp) = block.attn.compressor {
+        let ckey = format!("{pfx}:C");
+        let mut map = compress_states.lock();
+        let st = map
+            .entry(ckey.clone())
+            .or_insert_with(|| CompressLayerState::new(comp));
+        if let Some(mut ckv) = compressor_push(comp, st, x, pos, &block.attn.rope) {
+            ckv.resize(kv_width, 0.0);
+            let v = ckv.clone();
+            kv.lock().append_kv(&ckey, &ckv, &v);
+        }
+    }
+    // Parallel index-compressor stream (ratio-4 layers with indexer).
+    if let Some(ref ix) = block.attn.indexer {
+        let ikey = format!("{pfx}:I");
+        let mut map = compress_states.lock();
+        let st = map
+            .entry(ikey.clone())
+            .or_insert_with(|| CompressLayerState::new(&ix.compressor));
+        if let Some(ckv) = compressor_push(&ix.compressor, st, x, pos, &ix.rope) {
+            let mut store = index_kv.lock();
+            let e = store.entry(ikey).or_insert_with(|| (Vec::new(), 0));
+            e.0.extend_from_slice(&ckv);
+            e.1 += 1;
+        }
     }
 }
 
@@ -1422,6 +1442,132 @@ fn materialize_compress_pool(
     } else {
         Some((k, v, n))
     }
+}
+
+/// Score compress tokens with the learned indexer and keep top-k.
+///
+/// `ck/cv` are main compress latents (`head_dim` each). `ik` is the parallel
+/// index-compress cache (`index_head_dim` each). Returns filtered `ck/cv`.
+fn topk_compress_by_indexer(
+    ix: &crate::weights::IndexerWeights,
+    qr: &[f32],
+    x: &[f32],
+    pos: usize,
+    ck: &[f32],
+    cv: &[f32],
+    cl: usize,
+    main_dim: usize,
+    ik: &[f32],
+    il: usize,
+) -> (Vec<f32>, Vec<f32>, u32) {
+    let main_dim = main_dim.max(1);
+    let id = ix.head_dim.max(1);
+    let nh = ix.n_heads.max(1);
+    let n = cl.min(il);
+    if n == 0 {
+        return (Vec::new(), Vec::new(), 0);
+    }
+    let k = ix.topk.min(n).max(1);
+    // q: [H * D_idx]
+    let mut q = ix.wq_b.matvec(qr);
+    q.resize(nh * id, 0.0);
+    for h in 0..nh {
+        ix.rope.apply_slice(&mut q[h * id..(h + 1) * id], pos, false);
+    }
+    // head weights: weights_proj @ x  * scale
+    let cols = ix.weights_proj.cols().max(1);
+    let mut weights = vec![0.0f32; nh];
+    let scale = (id as f32).sqrt().recip() * (nh as f32).sqrt().recip();
+    for h in 0..nh.min(ix.weights_proj.rows()) {
+        let r = &ix.weights_proj.data[h * cols..(h + 1) * cols];
+        let mut s = 0.0f32;
+        for (a, b) in r.iter().zip(x.iter()) {
+            s += a * b;
+        }
+        weights[h] = s * scale;
+    }
+    let mut scores = vec![0.0f32; n];
+    for t in 0..n {
+        let k_base = t * id;
+        if k_base + id > ik.len() {
+            break;
+        }
+        let kt = &ik[k_base..k_base + id];
+        let mut s = 0.0f32;
+        for h in 0..nh {
+            let qh = &q[h * id..(h + 1) * id];
+            let mut dot = 0.0f32;
+            for d in 0..id {
+                dot += qh[d] * kt[d];
+            }
+            s += dot.max(0.0) * weights[h]; // relu
+        }
+        scores[t] = s;
+    }
+    // top-k indices
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        scores[b]
+            .partial_cmp(&scores[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    order.truncate(k);
+    order.sort_unstable(); // restore temporal order for stability
+    let mut ok = Vec::with_capacity(order.len() * main_dim);
+    let mut ov = Vec::with_capacity(order.len() * main_dim);
+    for &t in &order {
+        let base = t * main_dim;
+        if base + main_dim <= ck.len() && base + main_dim <= cv.len() {
+            ok.extend_from_slice(&ck[base..base + main_dim]);
+            ov.extend_from_slice(&cv[base..base + main_dim]);
+        }
+    }
+    let n_out = (ok.len() / main_dim) as u32;
+    (ok, ov, n_out)
+}
+
+fn filter_compress_pool_for_block(
+    block: &crate::weights::LayerBlock,
+    qr: Option<&[f32]>,
+    x: Option<&[f32]>,
+    pos: usize,
+    pool: Option<(Vec<f32>, Vec<f32>, u32)>,
+    index_kv: &Mutex<HashMap<String, (Vec<f32>, usize)>>,
+    pfx: &str,
+    main_dim: usize,
+) -> Option<(Vec<f32>, Vec<f32>, u32)> {
+    let Some((ck, cv, cl)) = pool else {
+        return None;
+    };
+    if cl == 0 {
+        return Some((ck, cv, cl));
+    }
+    let Some(ref ix) = block.attn.indexer else {
+        return Some((ck, cv, cl));
+    };
+    let (Some(qr), Some(x)) = (qr, x) else {
+        return Some((ck, cv, cl));
+    };
+    let ikey = format!("{pfx}:I");
+    let guard = index_kv.lock();
+    let Some((ref ik, il)) = guard.get(&ikey) else {
+        return Some((ck, cv, cl));
+    };
+    if *il == 0 {
+        return Some((ck, cv, cl));
+    }
+    Some(topk_compress_by_indexer(
+        ix,
+        qr,
+        x,
+        pos,
+        &ck,
+        &cv,
+        cl as usize,
+        main_dim,
+        ik,
+        *il,
+    ))
 }
 
 fn matvec(w: &[f32], out_dim: usize, in_dim: usize, x: &[f32]) -> Vec<f32> {
@@ -1569,8 +1715,10 @@ pub struct LocalWeightRunner {
     head_dim: usize,
     /// Sliding-window size for attention (0 = full context).
     sliding_window: usize,
-    /// Incremental compressor state keyed by `{prefix}:L{i}:C`.
+    /// Incremental compressor state keyed by `{prefix}:L{i}:C` / `:I`.
     compress_states: Mutex<HashMap<String, CompressLayerState>>,
+    /// Indexer compress latents keyed by `{prefix}:L{i}:I` (flat `[n * index_head_dim]`).
+    index_kv: Mutex<HashMap<String, (Vec<f32>, usize)>>,
 }
 
 impl LocalWeightRunner {
@@ -1634,6 +1782,7 @@ impl LocalWeightRunner {
             head_dim,
             sliding_window,
             compress_states: Mutex::new(HashMap::new()),
+            index_kv: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1844,6 +1993,7 @@ impl InferenceBackend for LocalWeightRunner {
                             maybe_append_compress(
                                 &self.kv,
                                 &self.compress_states,
+                                &self.index_kv,
                                 &pfx,
                                 block,
                                 &hn,
@@ -1865,7 +2015,33 @@ impl InferenceBackend for LocalWeightRunner {
                                     head_dim,
                                     self.sliding_window,
                                     block.attn.rope.compress_ratio,
-                                    materialize_compress_pool(&self.kv, &pfx),
+                                    {
+                                        let qr = self.weights.project_q_lora(&block.attn, &x);
+                                        let hn2 = self.weights.rms_norm_with(&x, Some(&block.attn.attn_norm));
+                                        filter_compress_pool_for_block(
+                                            block,
+                                            Some(&qr),
+                                            Some(&hn2),
+                                            pos,
+                                            {
+                                                let qr = self.weights.project_q_lora(&block.attn, &x);
+                                                let hn2 = self.weights.rms_norm_with(&x, Some(&block.attn.attn_norm));
+                                                filter_compress_pool_for_block(
+                                                    block,
+                                                    Some(&qr),
+                                                    Some(&hn2),
+                                                    pos,
+                                                    materialize_compress_pool(&self.kv, &pfx),
+                                                    &self.index_kv,
+                                                    &pfx,
+                                                    head_dim,
+                                                )
+                                            },
+                                            &self.index_kv,
+                                            &pfx,
+                                            head_dim,
+                                        )
+                                    },
                                 );
                                 if let Ok(dec) = self
                                     .kernel
@@ -1930,6 +2106,7 @@ impl InferenceBackend for LocalWeightRunner {
                             maybe_append_compress(
                                 &self.kv,
                                 &self.compress_states,
+                                &self.index_kv,
                                 &pfx,
                                 block,
                                 &hn,
@@ -1950,7 +2127,20 @@ impl InferenceBackend for LocalWeightRunner {
                                     head_dim,
                                     self.sliding_window,
                                     block.attn.rope.compress_ratio,
-                                    materialize_compress_pool(&self.kv, &pfx),
+                                    {
+                                        let qr = self.weights.project_q_lora(&block.attn, &h);
+                                        let hn2 = self.weights.rms_norm_with(&h, Some(&block.attn.attn_norm));
+                                        filter_compress_pool_for_block(
+                                            block,
+                                            Some(&qr),
+                                            Some(&hn2),
+                                            pos,
+                                            materialize_compress_pool(&self.kv, &pfx),
+                                            &self.index_kv,
+                                            &pfx,
+                                            head_dim,
+                                        )
+                                    },
                                 );
                                 if let Ok(dec) = self
                                     .kernel
@@ -2088,6 +2278,7 @@ impl InferenceBackend for LocalWeightRunner {
                             maybe_append_compress(
                                 &self.kv,
                                 &self.compress_states,
+                                &self.index_kv,
                                 &pfx,
                                 block,
                                 &hn,
@@ -2110,7 +2301,20 @@ impl InferenceBackend for LocalWeightRunner {
                             head_dim,
                             self.sliding_window,
                             block.attn.rope.compress_ratio,
-                            materialize_compress_pool(&self.kv, &pfx),
+                            {
+                                let qr = self.weights.project_q_lora(&block.attn, &x);
+                                let hn2 = self.weights.rms_norm_with(&x, Some(&block.attn.attn_norm));
+                                filter_compress_pool_for_block(
+                                    block,
+                                    Some(&qr),
+                                    Some(&hn2),
+                                    q_pos,
+                                    materialize_compress_pool(&self.kv, &pfx),
+                                    &self.index_kv,
+                                    &pfx,
+                                    head_dim,
+                                )
+                            },
                         );
                         let dec = self
                             .kernel
@@ -2170,6 +2374,7 @@ impl InferenceBackend for LocalWeightRunner {
                             maybe_append_compress(
                                 &self.kv,
                                 &self.compress_states,
+                                &self.index_kv,
                                 &pfx,
                                 block,
                                 &hn,
@@ -2190,7 +2395,20 @@ impl InferenceBackend for LocalWeightRunner {
                             head_dim,
                             self.sliding_window,
                             block.attn.rope.compress_ratio,
-                            materialize_compress_pool(&self.kv, &pfx),
+                            {
+                                let qr = self.weights.project_q_lora(&block.attn, &h);
+                                let hn2 = self.weights.rms_norm_with(&h, Some(&block.attn.attn_norm));
+                                filter_compress_pool_for_block(
+                                    block,
+                                    Some(&qr),
+                                    Some(&hn2),
+                                    q_pos,
+                                    materialize_compress_pool(&self.kv, &pfx),
+                                    &self.index_kv,
+                                    &pfx,
+                                    head_dim,
+                                )
+                            },
                         );
                         let dec = self
                             .kernel
@@ -2273,6 +2491,7 @@ impl InferenceBackend for LocalWeightRunner {
                     maybe_append_compress(
                         &self.kv,
                         &self.compress_states,
+                        &self.index_kv,
                         &pfx,
                         block,
                         &hn,
@@ -2358,6 +2577,11 @@ impl InferenceBackend for LocalWeightRunner {
                 .layers
                 .iter()
                 .any(|l| l.attn.compressor.is_some()),
+            has_indexer = self
+                .weights
+                .layers
+                .iter()
+                .any(|l| l.attn.indexer.is_some()),
             moe_cache = ?self.weights.layers.first().and_then(|l| {
                 l.moe.as_ref().map(|m| m.cache_stats())
             }),
@@ -2395,6 +2619,9 @@ impl InferenceBackend for LocalWeightRunner {
             let cpfx = format!("{pfx}:C");
             total += self.kv.lock().free_prefix(&cpfx);
             self.compress_states.lock().remove(&cpfx);
+            let ipfx = format!("{pfx}:I");
+            self.compress_states.lock().remove(&ipfx);
+            self.index_kv.lock().remove(&ipfx);
         }
         info!(%prefix_id, pages_zeroed = total, "local runner physical KV free");
         Ok(())
@@ -2579,6 +2806,53 @@ mod tests {
         assert_eq!(n, 2);
         assert_eq!(k2, vec![0.0, 1.0, 4.0, 5.0]);
         assert_eq!(v2, vec![10.0, 11.0, 14.0, 15.0]);
+    }
+
+    #[test]
+    fn indexer_topk_picks_highest_score() {
+        use crate::weights::{CompressorWeights, IndexerWeights, LinearMat, RopeParams, TensorF32};
+        // 1 head, dim 2, topk 1, two compress tokens
+        let hidden = 2usize;
+        let id = 2usize;
+        let wq = TensorF32 {
+            data: vec![1.0, 0.0, 0.0, 1.0], // identity 2x2
+            shape: vec![2, 2],
+        };
+        let wp = TensorF32 {
+            data: vec![1.0, 0.0],
+            shape: vec![1, 2],
+        };
+        let dummy_comp = CompressorWeights {
+            ratio: 4,
+            head_dim: id,
+            hidden,
+            overlap: false,
+            ape: vec![0.0; 4 * id],
+            wkv: LinearMat::F32(wq.clone()),
+            wgate: LinearMat::F32(wq.clone()),
+            norm: vec![1.0; id],
+        };
+        let ix = IndexerWeights {
+            n_heads: 1,
+            head_dim: id,
+            topk: 1,
+            q_lora: 2,
+            wq_b: LinearMat::F32(wq),
+            weights_proj: wp,
+            compressor: dummy_comp,
+            rope: RopeParams::base(2, 10000.0),
+        };
+        // main compress tokens dim=2: t0=[1,0], t1=[0,1]
+        let ck = vec![1.0, 0.0, 0.0, 1.0];
+        let cv = ck.clone();
+        // index tokens same
+        let ik = ck.clone();
+        let qr = vec![1.0, 0.0]; // aligns with t0
+        let x = vec![1.0, 0.0];
+        let (ok, _ov, n) =
+            topk_compress_by_indexer(&ix, &qr, &x, 0, &ck, &cv, 2, 2, &ik, 2);
+        assert_eq!(n, 1);
+        assert_eq!(ok, vec![1.0, 0.0]);
     }
 
     #[test]

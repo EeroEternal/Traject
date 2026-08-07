@@ -67,6 +67,15 @@ pub struct HfModelConfig {
     /// YaRN / rope scaling block from config.json.
     #[serde(default)]
     pub rope_scaling: Option<RopeScalingConfig>,
+    /// Indexer head count (V4 Flash: 64).
+    #[serde(default)]
+    pub index_n_heads: Option<u32>,
+    /// Indexer per-head dim (V4 Flash: 128).
+    #[serde(default)]
+    pub index_head_dim: Option<u32>,
+    /// Indexer top-k over compress pool (V4 Flash: 512).
+    #[serde(default)]
+    pub index_topk: Option<u32>,
 }
 
 /// Subset of HF `rope_scaling` used for YaRN frequency interpolation.
