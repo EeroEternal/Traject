@@ -2023,20 +2023,7 @@ impl InferenceBackend for LocalWeightRunner {
                                             Some(&qr),
                                             Some(&hn2),
                                             pos,
-                                            {
-                                                let qr = self.weights.project_q_lora(&block.attn, &x);
-                                                let hn2 = self.weights.rms_norm_with(&x, Some(&block.attn.attn_norm));
-                                                filter_compress_pool_for_block(
-                                                    block,
-                                                    Some(&qr),
-                                                    Some(&hn2),
-                                                    pos,
-                                                    materialize_compress_pool(&self.kv, &pfx),
-                                                    &self.index_kv,
-                                                    &pfx,
-                                                    head_dim,
-                                                )
-                                            },
+                                            materialize_compress_pool(&self.kv, &pfx),
                                             &self.index_kv,
                                             &pfx,
                                             head_dim,
