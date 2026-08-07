@@ -1043,7 +1043,10 @@ fn mean_collapse_streams(streams: &[f32], hc_mult: usize, hidden: usize) -> Vec<
 
 /// How many transformer layers to load for the local runner.
 ///
-/// `TRAJECT_LOCAL_LAYERS` env (default 2, min 1, max 8 for memory safety).
+/// - `TRAJECT_LOCAL_LAYERS` — requested count (default **2**, min 1)
+/// - `TRAJECT_LOCAL_LAYERS_MAX` — hard cap (default **16**, never above model depth)
+///
+/// Dense layers are ~0.5 GiB f32 each; raise max only when the host has RAM.
 fn local_layer_count(cfg: Option<&crate::weights::HfModelConfig>) -> usize {
     let env = std::env::var("TRAJECT_LOCAL_LAYERS")
         .ok()
@@ -1053,7 +1056,86 @@ fn local_layer_count(cfg: Option<&crate::weights::HfModelConfig>) -> usize {
         .and_then(|c| c.num_hidden_layers)
         .map(|x| x as usize)
         .unwrap_or(43);
-    n.min(max_model).min(8)
+    let cap = std::env::var("TRAJECT_LOCAL_LAYERS_MAX")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(16)
+        .max(1)
+        .min(max_model);
+    n.min(cap)
+}
+
+/// Sliding-window size (`sliding_window` / `window_size` in config, default 128).
+///
+/// `TRAJECT_SLIDING_WINDOW=0` disables windowing (full context).
+fn resolve_sliding_window(cfg: Option<&crate::weights::HfModelConfig>) -> usize {
+    if let Ok(s) = std::env::var("TRAJECT_SLIDING_WINDOW") {
+        if let Ok(v) = s.parse::<usize>() {
+            return v; // 0 = disabled
+        }
+    }
+    cfg.and_then(|c| c.sliding_window)
+        .map(|x| x as usize)
+        .unwrap_or(128)
+        .max(0)
+}
+
+/// Keep only the last `window` tokens of a NHD-style cache `[S * width]`.
+///
+/// `width` is `heads * head_dim` (expanded) or `head_dim` (compressed MQA).
+fn slice_kv_window(
+    k: Vec<f32>,
+    v: Vec<f32>,
+    seq_len: u32,
+    width: usize,
+    window: usize,
+) -> (Vec<f32>, Vec<f32>, u32) {
+    let s = seq_len as usize;
+    if window == 0 || s <= window || width == 0 {
+        return (k, v, seq_len);
+    }
+    let keep = window;
+    let start = s - keep;
+    let byte_start = start * width;
+    let need = keep * width;
+    let k_out = if k.len() >= byte_start + need {
+        k[byte_start..byte_start + need].to_vec()
+    } else {
+        k
+    };
+    let v_out = if v.len() >= byte_start + need {
+        v[byte_start..byte_start + need].to_vec()
+    } else {
+        v
+    };
+    (k_out, v_out, keep as u32)
+}
+
+/// Apply sliding window (optional) then MQA expand for KernelBackend.
+fn prepare_kv_for_decode(
+    multihead: bool,
+    k_cache: Vec<f32>,
+    v_cache: Vec<f32>,
+    seq_len: u32,
+    n_q: usize,
+    head_dim: usize,
+    window: usize,
+) -> (Vec<f32>, Vec<f32>, u32) {
+    let width = if multihead {
+        head_dim.max(1)
+    } else {
+        (n_q * head_dim).max(1)
+    };
+    let (k, v, sl) = slice_kv_window(k_cache, v_cache, seq_len, width, window);
+    if multihead {
+        (
+            expand_kv_mqa(&k, sl as usize, n_q, head_dim),
+            expand_kv_mqa(&v, sl as usize, n_q, head_dim),
+            sl,
+        )
+    } else {
+        (k, v, sl)
+    }
 }
 
 fn matvec(w: &[f32], out_dim: usize, in_dim: usize, x: &[f32]) -> Vec<f32> {
@@ -1198,6 +1280,8 @@ pub struct LocalWeightRunner {
     n_q_heads: usize,
     /// Per-head dim (= kv_lora when multihead).
     head_dim: usize,
+    /// Sliding-window size for attention (0 = full context).
+    sliding_window: usize,
 }
 
 impl LocalWeightRunner {
@@ -1234,6 +1318,11 @@ impl LocalWeightRunner {
         // Multi-head MQA: store compressed KV (1 head × kv_lora); expand for Q heads at kernel time.
         let (multihead, n_q_heads, head_dim, pool_heads, pool_dim) =
             resolve_attn_layout(&weights, &cfg);
+        let sliding_window = {
+            use crate::weights::HfModelConfig;
+            let hf = cfg.model_dir.as_ref().and_then(|d| HfModelConfig::load(d).ok());
+            resolve_sliding_window(hf.as_ref())
+        };
         let kernel = select_kernel(cfg.prefer_flashinfer);
         info!(
             kernel = kernel.name(),
@@ -1242,6 +1331,7 @@ impl LocalWeightRunner {
             head_dim,
             pool_heads,
             pool_dim,
+            sliding_window,
             "LocalWeightRunner attention kernel"
         );
         Self {
@@ -1253,6 +1343,7 @@ impl LocalWeightRunner {
             multihead,
             n_q_heads,
             head_dim,
+            sliding_window,
         }
     }
 
@@ -1465,16 +1556,15 @@ impl InferenceBackend for LocalWeightRunner {
                             let (k_cache, v_cache, seq_len) = self.kv.lock().materialize_kv(&pfx);
                             let mut attn_out = vec![0.0f32; self.weights.hidden];
                             if seq_len > 0 {
-                                let k_exp = if self.multihead {
-                                    expand_kv_mqa(&k_cache, seq_len as usize, n_q, head_dim)
-                                } else {
-                                    k_cache
-                                };
-                                let v_exp = if self.multihead {
-                                    expand_kv_mqa(&v_cache, seq_len as usize, n_q, head_dim)
-                                } else {
-                                    v_cache
-                                };
+                                let (k_exp, v_exp, seq_len) = prepare_kv_for_decode(
+    self.multihead,
+    k_cache,
+    v_cache,
+    seq_len,
+    n_q,
+    head_dim,
+    self.sliding_window,
+);
                                 if let Ok(dec) = self
                                     .kernel
                                     .decode(DecodeRequest {
@@ -1547,16 +1637,15 @@ impl InferenceBackend for LocalWeightRunner {
                             apply_rope_heads(&mut qq, n_q, head_dim, rd, pos, rope_theta, false);
                             let (k_cache, v_cache, seq_len) = self.kv.lock().materialize_kv(&pfx);
                             if seq_len > 0 {
-                                let k_exp = if self.multihead {
-                                    expand_kv_mqa(&k_cache, seq_len as usize, n_q, head_dim)
-                                } else {
-                                    k_cache
-                                };
-                                let v_exp = if self.multihead {
-                                    expand_kv_mqa(&v_cache, seq_len as usize, n_q, head_dim)
-                                } else {
-                                    v_cache
-                                };
+                                let (k_exp, v_exp, seq_len) = prepare_kv_for_decode(
+    self.multihead,
+    k_cache,
+    v_cache,
+    seq_len,
+    n_q,
+    head_dim,
+    self.sliding_window,
+);
                                 if let Ok(dec) = self
                                     .kernel
                                     .decode(DecodeRequest {
@@ -1643,16 +1732,15 @@ impl InferenceBackend for LocalWeightRunner {
                 let mut q = self.weights.project_q(&h);
                 q.resize(q_width, 0.0);
                 apply_rope_heads(&mut q, n_q, head_dim, rope_dim, q_pos, rope_theta, false);
-                let k_exp = if self.multihead {
-                    expand_kv_mqa(&k_cache, seq_len as usize, n_q, head_dim)
-                } else {
-                    k_cache
-                };
-                let v_exp = if self.multihead {
-                    expand_kv_mqa(&v_cache, seq_len as usize, n_q, head_dim)
-                } else {
-                    v_cache
-                };
+                let (k_exp, v_exp, seq_len) = prepare_kv_for_decode(
+    self.multihead,
+    k_cache,
+    v_cache,
+    seq_len,
+    n_q,
+    head_dim,
+    self.sliding_window,
+);
                 let dec = self
                     .kernel
                     .decode(DecodeRequest {
@@ -1704,16 +1792,15 @@ impl InferenceBackend for LocalWeightRunner {
                         let mut qq = self.weights.project_q_layer(&block.attn, &x);
                         qq.resize(q_width, 0.0);
                         apply_rope_heads(&mut qq, n_q, head_dim, rd, q_pos, rope_theta, false);
-                        let k_exp = if self.multihead {
-                            expand_kv_mqa(&k_cache, seq_len as usize, n_q, head_dim)
-                        } else {
-                            k_cache
-                        };
-                        let v_exp = if self.multihead {
-                            expand_kv_mqa(&v_cache, seq_len as usize, n_q, head_dim)
-                        } else {
-                            v_cache
-                        };
+                        let (k_exp, v_exp, seq_len) = prepare_kv_for_decode(
+    self.multihead,
+    k_cache,
+    v_cache,
+    seq_len,
+    n_q,
+    head_dim,
+    self.sliding_window,
+);
                         let dec = self
                             .kernel
                             .decode(DecodeRequest {
@@ -1781,16 +1868,15 @@ impl InferenceBackend for LocalWeightRunner {
                         }
                         let q_pos = (seq_len as usize).saturating_sub(1);
                         apply_rope_heads(&mut qq, n_q, head_dim, rd, q_pos, rope_theta, false);
-                        let k_exp = if self.multihead {
-                            expand_kv_mqa(&k_cache, seq_len as usize, n_q, head_dim)
-                        } else {
-                            k_cache
-                        };
-                        let v_exp = if self.multihead {
-                            expand_kv_mqa(&v_cache, seq_len as usize, n_q, head_dim)
-                        } else {
-                            v_cache
-                        };
+                        let (k_exp, v_exp, seq_len) = prepare_kv_for_decode(
+    self.multihead,
+    k_cache,
+    v_cache,
+    seq_len,
+    n_q,
+    head_dim,
+    self.sliding_window,
+);
                         let dec = self
                             .kernel
                             .decode(DecodeRequest {
@@ -1950,6 +2036,7 @@ impl InferenceBackend for LocalWeightRunner {
             has_hc = self.weights.has_hc(),
             has_hc_head = self.weights.hc_head.is_some(),
             hc_mult = hc_mult,
+            sliding_window = self.sliding_window,
             moe_cache = ?self.weights.layers.first().and_then(|l| {
                 l.moe.as_ref().map(|m| m.cache_stats())
             }),
@@ -2102,5 +2189,26 @@ mod tests {
         let h = vec![1.0f32, 2.0];
         let s = expand_hc_streams(&h, 3);
         assert_eq!(s, vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn slice_kv_window_keeps_tail() {
+        // seq=4, width=2 → last 2 tokens
+        let k: Vec<f32> = (0..8).map(|x| x as f32).collect();
+        let v: Vec<f32> = (10..18).map(|x| x as f32).collect();
+        let (k2, v2, sl) = slice_kv_window(k, v, 4, 2, 2);
+        assert_eq!(sl, 2);
+        assert_eq!(k2, vec![4.0, 5.0, 6.0, 7.0]);
+        assert_eq!(v2, vec![14.0, 15.0, 16.0, 17.0]);
+    }
+
+    #[test]
+    fn slice_kv_window_noop_when_short() {
+        let k = vec![1.0f32, 2.0];
+        let v = vec![3.0f32, 4.0];
+        let (k2, v2, sl) = slice_kv_window(k.clone(), v.clone(), 1, 2, 128);
+        assert_eq!(sl, 1);
+        assert_eq!(k2, k);
+        assert_eq!(v2, v);
     }
 }

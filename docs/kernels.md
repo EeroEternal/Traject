@@ -89,14 +89,17 @@ toy char-hash encode and id-list decode.
 ### Layer stack (in-process)
 
 Loads the first **N** DeepSeek-V4 blocks (`TRAJECT_LOCAL_LAYERS`, default **2**,
-max 8). Each layer:
+cap `TRAJECT_LOCAL_LAYERS_MAX` default **16**). Dense layers share one
+safetensors catalog at load. Each layer:
 
 1. **Attention (MQA multi-head):** `attn_norm` + FP8 `wq_a`/`wkv` + norms + `wq_b`  
    Q keeps **H heads × D** (`TRAJECT_ATTN_HEADS`, default 8; model has 64×512).  
    Per-head RMSNorm after `wq_b`. KV is a **single latent (K=V)**, stored compressed
    (`1 × D`) and expanded to H heads at kernel time.
-2. **RoPE + attn_sink:** last `qk_rope_head_dim` (64) dims get base RoPE; inverse RoPE
-   on attention output. Per-head `attn_sink` absorbs softmax mass (CPU kernel).
+2. **RoPE + attn_sink + SWA:** last `qk_rope_head_dim` (64) dims get base RoPE;
+   inverse RoPE on attention output. Per-head `attn_sink` absorbs softmax mass.
+   Decode attends only the last **`sliding_window`** tokens (default 128;
+   `TRAJECT_SLIDING_WINDOW=0` = full context).
 3. **o_proj:** group-concat heads → `wo_a` → `wo_b` (official layout; residual is
    `x += o`, not residual-through-`wo_a`).
 4. **Hyper-Connections (HC):** embed expands to `hc_mult` (4) streams; each block
@@ -106,19 +109,21 @@ max 8). Each layer:
 
 Per-layer KV is keyed `{prefix}:L{i}`. Free drops base + all layer keys.
 
-**Not loaded yet:** full 43-layer production stack (memory); YaRN for compressed
-layers; sparse top-k / indexer.
+**Not loaded yet:** full 43-layer production parity (memory + compress/sparse
+indexer); YaRN for compressed layers.
 
 ```bash
-export TRAJECT_LOCAL_LAYERS=2   # or 1..8
-export TRAJECT_ATTN_HEADS=8     # Q heads (MQA); max 64 for V4 Flash
-export TRAJECT_MOE_CACHE=32     # LRU packed experts per MoE layer
+export TRAJECT_LOCAL_LAYERS=2      # 1..TRAJECT_LOCAL_LAYERS_MAX (default cap 16)
+export TRAJECT_LOCAL_LAYERS_MAX=16 # raise toward 43 only with enough RAM
+export TRAJECT_ATTN_HEADS=8        # Q heads (MQA); max 64 for V4 Flash
+export TRAJECT_SLIDING_WINDOW=128  # 0 = disable SWA
+export TRAJECT_MOE_CACHE=32        # LRU packed experts per MoE layer
 cargo run -p traject-cli --release -- \
   --local-runner --model /path/to/ds-v4-flash --max-tokens 4 "hello"
 ```
 
 Routed MoE keeps a **live `SafetensorCatalog`** (mmap reuse) and an **LRU** of
-**packed FP4** experts. Chunk logs report `multihead`, `n_q_heads`, `moe_cache`.
+**packed FP4** experts. Chunk logs report `multihead`, `sliding_window`, `moe_cache`.
 
 ## Status
 
@@ -139,5 +144,6 @@ Routed MoE keeps a **live `SafetensorCatalog`** (mmap reuse) and an **LRU** of
 - [x] MLA RoPE (last 64 dims) + inverse RoPE on o + `attn_sink` + K=V  
 - [x] o_proj group-concat (official `wo_a` layout)  
 - [x] Hyper-Connections residual (`hc_*` + Sinkhorn + `hc_head`)  
-
+- [x] Shared dense safetensors catalog + raised layer cap (`TRAJECT_LOCAL_LAYERS_MAX`)  
+- [x] Sliding-window attention (`sliding_window` / `TRAJECT_SLIDING_WINDOW`)  
 - [ ] Full 43-layer production parity (still sglang for prod MoE)  

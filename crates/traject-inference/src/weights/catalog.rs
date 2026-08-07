@@ -55,12 +55,10 @@ impl SafetensorCatalog {
         }
         let index_path = root.join("model.safetensors.index.json");
         let weight_map = if index_path.exists() {
-            let raw = std::fs::read_to_string(&index_path).map_err(|e| {
-                TrajectError::Other(format!("read index: {e}"))
-            })?;
-            let idx: IndexFile = serde_json::from_str(&raw).map_err(|e| {
-                TrajectError::Other(format!("parse index: {e}"))
-            })?;
+            let raw = std::fs::read_to_string(&index_path)
+                .map_err(|e| TrajectError::Other(format!("read index: {e}")))?;
+            let idx: IndexFile = serde_json::from_str(&raw)
+                .map_err(|e| TrajectError::Other(format!("parse index: {e}")))?;
             idx.weight_map
         } else {
             // Single-file or discover first *.safetensors and list keys lazily later.
@@ -83,9 +81,8 @@ impl SafetensorCatalog {
             return Ok(self.root.join(rel));
         }
         // Fallback: scan single safetensors files in root.
-        let entries = std::fs::read_dir(&self.root).map_err(|e| {
-            TrajectError::Other(format!("read dir: {e}"))
-        })?;
+        let entries = std::fs::read_dir(&self.root)
+            .map_err(|e| TrajectError::Other(format!("read dir: {e}")))?;
         for e in entries.flatten() {
             let p = e.path();
             if p.extension().and_then(|s| s.to_str()) == Some("safetensors") {
@@ -110,12 +107,10 @@ impl SafetensorCatalog {
     fn ensure_mmap(&mut self, shard: &Path) -> Result<&Mmap> {
         let key = shard.to_string_lossy().into_owned();
         if !self.open.contains_key(&key) {
-            let file = File::open(shard).map_err(|e| {
-                TrajectError::Other(format!("open {}: {e}", shard.display()))
-            })?;
-            let mmap = unsafe { Mmap::map(&file) }.map_err(|e| {
-                TrajectError::Other(format!("mmap {}: {e}", shard.display()))
-            })?;
+            let file = File::open(shard)
+                .map_err(|e| TrajectError::Other(format!("open {}: {e}", shard.display())))?;
+            let mmap = unsafe { Mmap::map(&file) }
+                .map_err(|e| TrajectError::Other(format!("mmap {}: {e}", shard.display())))?;
             self.open.insert(key.clone(), mmap);
         }
         Ok(self.open.get(&key).expect("just inserted"))
@@ -125,16 +120,14 @@ impl SafetensorCatalog {
     pub fn load_f32(&mut self, name: &str) -> Result<TensorF32> {
         let shard = self.shard_for(name)?;
         let mmap = self.ensure_mmap(&shard)?;
-        let st = SafeTensors::deserialize(mmap).map_err(|e| {
-            TrajectError::Other(format!("deserialize {}: {e}", shard.display()))
-        })?;
-        let view = st.tensor(name).map_err(|e| {
-            TrajectError::Other(format!("tensor `{name}`: {e}"))
-        })?;
+        let st = SafeTensors::deserialize(mmap)
+            .map_err(|e| TrajectError::Other(format!("deserialize {}: {e}", shard.display())))?;
+        let view = st
+            .tensor(name)
+            .map_err(|e| TrajectError::Other(format!("tensor `{name}`: {e}")))?;
         let shape: Vec<usize> = view.shape().to_vec();
-        let data = bytes_to_f32_vec(view.data(), view.dtype()).map_err(|e| {
-            TrajectError::Other(format!("decode `{name}`: {e}"))
-        })?;
+        let data = bytes_to_f32_vec(view.data(), view.dtype())
+            .map_err(|e| TrajectError::Other(format!("decode `{name}`: {e}")))?;
         let expected: usize = shape.iter().product();
         if data.len() != expected {
             return Err(TrajectError::Other(format!(
@@ -199,7 +192,11 @@ impl SafetensorCatalog {
     /// Load DeepSeek FP4 expert weight: packed `I8` + `F8_E8M0` scale, block_k=32.
     ///
     /// Returns dequantized f32 with logical shape `[rows, packed_cols * 2]`.
-    pub fn load_fp4_block_scaled(&mut self, weight_name: &str, block_k: usize) -> Result<TensorF32> {
+    pub fn load_fp4_block_scaled(
+        &mut self,
+        weight_name: &str,
+        block_k: usize,
+    ) -> Result<TensorF32> {
         let scale_name = if weight_name.ends_with(".weight") {
             format!("{}.scale", weight_name.trim_end_matches(".weight"))
         } else {
@@ -275,21 +272,19 @@ impl SafetensorCatalog {
     fn load_raw(&mut self, name: &str) -> Result<(Vec<u8>, Vec<usize>, safetensors::Dtype)> {
         let shard = self.shard_for(name)?;
         let mmap = self.ensure_mmap(&shard)?;
-        let st = SafeTensors::deserialize(mmap).map_err(|e| {
-            TrajectError::Other(format!("deserialize {}: {e}", shard.display()))
-        })?;
-        let view = st.tensor(name).map_err(|e| {
-            TrajectError::Other(format!("tensor `{name}`: {e}"))
-        })?;
+        let st = SafeTensors::deserialize(mmap)
+            .map_err(|e| TrajectError::Other(format!("deserialize {}: {e}", shard.display())))?;
+        let view = st
+            .tensor(name)
+            .map_err(|e| TrajectError::Other(format!("tensor `{name}`: {e}")))?;
         Ok((view.data().to_vec(), view.shape().to_vec(), view.dtype()))
     }
 
     pub fn has(&self, name: &str) -> bool {
-        self.weight_map.contains_key(name)
-            || {
-                // avoid recursive error noise on missing single-file fallback
-                self.shard_for(name).is_ok()
-            }
+        self.weight_map.contains_key(name) || {
+            // avoid recursive error noise on missing single-file fallback
+            self.shard_for(name).is_ok()
+        }
     }
 }
 
@@ -404,6 +399,14 @@ fn load_weight_fp8_or_f32(cat: &mut SafetensorCatalog, names: &[&str]) -> Result
 /// Load attention weights for `layers.{layer}` (DeepSeek-V4 MLA path).
 pub fn load_layer_attn(model_dir: &Path, layer: usize) -> Result<Layer0AttnWeights> {
     let mut cat = SafetensorCatalog::open(model_dir)?;
+    load_layer_attn_into(&mut cat, model_dir, layer)
+}
+
+fn load_layer_attn_into(
+    mut cat: &mut SafetensorCatalog,
+    model_dir: &Path,
+    layer: usize,
+) -> Result<Layer0AttnWeights> {
     let norm_names = [
         format!("layers.{layer}.attn_norm.weight"),
         format!("model.layers.{layer}.input_layernorm.weight"),
@@ -906,11 +909,7 @@ impl Clone for Layer0RoutedMoe {
                 open: HashMap::new(),
             }
         });
-        let cap = self
-            .cache
-            .lock()
-            .map(|c| c.cap)
-            .unwrap_or(32);
+        let cap = self.cache.lock().map(|c| c.cap).unwrap_or(32);
         Self {
             model_dir: self.model_dir.clone(),
             layer: self.layer,
@@ -994,18 +993,9 @@ fn load_fp4_expert_packed(
     layer: usize,
     id: usize,
 ) -> Result<ExpertPacked> {
-    let w1 = cat.load_fp4_packed(
-        &format!("layers.{layer}.ffn.experts.{id}.w1.weight"),
-        32,
-    )?;
-    let w2 = cat.load_fp4_packed(
-        &format!("layers.{layer}.ffn.experts.{id}.w2.weight"),
-        32,
-    )?;
-    let w3 = cat.load_fp4_packed(
-        &format!("layers.{layer}.ffn.experts.{id}.w3.weight"),
-        32,
-    )?;
+    let w1 = cat.load_fp4_packed(&format!("layers.{layer}.ffn.experts.{id}.w1.weight"), 32)?;
+    let w2 = cat.load_fp4_packed(&format!("layers.{layer}.ffn.experts.{id}.w2.weight"), 32)?;
+    let w3 = cat.load_fp4_packed(&format!("layers.{layer}.ffn.experts.{id}.w3.weight"), 32)?;
     Ok(ExpertPacked {
         w1,
         w2,
@@ -1019,9 +1009,7 @@ pub fn load_layer_routed_moe(model_dir: &Path, layer: usize) -> Result<Layer0Rou
     let mut cat = SafetensorCatalog::open(model_dir)?;
     let gate_name = format!("layers.{layer}.ffn.gate.weight");
     if !cat.has(&gate_name) {
-        return Err(TrajectError::Other(format!(
-            "{gate_name} not found"
-        )));
+        return Err(TrajectError::Other(format!("{gate_name} not found")));
     }
     let gate = cat.load_f32(&gate_name)?;
     if gate.shape.len() != 2 {
@@ -1099,6 +1087,14 @@ pub fn load_layer_routed_moe(model_dir: &Path, layer: usize) -> Result<Layer0Rou
 /// Load shared-expert SwiGLU for `layers.{layer}`.
 pub fn load_layer_shared_ffn(model_dir: &Path, layer: usize) -> Result<Layer0SharedFfn> {
     let mut cat = SafetensorCatalog::open(model_dir)?;
+    load_layer_shared_ffn_into(&mut cat, model_dir, layer)
+}
+
+fn load_layer_shared_ffn_into(
+    mut cat: &mut SafetensorCatalog,
+    model_dir: &Path,
+    layer: usize,
+) -> Result<Layer0SharedFfn> {
     let mut ffn_norm = None;
     for n in [
         format!("layers.{layer}.ffn_norm.weight"),
@@ -1177,7 +1173,6 @@ pub fn load_layer_shared_ffn(model_dir: &Path, layer: usize) -> Result<Layer0Sha
     })
 }
 
-
 /// Backward-compatible layer-0 loaders.
 pub fn load_layer0_attn(model_dir: &Path) -> Result<Layer0AttnWeights> {
     load_layer_attn(model_dir, 0)
@@ -1236,6 +1231,14 @@ pub struct HcHeadWeights {
 /// Load layer HC parameters (soft-fail if missing).
 pub fn load_layer_hc(model_dir: &Path, layer: usize) -> Result<LayerHcWeights> {
     let mut cat = SafetensorCatalog::open(model_dir)?;
+    load_layer_hc_into(&mut cat, model_dir, layer)
+}
+
+fn load_layer_hc_into(
+    cat: &mut SafetensorCatalog,
+    model_dir: &Path,
+    layer: usize,
+) -> Result<LayerHcWeights> {
     let (hc_mult, sinkhorn_iters, eps, norm_eps) = {
         use crate::weights::HfModelConfig;
         match HfModelConfig::load(model_dir) {
@@ -1286,11 +1289,7 @@ pub fn load_layer_hc(model_dir: &Path, layer: usize) -> Result<LayerHcWeights> {
     }
     info!(
         layer,
-        hc_mult,
-        hidden,
-        mix_hc,
-        sinkhorn_iters,
-        "loaded layer Hyper-Connection weights"
+        hc_mult, hidden, mix_hc, sinkhorn_iters, "loaded layer Hyper-Connection weights"
     );
     Ok(LayerHcWeights {
         hc_mult,
@@ -1359,14 +1358,19 @@ pub fn load_hc_head(model_dir: &Path) -> Result<HcHeadWeights> {
 }
 
 /// Load the first `n_layers` transformer blocks (attn + shared FFN + routed MoE + HC).
+///
+/// Reuses one [`SafetensorCatalog`] for dense attn/FFN/HC tensors. Each routed MoE
+/// layer still opens its own catalog (kept live for lazy expert loads).
 pub fn load_layer_stack(model_dir: &Path, n_layers: usize) -> Result<Vec<LayerBlock>> {
     let n = n_layers.max(1);
+    let mut cat = SafetensorCatalog::open(model_dir)?;
     let mut out = Vec::with_capacity(n);
     for layer in 0..n {
-        let attn = load_layer_attn(model_dir, layer)?;
-        let ffn = load_layer_shared_ffn(model_dir, layer).ok();
+        let attn = load_layer_attn_into(&mut cat, model_dir, layer)?;
+        let ffn = load_layer_shared_ffn_into(&mut cat, model_dir, layer).ok();
+        // MoE keeps its own catalog for expert LRU; separate open is intentional.
         let moe = load_layer_routed_moe(model_dir, layer).ok();
-        let hc = match load_layer_hc(model_dir, layer) {
+        let hc = match load_layer_hc_into(&mut cat, model_dir, layer) {
             Ok(h) => Some(h),
             Err(e) => {
                 warn!(layer, error = %e, "layer HC weights missing; simple residual");
@@ -1387,7 +1391,12 @@ pub fn load_layer_stack(model_dir: &Path, n_layers: usize) -> Result<Vec<LayerBl
             hc,
         });
     }
-    info!(n_layers = n, dir = %model_dir.display(), "loaded layer stack");
+    info!(
+        n_layers = n,
+        dir = %model_dir.display(),
+        shared_catalog = true,
+        "loaded layer stack"
+    );
     Ok(out)
 }
 
@@ -1421,7 +1430,11 @@ pub fn load_embed_head_norm(
         "output.weight",
         "model.embed_tokens.weight", // tied
     ];
-    let norm_names = ["norm.weight", "model.norm.weight", "transformer.ln_f.weight"];
+    let norm_names = [
+        "norm.weight",
+        "model.norm.weight",
+        "transformer.ln_f.weight",
+    ];
 
     let mut embed = None;
     let mut embed_key = String::new();
@@ -1479,9 +1492,7 @@ mod tests {
     fn load_single_file_roundtrip() {
         let dir = tempfile_dir();
         // tiny embed 4x3 f32
-        let data: Vec<u8> = (0..12u32)
-            .flat_map(|i| (i as f32).to_le_bytes())
-            .collect();
+        let data: Vec<u8> = (0..12u32).flat_map(|i| (i as f32).to_le_bytes()).collect();
         let tensor = TensorView::new(Dtype::F32, vec![4, 3], &data).unwrap();
         let mut tensors = std::collections::BTreeMap::new();
         tensors.insert("embed.weight".to_string(), tensor);

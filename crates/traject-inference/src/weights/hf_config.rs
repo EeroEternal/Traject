@@ -55,6 +55,9 @@ pub struct HfModelConfig {
     /// HC epsilon (default 1e-6).
     #[serde(default)]
     pub hc_eps: Option<f32>,
+    /// Sliding-window size for pure SWA layers (V4 Flash: 128).
+    #[serde(default, alias = "window_size")]
+    pub sliding_window: Option<u32>,
 }
 
 fn default_vocab() -> u32 {
