@@ -47,7 +47,8 @@
 - [x] Sparse window + strided history KV gather for compress layers
 - [x] Learned KV compressor (gated pooling → compress pool)
 - [x] Learned indexer top-k over compress pool (ratio-4 layers)
-- [ ] Full 43-layer production parity in-process (prod MoE remains sglang-lite)
+- [x] Shared MoE catalog across layers + `TRAJECT_LOCAL_LAYERS` up to full model depth
+- [ ] Quality/perf parity with sglang-lite for in-process 43-layer runs
 - [x] Tool latency-aware pin TTL from histograms (`ToolLatencyTracker` p95)
 - [x] Prefetch pin after tool return (`PinReason::Prefetch`)
 - [x] Engine `/v1/prefix/pin|unpin|free` + Driver client (soft-fail if offline)
