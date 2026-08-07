@@ -253,6 +253,83 @@ pub fn bytes_to_f32_vec(data: &[u8], dtype: safetensors::Dtype) -> Result<Vec<f3
     }
 }
 
+/// Fused matvec for block-scaled FP8: `y = (e4m3 * e8m0_scale) @ x` without full dequant.
+///
+/// Weight `[rows, cols]` e4m3, scale `[ceil(rows/B), ceil(cols/B)]` e8m0, block `B` (V4: 128).
+pub fn matvec_fp8_block_scaled(
+    weight_e4m3: &[u8],
+    rows: usize,
+    cols: usize,
+    scale_e8m0: &[u8],
+    scale_rows: usize,
+    scale_cols: usize,
+    block: usize,
+    x: &[f32],
+) -> Result<Vec<f32>, String> {
+    let block = block.max(1);
+    if x.len() < cols {
+        return Err(format!("fp8 matvec x len {} < cols {cols}", x.len()));
+    }
+    if weight_e4m3.len() != rows * cols {
+        return Err(format!(
+            "fp8 matvec weight len {} != rows*cols {}",
+            weight_e4m3.len(),
+            rows * cols
+        ));
+    }
+    if scale_e8m0.len() < scale_rows * scale_cols {
+        return Err(format!(
+            "fp8 matvec scale len {} < scale_rows*scale_cols {}",
+            scale_e8m0.len(),
+            scale_rows * scale_cols
+        ));
+    }
+    let mut y = vec![0.0f32; rows];
+    for i in 0..rows {
+        let si = i / block;
+        let mut acc = 0.0f32;
+        let row_off = i * cols;
+        for j in 0..cols {
+            let sj = j / block;
+            let w = e4m3_bits_to_f32(weight_e4m3[row_off + j]);
+            let s = e8m0_bits_to_f32(scale_e8m0[si * scale_cols + sj]);
+            acc += w * s * x[j];
+        }
+        y[i] = acc;
+    }
+    Ok(y)
+}
+
+/// Dot product of one FP8 row with `x` (same scaling as [`matvec_fp8_block_scaled`]).
+pub fn row_dot_fp8_block_scaled(
+    weight_e4m3: &[u8],
+    rows: usize,
+    cols: usize,
+    scale_e8m0: &[u8],
+    scale_cols: usize,
+    block: usize,
+    row: usize,
+    x: &[f32],
+) -> Result<f32, String> {
+    if row >= rows {
+        return Err(format!("fp8 row_dot row {row} >= rows {rows}"));
+    }
+    if x.len() < cols {
+        return Err(format!("fp8 row_dot x len {} < cols {cols}", x.len()));
+    }
+    let block = block.max(1);
+    let si = row / block;
+    let row_off = row * cols;
+    let mut acc = 0.0f32;
+    for j in 0..cols {
+        let sj = j / block;
+        let w = e4m3_bits_to_f32(weight_e4m3[row_off + j]);
+        let s = e8m0_bits_to_f32(scale_e8m0[si * scale_cols + sj]);
+        acc += w * s * x[j];
+    }
+    Ok(acc)
+}
+
 /// Block-scaled FP8 dequant: `weight[out,in]` with `scale[out/B, in/B]`, block size `B`.
 ///
 /// DeepSeek-V4 uses B=128: e4m3 weights × e8m0 scales.
@@ -341,6 +418,25 @@ mod tests {
         for v in out {
             assert!((v - 2.25).abs() < 1e-5, "v={v}");
         }
+    }
+
+    #[test]
+    fn fp8_matvec_matches_dequant() {
+        // 2x2, block=2, all weights 2.25, scale 1.0
+        let w = [65u8, 65, 65, 65];
+        let s = [127u8];
+        let x = [1.0f32, 2.0];
+        let deq = dequant_fp8_block_scaled(&w, &[2, 2], &s, &[1, 1], 2).unwrap();
+        let y_ref = [
+            deq[0] * x[0] + deq[1] * x[1],
+            deq[2] * x[0] + deq[3] * x[1],
+        ];
+        let y = matvec_fp8_block_scaled(&w, 2, 2, &s, 1, 1, 2, &x).unwrap();
+        for (a, b) in y.iter().zip(y_ref.iter()) {
+            assert!((a - b).abs() < 1e-5, "{a} vs {b}");
+        }
+        let d0 = row_dot_fp8_block_scaled(&w, 2, 2, &s, 1, 2, 0, &x).unwrap();
+        assert!((d0 - y_ref[0]).abs() < 1e-5);
     }
 
     #[test]

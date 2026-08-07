@@ -89,10 +89,11 @@ toy char-hash encode and id-list decode.
 ### Layer stack (in-process)
 
 Loads the first **N** DeepSeek-V4 blocks (`TRAJECT_LOCAL_LAYERS`, default **2**,
-cap `TRAJECT_LOCAL_LAYERS_MAX` default **16**). Dense layers share one
-safetensors catalog at load. Each layer:
+cap `TRAJECT_LOCAL_LAYERS_MAX` default **32**). Dense layers share one
+safetensors catalog at load and keep **packed FP8** weights (fused matvec, no
+full f32 expand). Each layer:
 
-1. **Attention (MQA multi-head):** `attn_norm` + FP8 `wq_a`/`wkv` + norms + `wq_b`  
+1. **Attention (MQA multi-head):** `attn_norm` + packed FP8 `wq_a`/`wkv`/`wq_b`  
    Q keeps **H heads × D** (`TRAJECT_ATTN_HEADS`, default 8; model has 64×512).  
    Per-head RMSNorm after `wq_b`. KV is a **single latent (K=V)**, stored compressed
    (`1 × D`) and expanded to H heads at kernel time.
@@ -109,12 +110,12 @@ safetensors catalog at load. Each layer:
 
 Per-layer KV is keyed `{prefix}:L{i}`. Free drops base + all layer keys.
 
-**Not loaded yet:** full 43-layer production parity (memory + compress/sparse
-indexer); YaRN for compressed layers.
+**Not loaded yet:** full 43-layer production parity (compress/sparse indexer,
+YaRN); optional GPU kernels for dense FP8 matvec.
 
 ```bash
-export TRAJECT_LOCAL_LAYERS=2      # 1..TRAJECT_LOCAL_LAYERS_MAX (default cap 16)
-export TRAJECT_LOCAL_LAYERS_MAX=16 # raise toward 43 only with enough RAM
+export TRAJECT_LOCAL_LAYERS=2      # 1..TRAJECT_LOCAL_LAYERS_MAX (default cap 32)
+export TRAJECT_LOCAL_LAYERS_MAX=32 # raise toward 43 when RAM allows
 export TRAJECT_ATTN_HEADS=8        # Q heads (MQA); max 64 for V4 Flash
 export TRAJECT_SLIDING_WINDOW=128  # 0 = disable SWA
 export TRAJECT_MOE_CACHE=32        # LRU packed experts per MoE layer
@@ -122,8 +123,8 @@ cargo run -p traject-cli --release -- \
   --local-runner --model /path/to/ds-v4-flash --max-tokens 4 "hello"
 ```
 
-Routed MoE keeps a **live `SafetensorCatalog`** (mmap reuse) and an **LRU** of
-**packed FP4** experts. Chunk logs report `multihead`, `sliding_window`, `moe_cache`.
+Dense attn/FFN use **packed FP8** fused matvec; routed MoE uses **packed FP4**.
+Chunk logs report `multihead`, `sliding_window`, `packed_fp8`, `moe_cache`.
 
 ## Status
 
@@ -146,4 +147,5 @@ Routed MoE keeps a **live `SafetensorCatalog`** (mmap reuse) and an **LRU** of
 - [x] Hyper-Connections residual (`hc_*` + Sinkhorn + `hc_head`)  
 - [x] Shared dense safetensors catalog + raised layer cap (`TRAJECT_LOCAL_LAYERS_MAX`)  
 - [x] Sliding-window attention (`sliding_window` / `TRAJECT_SLIDING_WINDOW`)  
+- [x] Packed FP8 dense weights + fused matvec (attn + shared FFN)  
 - [ ] Full 43-layer production parity (still sglang for prod MoE)  

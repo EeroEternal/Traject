@@ -12,6 +12,7 @@ use traject_core::{Result, TrajectError};
 
 use super::dtype::{
     bytes_to_f32_vec, dequant_fp4_block_scaled, dequant_fp8_block_scaled, matvec_fp4_block_scaled,
+    matvec_fp8_block_scaled, row_dot_fp8_block_scaled,
 };
 
 #[derive(Debug, Deserialize)]
@@ -32,6 +33,110 @@ impl TensorF32 {
     }
     pub fn cols(&self) -> usize {
         self.shape.get(1).copied().unwrap_or(1)
+    }
+}
+
+/// Packed FP8 e4m3 + e8m0 block scales (no full f32 expand).
+#[derive(Debug, Clone)]
+pub struct PackedFp8Mat {
+    pub weight: Vec<u8>,
+    pub rows: usize,
+    pub cols: usize,
+    pub scale: Vec<u8>,
+    pub scale_rows: usize,
+    pub scale_cols: usize,
+    pub block: usize,
+}
+
+impl PackedFp8Mat {
+    pub fn matvec(&self, x: &[f32]) -> Result<Vec<f32>> {
+        matvec_fp8_block_scaled(
+            &self.weight,
+            self.rows,
+            self.cols,
+            &self.scale,
+            self.scale_rows,
+            self.scale_cols,
+            self.block,
+            x,
+        )
+        .map_err(|e| TrajectError::Other(e))
+    }
+
+    pub fn row_dot(&self, row: usize, x: &[f32]) -> Result<f32> {
+        row_dot_fp8_block_scaled(
+            &self.weight,
+            self.rows,
+            self.cols,
+            &self.scale,
+            self.scale_cols,
+            self.block,
+            row,
+            x,
+        )
+        .map_err(|e| TrajectError::Other(e))
+    }
+}
+
+/// Dense linear weight: f32 dequant **or** packed FP8 (preferred for V4).
+#[derive(Debug, Clone)]
+pub enum LinearMat {
+    F32(TensorF32),
+    Fp8(PackedFp8Mat),
+}
+
+impl LinearMat {
+    pub fn rows(&self) -> usize {
+        match self {
+            LinearMat::F32(t) => t.rows(),
+            LinearMat::Fp8(p) => p.rows,
+        }
+    }
+    pub fn cols(&self) -> usize {
+        match self {
+            LinearMat::F32(t) => t.cols(),
+            LinearMat::Fp8(p) => p.cols,
+        }
+    }
+    pub fn is_fp8(&self) -> bool {
+        matches!(self, LinearMat::Fp8(_))
+    }
+    /// `y = W @ x` with `W` shape `[rows, cols]`.
+    pub fn matvec(&self, x: &[f32]) -> Vec<f32> {
+        match self {
+            LinearMat::F32(t) => {
+                let rows = t.rows();
+                let cols = t.cols().max(1);
+                let mut y = vec![0.0f32; rows];
+                for i in 0..rows {
+                    let row = &t.data[i * cols..(i + 1) * cols];
+                    let mut s = 0.0f32;
+                    for (a, b) in row.iter().zip(x.iter()) {
+                        s += a * b;
+                    }
+                    y[i] = s;
+                }
+                y
+            }
+            LinearMat::Fp8(p) => p.matvec(x).unwrap_or_else(|_| vec![0.0; p.rows]),
+        }
+    }
+    pub fn row_dot(&self, row: usize, x: &[f32]) -> f32 {
+        match self {
+            LinearMat::F32(t) => {
+                let cols = t.cols().max(1);
+                if row >= t.rows() || x.len() < cols {
+                    return 0.0;
+                }
+                let r = &t.data[row * cols..(row + 1) * cols];
+                let mut s = 0.0f32;
+                for (a, b) in r.iter().zip(x.iter()) {
+                    s += a * b;
+                }
+                s
+            }
+            LinearMat::Fp8(p) => p.row_dot(row, x).unwrap_or(0.0),
+        }
     }
 }
 
@@ -189,6 +294,56 @@ impl SafetensorCatalog {
         })
     }
 
+    /// Load FP8 weight **packed** (no f32 expand). Prefer for dense attn/FFN.
+    pub fn load_fp8_packed(&mut self, weight_name: &str, block: usize) -> Result<PackedFp8Mat> {
+        let scale_name = if weight_name.ends_with(".weight") {
+            format!("{}.scale", weight_name.trim_end_matches(".weight"))
+        } else {
+            format!("{weight_name}.scale")
+        };
+        if !self.has(&scale_name) {
+            return Err(TrajectError::Other(format!(
+                "no scale tensor for `{weight_name}` (expected `{scale_name}`)"
+            )));
+        }
+        let (w_bytes, w_shape, w_dtype) = self.load_raw(weight_name)?;
+        let (s_bytes, s_shape, s_dtype) = self.load_raw(&scale_name)?;
+        if w_dtype != safetensors::Dtype::F8_E4M3 {
+            return Err(TrajectError::Other(format!(
+                "`{weight_name}` dtype {w_dtype:?}, expected F8_E4M3"
+            )));
+        }
+        if s_dtype != safetensors::Dtype::F8_E8M0 {
+            return Err(TrajectError::Other(format!(
+                "`{scale_name}` dtype {s_dtype:?}, expected F8_E8M0"
+            )));
+        }
+        if w_shape.len() != 2 || s_shape.len() != 2 {
+            return Err(TrajectError::Other(format!(
+                "fp8 packed expects 2D weight/scale, got {w_shape:?} / {s_shape:?}"
+            )));
+        }
+        let rows = w_shape[0];
+        let cols = w_shape[1];
+        info!(
+            tensor = weight_name,
+            scale = %scale_name,
+            shape = ?w_shape,
+            block,
+            bytes = w_bytes.len(),
+            "loaded FP8 block-scaled weight packed (no f32 expand)"
+        );
+        Ok(PackedFp8Mat {
+            weight: w_bytes,
+            rows,
+            cols,
+            scale: s_bytes,
+            scale_rows: s_shape[0],
+            scale_cols: s_shape[1],
+            block: block.max(1),
+        })
+    }
+
     /// Load DeepSeek FP4 expert weight: packed `I8` + `F8_E8M0` scale, block_k=32.
     ///
     /// Returns dequantized f32 with logical shape `[rows, packed_cols * 2]`.
@@ -297,22 +452,22 @@ pub struct Layer0AttnWeights {
     pub attn_norm: Vec<f32>,
     pub hidden: usize,
     /// `wq_a`: [q_lora, hidden] — Q down-projection.
-    pub wq_a: TensorF32,
+    pub wq_a: LinearMat,
     /// `wkv`: [kv_lora / head_dim, hidden] — shared MQA latent (K=V).
-    pub wkv: TensorF32,
+    pub wkv: LinearMat,
     /// Optional RMSNorm on q_lora (after `wq_a`).
     pub q_norm: Option<Vec<f32>>,
     /// Optional RMSNorm on kv_lora (after `wkv`).
     pub kv_norm: Option<Vec<f32>>,
     /// Optional `wq_b`: [n_heads * head_dim, q_lora] — expand Q to full heads.
-    pub wq_b: Option<TensorF32>,
+    pub wq_b: Option<LinearMat>,
     /// Head count implied by `wq_b` rows / `kv_lora` (when present).
     pub n_heads: Option<usize>,
     /// Optional `wo_a`: [o_groups * o_lora, heads_per_group * head_dim] —
     /// maps concatenated group heads → o_lora (V4 Flash; often 4096 == hidden).
-    pub wo_a: Option<TensorF32>,
+    pub wo_a: Option<LinearMat>,
     /// Optional `wo_b`: [hidden, o_groups * o_lora] — maps o-intermediate → hidden.
-    pub wo_b: Option<TensorF32>,
+    pub wo_b: Option<LinearMat>,
     /// `o_groups` (default 8 for V4 Flash).
     pub o_groups: usize,
     /// `o_lora_rank` per group (default 1024).
@@ -354,14 +509,15 @@ pub struct Layer0SharedFfn {
     pub hidden: usize,
     pub intermediate: usize,
     /// [intermediate, hidden]
-    pub w1: TensorF32,
+    pub w1: LinearMat,
     /// [hidden, intermediate]
-    pub w2: TensorF32,
+    pub w2: LinearMat,
     /// [intermediate, hidden]
-    pub w3: TensorF32,
+    pub w3: LinearMat,
 }
 
-fn load_weight_fp8_or_f32(cat: &mut SafetensorCatalog, names: &[&str]) -> Result<TensorF32> {
+/// Prefer packed FP8; fall back to f32 dequant / native f32.
+fn load_weight_linear(cat: &mut SafetensorCatalog, names: &[&str]) -> Result<LinearMat> {
     for n in names {
         if !cat.has(n) {
             continue;
@@ -373,22 +529,25 @@ fn load_weight_fp8_or_f32(cat: &mut SafetensorCatalog, names: &[&str]) -> Result
         } else {
             (*n).to_string()
         };
-        // Prefer FP8 block-scaled when a sibling `.scale` exists.
         let scale = if key.ends_with(".weight") {
             format!("{}.scale", key.trim_end_matches(".weight"))
         } else {
             format!("{key}.scale")
         };
         if cat.has(&scale) {
+            if let Ok(p) = cat.load_fp8_packed(&key, 128) {
+                return Ok(LinearMat::Fp8(p));
+            }
+            // Fallback: full dequant (legacy path).
             if let Ok(t) = cat.load_fp8_block_scaled(&key, 128) {
-                return Ok(t);
+                return Ok(LinearMat::F32(t));
             }
         }
         if let Ok(t) = cat.load_f32(&key) {
-            return Ok(t);
+            return Ok(LinearMat::F32(t));
         }
         if let Ok(t) = cat.load_f32(n) {
-            return Ok(t);
+            return Ok(LinearMat::F32(t));
         }
     }
     Err(TrajectError::Other(format!(
@@ -431,26 +590,23 @@ fn load_layer_attn_into(
         format!("model.layers.{layer}.self_attn.q_a_proj.weight"),
     ];
     let wq_a_refs: Vec<&str> = wq_a_names.iter().map(|s| s.as_str()).collect();
-    let wq_a = load_weight_fp8_or_f32(&mut cat, &wq_a_refs)?;
+    let wq_a = load_weight_linear(&mut cat, &wq_a_refs)?;
     let wkv_names = [
         format!("layers.{layer}.attn.wkv.weight"),
         format!("layers.{layer}.attn.wkv"),
         format!("model.layers.{layer}.self_attn.kv_a_proj_with_mqa.weight"),
     ];
     let wkv_refs: Vec<&str> = wkv_names.iter().map(|s| s.as_str()).collect();
-    let wkv = load_weight_fp8_or_f32(&mut cat, &wkv_refs)?;
+    let wkv = load_weight_linear(&mut cat, &wkv_refs)?;
 
-    if wq_a.shape.len() != 2 || wkv.shape.len() != 2 {
-        return Err(TrajectError::Other(format!(
-            "layer-{layer} projections must be 2D, wq_a={:?} wkv={:?}",
-            wq_a.shape, wkv.shape
-        )));
-    }
     let hidden = attn_norm.data.len();
     if wq_a.cols() != hidden || wkv.cols() != hidden {
         return Err(TrajectError::Other(format!(
-            "layer-{layer} in_features mismatch: norm_h={hidden} wq_a={:?} wkv={:?}",
-            wq_a.shape, wkv.shape
+            "layer-{layer} in_features mismatch: norm_h={hidden} wq_a=[{},{}] wkv=[{},{}]",
+            wq_a.rows(),
+            wq_a.cols(),
+            wkv.rows(),
+            wkv.cols()
         )));
     }
 
@@ -470,18 +626,16 @@ fn load_layer_attn_into(
         format!("model.layers.{layer}.self_attn.q_b_proj.weight"),
     ];
     let wq_b_refs: Vec<&str> = wq_b_names.iter().map(|s| s.as_str()).collect();
-    let wq_b = match load_weight_fp8_or_f32(&mut cat, &wq_b_refs) {
+    let wq_b = match load_weight_linear(&mut cat, &wq_b_refs) {
+        Ok(t) if t.cols() == wq_a.rows() => Some(t),
         Ok(t) => {
-            if t.shape.len() == 2 && t.cols() == wq_a.rows() {
-                Some(t)
-            } else {
-                warn!(
-                    shape = ?t.shape,
-                    q_lora = wq_a.rows(),
-                    "wq_b shape incompatible with wq_a; skipping Q expand"
-                );
-                None
-            }
+            warn!(
+                rows = t.rows(),
+                cols = t.cols(),
+                q_lora = wq_a.rows(),
+                "wq_b shape incompatible with wq_a; skipping Q expand"
+            );
+            None
         }
         Err(e) => {
             warn!(error = %e, "wq_b not loaded; Q stays at q_lora");
@@ -542,11 +696,17 @@ fn load_layer_attn_into(
         format!("model.layers.{layer}.self_attn.o_a_proj.weight"),
     ];
     let wo_a_refs: Vec<&str> = wo_a_names.iter().map(|s| s.as_str()).collect();
-    let wo_a = match load_weight_fp8_or_f32(&mut cat, &wo_a_refs) {
-        Ok(t) if t.shape == [o_inter, group_in] || t.shape == [o_inter, hidden] => Some(t),
+    let wo_a = match load_weight_linear(&mut cat, &wo_a_refs) {
+        Ok(t)
+            if (t.rows() == o_inter && t.cols() == group_in)
+                || (t.rows() == o_inter && t.cols() == hidden) =>
+        {
+            Some(t)
+        }
         Ok(t) => {
             warn!(
-                shape = ?t.shape,
+                rows = t.rows(),
+                cols = t.cols(),
                 want_group = ?[o_inter, group_in],
                 "wo_a shape mismatch; skip"
             );
@@ -568,10 +728,15 @@ fn load_layer_attn_into(
         format!("model.layers.{layer}.self_attn.o_b_proj.weight"),
     ];
     let wo_b_refs: Vec<&str> = wo_b_names.iter().map(|s| s.as_str()).collect();
-    let wo_b = match load_weight_fp8_or_f32(&mut cat, &wo_b_refs) {
-        Ok(t) if t.shape == [hidden, o_inter] => Some(t),
+    let wo_b = match load_weight_linear(&mut cat, &wo_b_refs) {
+        Ok(t) if t.rows() == hidden && t.cols() == o_inter => Some(t),
         Ok(t) => {
-            warn!(shape = ?t.shape, want = ?[hidden, o_inter], "wo_b shape mismatch; skip");
+            warn!(
+                rows = t.rows(),
+                cols = t.cols(),
+                want = ?[hidden, o_inter],
+                "wo_b shape mismatch; skip"
+            );
             None
         }
         Err(e) => {
@@ -585,6 +750,7 @@ fn load_layer_attn_into(
         hidden,
         q_lora = wq_a.rows(),
         kv_lora = wkv.rows(),
+        packed_fp8 = wq_a.is_fp8() && wkv.is_fp8(),
         has_q_norm = q_norm.is_some(),
         has_kv_norm = kv_norm.is_some(),
         has_wq_b = wq_b.is_some(),
@@ -1118,40 +1284,38 @@ fn load_layer_shared_ffn_into(
         format!("layers.{layer}.mlp.shared_experts.gate_proj.weight"),
     ];
     let w1r: Vec<&str> = w1n.iter().map(|s| s.as_str()).collect();
-    let w1 = load_weight_fp8_or_f32(&mut cat, &w1r)?;
+    let w1 = load_weight_linear(&mut cat, &w1r)?;
     let w2n = [
         format!("layers.{layer}.ffn.shared_experts.w2.weight"),
         format!("layers.{layer}.ffn.shared_experts.w2"),
         format!("layers.{layer}.mlp.shared_experts.down_proj.weight"),
     ];
     let w2r: Vec<&str> = w2n.iter().map(|s| s.as_str()).collect();
-    let w2 = load_weight_fp8_or_f32(&mut cat, &w2r)?;
+    let w2 = load_weight_linear(&mut cat, &w2r)?;
     let w3n = [
         format!("layers.{layer}.ffn.shared_experts.w3.weight"),
         format!("layers.{layer}.ffn.shared_experts.w3"),
         format!("layers.{layer}.mlp.shared_experts.up_proj.weight"),
     ];
     let w3r: Vec<&str> = w3n.iter().map(|s| s.as_str()).collect();
-    let w3 = load_weight_fp8_or_f32(&mut cat, &w3r)?;
+    let w3 = load_weight_linear(&mut cat, &w3r)?;
 
-    if w1.shape.len() != 2 || w2.shape.len() != 2 || w3.shape.len() != 2 {
-        return Err(TrajectError::Other(format!(
-            "shared ffn weights must be 2D: w1={:?} w2={:?} w3={:?}",
-            w1.shape, w2.shape, w3.shape
-        )));
-    }
     let hidden = ffn_norm.data.len();
     let intermediate = w1.rows();
     if w1.cols() != hidden || w3.cols() != hidden || w3.rows() != intermediate {
         return Err(TrajectError::Other(format!(
-            "shared ffn shape mismatch: hidden={hidden} w1={:?} w3={:?}",
-            w1.shape, w3.shape
+            "shared ffn shape mismatch: hidden={hidden} w1=[{},{}] w3=[{},{}]",
+            w1.rows(),
+            w1.cols(),
+            w3.rows(),
+            w3.cols()
         )));
     }
     if w2.rows() != hidden || w2.cols() != intermediate {
         return Err(TrajectError::Other(format!(
-            "shared ffn w2 shape {:?} want [{hidden}, {intermediate}]",
-            w2.shape
+            "shared ffn w2 shape [{}, {}] want [{hidden}, {intermediate}]",
+            w2.rows(),
+            w2.cols()
         )));
     }
 
@@ -1160,6 +1324,7 @@ fn load_layer_shared_ffn_into(
         hidden,
         intermediate,
         layer,
+        packed_fp8 = w1.is_fp8(),
         "loaded layer shared expert FFN"
     );
 
