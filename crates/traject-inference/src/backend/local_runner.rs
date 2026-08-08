@@ -378,19 +378,24 @@ impl ModelWeights {
         self.rms_norm_with(x, self.norm.as_deref())
     }
 
-    /// Hidden → q_lora (after attn_norm + wq_a + optional q_norm). Used by indexer.
-    fn project_q_lora(&self, layer: &crate::weights::Layer0AttnWeights, h: &[f32]) -> Vec<f32> {
-        let hn = self.rms_norm_with(h, Some(&layer.attn_norm));
-        let mut q = layer.wq_a.matvec(&hn);
+    /// Official Attention expects **already attn_normed** `x`.
+    ///
+    /// `q_lora = q_norm(wq_a(x))` — used by indexer as `qr`.
+    fn project_q_lora(&self, layer: &crate::weights::Layer0AttnWeights, x_normed: &[f32]) -> Vec<f32> {
+        let mut q = layer.wq_a.matvec(x_normed);
         if let Some(ref qn) = layer.q_norm {
             q = self.rms_norm_with(&q, Some(qn));
         }
         q
     }
 
-    /// Hidden → multi-head Q (no RoPE; caller applies position).
-    fn project_q_layer(&self, layer: &crate::weights::Layer0AttnWeights, h: &[f32]) -> Vec<f32> {
-        let q = self.project_q_lora(layer, h);
+    /// Multi-head Q from attn_normed `x` (no RoPE; caller applies position).
+    fn project_q_layer(
+        &self,
+        layer: &crate::weights::Layer0AttnWeights,
+        x_normed: &[f32],
+    ) -> Vec<f32> {
+        let q = self.project_q_lora(layer, x_normed);
         if let Some(ref wq_b) = layer.wq_b {
             let q_full = wq_b.matvec(&q);
             // Keep multi-head Q: first n_q_heads × head_dim (no mean-pool).
@@ -423,14 +428,13 @@ impl ModelWeights {
         out
     }
 
-    /// Hidden → shared MQA latent (K=V). RoPE applied by caller at token pos.
+    /// Shared MQA latent (K=V) from attn_normed `x`. RoPE applied by caller.
     fn project_kv_layer(
         &self,
         layer: &crate::weights::Layer0AttnWeights,
-        h: &[f32],
+        x_normed: &[f32],
     ) -> (Vec<f32>, Vec<f32>) {
-        let hn = self.rms_norm_with(h, Some(&layer.attn_norm));
-        let mut kv = layer.wkv.matvec(&hn);
+        let mut kv = layer.wkv.matvec(x_normed);
         if let Some(ref kn) = layer.kv_norm {
             kv = self.rms_norm_with(&kv, Some(kn));
         }
@@ -442,14 +446,16 @@ impl ModelWeights {
 
     fn project_q(&self, h: &[f32]) -> Vec<f32> {
         if let Some(block) = self.layers.first() {
-            return self.project_q_layer(&block.attn, h);
+            let hn = self.rms_norm_with(h, Some(&block.attn.attn_norm));
+            return self.project_q_layer(&block.attn, &hn);
         }
         matvec(&self.w_down, self.attn_dim, self.hidden, h)
     }
 
     fn project_kv(&self, h: &[f32]) -> (Vec<f32>, Vec<f32>) {
         if let Some(block) = self.layers.first() {
-            return self.project_kv_layer(&block.attn, h);
+            let hn = self.rms_norm_with(h, Some(&block.attn.attn_norm));
+            return self.project_kv_layer(&block.attn, &hn);
         }
         let a = matvec(&self.w_down, self.attn_dim, self.hidden, h);
         let v = a.iter().map(|x| x * 0.5).collect();
@@ -553,12 +559,14 @@ impl ModelWeights {
         matvec(&self.w_up, self.hidden, self.attn_dim, attn_o)
     }
 
-    /// Pure shared-expert SwiGLU (no residual). Applies official `swiglu_limit`.
-    fn shared_ffn_delta(&self, ffn: &crate::weights::Layer0SharedFfn, h: &[f32]) -> Vec<f32> {
-        let n = self.rms_norm_with(h, Some(&ffn.ffn_norm));
-        // SwiGLU with LinearMat (packed FP8 or f32).
-        let mut u = ffn.w1.matvec(&n);
-        let mut g = ffn.w3.matvec(&n);
+    /// Shared-expert SwiGLU on **already ffn_normed** activations.
+    fn shared_ffn_delta_normed(
+        &self,
+        ffn: &crate::weights::Layer0SharedFfn,
+        n: &[f32],
+    ) -> Vec<f32> {
+        let mut u = ffn.w1.matvec(n);
+        let mut g = ffn.w3.matvec(n);
         let limit = ffn.swiglu_limit;
         if limit > 0.0 {
             for v in &mut u {
@@ -575,6 +583,12 @@ impl ModelWeights {
             gated[i] = x * (1.0 / (1.0 + (-x).exp())) * y; // silu(u) * g
         }
         ffn.w2.matvec(&gated)
+    }
+
+    /// Pure shared-expert SwiGLU (applies ffn_norm then SwiGLU).
+    fn shared_ffn_delta(&self, ffn: &crate::weights::Layer0SharedFfn, h: &[f32]) -> Vec<f32> {
+        let n = self.rms_norm_with(h, Some(&ffn.ffn_norm));
+        self.shared_ffn_delta_normed(ffn, &n)
     }
 
     fn shared_ffn_residual_block(
@@ -649,7 +663,7 @@ impl ModelWeights {
         out
     }
 
-    /// Official MoE: shared + routed on the same normed input (no residual).
+    /// Official MoE: **one** `ffn_norm`, then shared + routed on the same tensor.
     fn moe_block_delta(
         &self,
         ffn: Option<&crate::weights::Layer0SharedFfn>,
@@ -659,13 +673,13 @@ impl ModelWeights {
     ) -> Vec<f32> {
         let mut y = vec![0.0f32; h.len()];
         if let Some(ffn) = ffn {
-            let d = self.shared_ffn_delta(ffn, h);
+            // Official Block: x = ffn_norm(x); y = shared(x) + routed(x)
+            let n = self.rms_norm_with(h, Some(&ffn.ffn_norm));
+            let d = self.shared_ffn_delta_normed(ffn, &n);
             for (o, x) in y.iter_mut().zip(d.iter()) {
                 *o += *x;
             }
             if let Some(moe) = moe {
-                // Shared already applied ffn_norm; route on same normed activations.
-                let n = self.rms_norm_with(h, Some(&ffn.ffn_norm));
                 let d = self.routed_moe_delta(moe, None, &n, true, token_id);
                 for (o, x) in y.iter_mut().zip(d.iter()) {
                     *o += *x;
@@ -1131,7 +1145,7 @@ fn mean_collapse_streams(streams: &[f32], hc_mult: usize, hidden: usize) -> Vec<
 
 /// How many transformer layers to load for the local runner.
 ///
-/// - `TRAJECT_LOCAL_LAYERS` — requested count (default **2**, min 1)
+/// - `TRAJECT_LOCAL_LAYERS` — requested count (default **4**, min 1)
 /// - `TRAJECT_LOCAL_LAYERS_MAX` — hard cap (default **43** = full V4 Flash depth,
 ///   never above model `num_hidden_layers`)
 ///
@@ -1140,7 +1154,7 @@ fn local_layer_count(cfg: Option<&crate::weights::HfModelConfig>) -> usize {
     let env = std::env::var("TRAJECT_LOCAL_LAYERS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok());
-    let n = env.unwrap_or(2).max(1);
+    let n = env.unwrap_or(4).max(1);
     let max_model = cfg
         .and_then(|c| c.num_hidden_layers)
         .map(|x| x as usize)
@@ -2103,23 +2117,24 @@ impl InferenceBackend for LocalWeightRunner {
                                 hc.eps,
                                 hc.norm_eps,
                             );
-                            let (mut kk, _) = self.weights.project_kv_layer(&block.attn, &x);
+                            // Official: single attn_norm shared by Q/KV/compressor/indexer.
+                            let xn = self.weights.rms_norm_with(&x, Some(&block.attn.attn_norm));
+                            let (mut kk, _) = self.weights.project_kv_layer(&block.attn, &xn);
                             kk.resize(kv_width, 0.0);
                             finalize_attn_kv_latent(&mut kk, head_dim, &block.attn.rope, pos);
                             let vv = kk.clone();
                             self.kv.lock().append_kv(&pfx, &kk, &vv);
-                            let hn = self.weights.rms_norm_with(&x, Some(&block.attn.attn_norm));
                             maybe_append_compress(
                                 &self.kv,
                                 &self.compress_states,
                                 &self.index_kv,
                                 &pfx,
                                 block,
-                                &hn,
+                                &xn,
                                 pos,
                                 kv_width,
                             );
-                            let mut qq = self.weights.project_q_layer(&block.attn, &x);
+                            let mut qq = self.weights.project_q_layer(&block.attn, &xn);
                             qq.resize(q_width, 0.0);
                             apply_rope_heads(&mut qq, n_q, head_dim, &block.attn.rope, pos, false);
                             let (k_cache, v_cache, seq_len) = self.kv.lock().materialize_kv(&pfx);
@@ -2135,12 +2150,11 @@ impl InferenceBackend for LocalWeightRunner {
                                     self.sliding_window,
                                     block.attn.rope.compress_ratio,
                                     {
-                                        let qr = self.weights.project_q_lora(&block.attn, &x);
-                                        let hn2 = self.weights.rms_norm_with(&x, Some(&block.attn.attn_norm));
+                                        let qr = self.weights.project_q_lora(&block.attn, &xn);
                                         filter_compress_pool_for_block(
                                             block,
                                             Some(&qr),
-                                            Some(&hn2),
+                                            Some(&xn),
                                             pos,
                                             materialize_compress_pool(&self.kv, &pfx),
                                             &self.index_kv,
@@ -2204,23 +2218,24 @@ impl InferenceBackend for LocalWeightRunner {
                             } else {
                                 mean_collapse_streams(&streams, hc_mult, self.weights.hidden)
                             };
-                            let (mut kk, _) = self.weights.project_kv_layer(&block.attn, &h);
+                            // Official: single attn_norm shared by Q/KV/compressor/indexer.
+                            let xn = self.weights.rms_norm_with(&h, Some(&block.attn.attn_norm));
+                            let (mut kk, _) = self.weights.project_kv_layer(&block.attn, &xn);
                             kk.resize(kv_width, 0.0);
                             finalize_attn_kv_latent(&mut kk, head_dim, &block.attn.rope, pos);
                             let vv = kk.clone();
                             self.kv.lock().append_kv(&pfx, &kk, &vv);
-                            let hn = self.weights.rms_norm_with(&h, Some(&block.attn.attn_norm));
                             maybe_append_compress(
                                 &self.kv,
                                 &self.compress_states,
                                 &self.index_kv,
                                 &pfx,
                                 block,
-                                &hn,
+                                &xn,
                                 pos,
                                 kv_width,
                             );
-                            let mut qq = self.weights.project_q_layer(&block.attn, &h);
+                            let mut qq = self.weights.project_q_layer(&block.attn, &xn);
                             qq.resize(q_width, 0.0);
                             apply_rope_heads(&mut qq, n_q, head_dim, &block.attn.rope, pos, false);
                             let (k_cache, v_cache, seq_len) = self.kv.lock().materialize_kv(&pfx);
@@ -2235,12 +2250,11 @@ impl InferenceBackend for LocalWeightRunner {
                                     self.sliding_window,
                                     block.attn.rope.compress_ratio,
                                     {
-                                        let qr = self.weights.project_q_lora(&block.attn, &h);
-                                        let hn2 = self.weights.rms_norm_with(&h, Some(&block.attn.attn_norm));
+                                        let qr = self.weights.project_q_lora(&block.attn, &xn);
                                         filter_compress_pool_for_block(
                                             block,
                                             Some(&qr),
-                                            Some(&hn2),
+                                            Some(&xn),
                                             pos,
                                             materialize_compress_pool(&self.kv, &pfx),
                                             &self.index_kv,
@@ -2382,21 +2396,22 @@ impl InferenceBackend for LocalWeightRunner {
                             hc.norm_eps,
                         );
                         // Write K/V at abs_pos from full residual (append new or refresh).
-                        let (mut kk, _) = self.weights.project_kv_layer(&block.attn, &x);
+                        // Official: single attn_norm for Q/KV/compressor/indexer.
+                        let xn = self.weights.rms_norm_with(&x, Some(&block.attn.attn_norm));
+                        let (mut kk, _) = self.weights.project_kv_layer(&block.attn, &xn);
                         kk.resize(kv_width, 0.0);
                         finalize_attn_kv_latent(&mut kk, head_dim, &block.attn.rope, abs_pos);
                         let vv = kk.clone();
                         let (seq_len, did_append) =
                             store_layer_kv_at_pos(&self.kv, &pfx, &kk, &vv, abs_pos);
                         if did_append {
-                            let hn = self.weights.rms_norm_with(&x, Some(&block.attn.attn_norm));
                             maybe_append_compress(
                                 &self.kv,
                                 &self.compress_states,
                                 &self.index_kv,
                                 &pfx,
                                 block,
-                                &hn,
+                                &xn,
                                 abs_pos,
                                 kv_width,
                             );
@@ -2407,7 +2422,7 @@ impl InferenceBackend for LocalWeightRunner {
                         }
                         let (k_cache, v_cache, seq_len) = self.kv.lock().materialize_kv(&pfx);
                         let q_pos = abs_pos.min((seq_len as usize).saturating_sub(1));
-                        let mut qq = self.weights.project_q_layer(&block.attn, &x);
+                        let mut qq = self.weights.project_q_layer(&block.attn, &xn);
                         qq.resize(q_width, 0.0);
                         apply_rope_heads(&mut qq, n_q, head_dim, &block.attn.rope, q_pos, false);
                         let (k_exp, v_exp, seq_len) = prepare_kv_for_decode(
@@ -2420,12 +2435,11 @@ impl InferenceBackend for LocalWeightRunner {
                             self.sliding_window,
                             block.attn.rope.compress_ratio,
                             {
-                                let qr = self.weights.project_q_lora(&block.attn, &x);
-                                let hn2 = self.weights.rms_norm_with(&x, Some(&block.attn.attn_norm));
+                                let qr = self.weights.project_q_lora(&block.attn, &xn);
                                 filter_compress_pool_for_block(
                                     block,
                                     Some(&qr),
-                                    Some(&hn2),
+                                    Some(&xn),
                                     q_pos,
                                     materialize_compress_pool(&self.kv, &pfx),
                                     &self.index_kv,
@@ -2480,21 +2494,21 @@ impl InferenceBackend for LocalWeightRunner {
                         } else {
                             mean_collapse_streams(&streams, hc_mult, self.weights.hidden)
                         };
-                        let (mut kk, _) = self.weights.project_kv_layer(&block.attn, &h);
+                        let xn = self.weights.rms_norm_with(&h, Some(&block.attn.attn_norm));
+                        let (mut kk, _) = self.weights.project_kv_layer(&block.attn, &xn);
                         kk.resize(kv_width, 0.0);
                         finalize_attn_kv_latent(&mut kk, head_dim, &block.attn.rope, abs_pos);
                         let vv = kk.clone();
                         let (seq_len, did_append) =
                             store_layer_kv_at_pos(&self.kv, &pfx, &kk, &vv, abs_pos);
                         if did_append {
-                            let hn = self.weights.rms_norm_with(&h, Some(&block.attn.attn_norm));
                             maybe_append_compress(
                                 &self.kv,
                                 &self.compress_states,
                                 &self.index_kv,
                                 &pfx,
                                 block,
-                                &hn,
+                                &xn,
                                 abs_pos,
                                 kv_width,
                             );
@@ -2505,7 +2519,7 @@ impl InferenceBackend for LocalWeightRunner {
                         }
                         let (k_cache, v_cache, seq_len) = self.kv.lock().materialize_kv(&pfx);
                         let q_pos = abs_pos.min((seq_len as usize).saturating_sub(1));
-                        let mut qq = self.weights.project_q_layer(&block.attn, &h);
+                        let mut qq = self.weights.project_q_layer(&block.attn, &xn);
                         qq.resize(q_width, 0.0);
                         apply_rope_heads(&mut qq, n_q, head_dim, &block.attn.rope, q_pos, false);
                         let (k_exp, v_exp, seq_len) = prepare_kv_for_decode(
@@ -2518,12 +2532,11 @@ impl InferenceBackend for LocalWeightRunner {
                             self.sliding_window,
                             block.attn.rope.compress_ratio,
                             {
-                                let qr = self.weights.project_q_lora(&block.attn, &h);
-                                let hn2 = self.weights.rms_norm_with(&h, Some(&block.attn.attn_norm));
+                                let qr = self.weights.project_q_lora(&block.attn, &xn);
                                 filter_compress_pool_for_block(
                                     block,
                                     Some(&qr),
-                                    Some(&hn2),
+                                    Some(&xn),
                                     q_pos,
                                     materialize_compress_pool(&self.kv, &pfx),
                                     &self.index_kv,

@@ -56,6 +56,7 @@
 - [x] Rayon-parallel lm_head logits + MoE gate/expert hot path
 - [x] Decode KV rewrite from full residual + shared-expert swiglu_limit
 - [x] Position-aware decode KV (append vs refresh) without post-sample placeholder path
+- [x] Official single attn_norm/ffn_norm per sublayer; default LOCAL_LAYERS=4
 - [ ] Quality/perf parity with sglang-lite for in-process 43-layer runs
 - [x] Tool latency-aware pin TTL from histograms (`ToolLatencyTracker` p95)
 - [x] Prefetch pin after tool return (`PinReason::Prefetch`)

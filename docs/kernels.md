@@ -123,7 +123,7 @@ Per-layer KV is keyed `{prefix}:L{i}`. Free drops base + all layer keys.
 quality/perf parity with sglang-lite (full 43-layer eval).
 
 ```bash
-export TRAJECT_LOCAL_LAYERS=2      # 1..num_hidden_layers (V4 Flash: 43)
+export TRAJECT_LOCAL_LAYERS=4      # default 4; 1..num_hidden_layers (V4 Flash: 43)
 export TRAJECT_LOCAL_LAYERS_MAX=43 # default = model depth
 export TRAJECT_ATTN_HEADS=64       # default = model n_heads; set 8 for fast CPU smoke
 export TRAJECT_SLIDING_WINDOW=128  # 0 = disable SWA
@@ -175,4 +175,5 @@ Chunk logs report `multihead`, `sliding_window`, `n_layers`, `moe_cache`.
 - [x] Rayon-parallel lm_head logits + MoE gate scores + top-k expert SwiGLU  
 - [x] Decode overwrite last KV from full residual; shared-expert `swiglu_limit`  
 - [x] Position-aware decode KV store (append new / refresh last); no crude post-sample  
+- [x] Single shared `attn_norm` / `ffn_norm` per sublayer (official Block order); default 4 layers  
 - [ ] Quality/perf parity with sglang-lite (GPU kernels, full eval)  
