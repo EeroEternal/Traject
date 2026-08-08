@@ -54,6 +54,7 @@
 - [x] Linear act_quant on packed FP8/FP4 matvec inputs (official `linear()`)
 - [x] Rayon-parallel FP8/FP4/f32 matvec + multi-head CPU attn; default full Q heads
 - [x] Rayon-parallel lm_head logits + MoE gate/expert hot path
+- [x] Decode KV rewrite from full residual + shared-expert swiglu_limit
 - [ ] Quality/perf parity with sglang-lite for in-process 43-layer runs
 - [x] Tool latency-aware pin TTL from histograms (`ToolLatencyTracker` p95)
 - [x] Prefetch pin after tool return (`PinReason::Prefetch`)

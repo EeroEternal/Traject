@@ -131,6 +131,31 @@ impl PagedKvPool {
         }
     }
 
+    /// Overwrite the last stored token's K/V (used to replace placeholder / crude KV
+    /// with values from the full residual path during decode).
+    fn overwrite_last_kv(&mut self, prefix: &str, k: &[f32], v: &[f32]) -> bool {
+        let need = self.num_heads * self.head_dim;
+        if k.len() < need || v.len() < need {
+            return false;
+        }
+        let Some(ids) = self.by_prefix.get(prefix) else {
+            return false;
+        };
+        let Some(&last) = ids.last() else {
+            return false;
+        };
+        let Some(page) = self.pages.get_mut(&last) else {
+            return false;
+        };
+        if page.tokens == 0 {
+            return false;
+        }
+        let off = (page.tokens as usize - 1) * need;
+        page.k[off..off + need].copy_from_slice(&k[..need]);
+        page.v[off..off + need].copy_from_slice(&v[..need]);
+        true
+    }
+
     fn materialize_kv(&self, prefix: &str) -> (Vec<f32>, Vec<f32>, u32) {
         let Some(ids) = self.by_prefix.get(prefix) else {
             return (Vec::new(), Vec::new(), 0);
@@ -528,12 +553,21 @@ impl ModelWeights {
         matvec(&self.w_up, self.hidden, self.attn_dim, attn_o)
     }
 
-    /// Pure shared-expert SwiGLU (no residual).
+    /// Pure shared-expert SwiGLU (no residual). Applies official `swiglu_limit`.
     fn shared_ffn_delta(&self, ffn: &crate::weights::Layer0SharedFfn, h: &[f32]) -> Vec<f32> {
         let n = self.rms_norm_with(h, Some(&ffn.ffn_norm));
         // SwiGLU with LinearMat (packed FP8 or f32).
-        let u = ffn.w1.matvec(&n);
-        let g = ffn.w3.matvec(&n);
+        let mut u = ffn.w1.matvec(&n);
+        let mut g = ffn.w3.matvec(&n);
+        let limit = ffn.swiglu_limit;
+        if limit > 0.0 {
+            for v in &mut u {
+                *v = v.min(limit);
+            }
+            for v in &mut g {
+                *v = (*v).clamp(-limit, limit);
+            }
+        }
         let mut gated = vec![0.0f32; ffn.intermediate];
         for i in 0..ffn.intermediate {
             let x = u.get(i).copied().unwrap_or(0.0);
@@ -2304,13 +2338,21 @@ impl InferenceBackend for LocalWeightRunner {
                             hc.eps,
                             hc.norm_eps,
                         );
-                        let (k_cache, v_cache, seq_len) = self.kv.lock().materialize_kv(&pfx);
-                        if seq_len == 0 {
-                            let (mut kk, _) = self.weights.project_kv_layer(&block.attn, &x);
-                            kk.resize(kv_width, 0.0);
-                            finalize_attn_kv_latent(&mut kk, head_dim, &block.attn.rope, 0);
-                            let vv = kk.clone();
-                            self.kv.lock().append_kv(&pfx, &kk, &vv);
+                        // Project K/V from full residual; overwrite last cache slot
+                        // (or append if empty) so decode K matches the HC path.
+                        let prev_len = self.kv.lock().materialize_kv(&pfx).2 as usize;
+                        let kv_pos = prev_len.saturating_sub(1);
+                        let (mut kk, _) = self.weights.project_kv_layer(&block.attn, &x);
+                        kk.resize(kv_width, 0.0);
+                        finalize_attn_kv_latent(&mut kk, head_dim, &block.attn.rope, kv_pos);
+                        let vv = kk.clone();
+                        {
+                            let mut guard = self.kv.lock();
+                            if prev_len == 0 || !guard.overwrite_last_kv(&pfx, &kk, &vv) {
+                                guard.append_kv(&pfx, &kk, &vv);
+                            }
+                        }
+                        if prev_len == 0 {
                             let hn = self.weights.rms_norm_with(&x, Some(&block.attn.attn_norm));
                             maybe_append_compress(
                                 &self.kv,
@@ -2325,6 +2367,7 @@ impl InferenceBackend for LocalWeightRunner {
                             streams = residual;
                             continue;
                         }
+                        let (k_cache, v_cache, seq_len) = self.kv.lock().materialize_kv(&pfx);
                         let q_pos = (seq_len as usize).saturating_sub(1);
                         let mut qq = self.weights.project_q_layer(&block.attn, &x);
                         qq.resize(q_width, 0.0);
@@ -2399,15 +2442,19 @@ impl InferenceBackend for LocalWeightRunner {
                         } else {
                             mean_collapse_streams(&streams, hc_mult, self.weights.hidden)
                         };
-                        let mut qq = self.weights.project_q_layer(&block.attn, &h);
-                        qq.resize(q_width, 0.0);
-                        let (k_cache, v_cache, seq_len) = self.kv.lock().materialize_kv(&pfx);
-                        if seq_len == 0 {
-                            let (mut kk, _) = self.weights.project_kv_layer(&block.attn, &h);
-                            kk.resize(kv_width, 0.0);
-                            finalize_attn_kv_latent(&mut kk, head_dim, &block.attn.rope, 0);
-                            let vv = kk.clone();
-                            self.kv.lock().append_kv(&pfx, &kk, &vv);
+                        let prev_len = self.kv.lock().materialize_kv(&pfx).2 as usize;
+                        let kv_pos = prev_len.saturating_sub(1);
+                        let (mut kk, _) = self.weights.project_kv_layer(&block.attn, &h);
+                        kk.resize(kv_width, 0.0);
+                        finalize_attn_kv_latent(&mut kk, head_dim, &block.attn.rope, kv_pos);
+                        let vv = kk.clone();
+                        {
+                            let mut guard = self.kv.lock();
+                            if prev_len == 0 || !guard.overwrite_last_kv(&pfx, &kk, &vv) {
+                                guard.append_kv(&pfx, &kk, &vv);
+                            }
+                        }
+                        if prev_len == 0 {
                             let hn = self.weights.rms_norm_with(&h, Some(&block.attn.attn_norm));
                             maybe_append_compress(
                                 &self.kv,
@@ -2422,7 +2469,10 @@ impl InferenceBackend for LocalWeightRunner {
                             streams = h;
                             continue;
                         }
+                        let (k_cache, v_cache, seq_len) = self.kv.lock().materialize_kv(&pfx);
                         let q_pos = (seq_len as usize).saturating_sub(1);
+                        let mut qq = self.weights.project_q_layer(&block.attn, &h);
+                        qq.resize(q_width, 0.0);
                         apply_rope_heads(&mut qq, n_q, head_dim, &block.attn.rope, q_pos, false);
                         let (k_exp, v_exp, seq_len) = prepare_kv_for_decode(
                             self.multihead,
@@ -2508,7 +2558,8 @@ impl InferenceBackend for LocalWeightRunner {
                 .await?;
 
             let tid = sampled.token_id % self.weights.vocab;
-            // Append new-token KV for every layer after sampling (for next step).
+            // Append new-token KV using the full HC residual path so the next
+            // decode step's overwrite/attend sees a consistent latent.
             let emb_n = self.weights.embed_token(tid);
             if self.weights.layers.is_empty() {
                 let (mut k, mut v) = self.weights.project_kv(&emb_n);
@@ -2516,29 +2567,97 @@ impl InferenceBackend for LocalWeightRunner {
                 v.resize(kv_width, 0.0);
                 self.kv.lock().append_kv(&prefix, &k, &v);
             } else {
-                let mut hh = emb_n;
+                let mut streams = if self.weights.has_hc() {
+                    expand_hc_streams(&emb_n, hc_mult)
+                } else {
+                    emb_n
+                };
                 for (li, block) in self.weights.layers.iter().enumerate() {
                     let pfx = format!("{prefix}:L{li}");
                     let pos = self.kv.lock().materialize_kv(&pfx).2 as usize;
-                    let (mut k, _) = self.weights.project_kv_layer(&block.attn, &hh);
-                    k.resize(kv_width, 0.0);
-                    finalize_attn_kv_latent(&mut k, head_dim, &block.attn.rope, pos);
-                    let v = k.clone();
-                    self.kv.lock().append_kv(&pfx, &k, &v);
-                    let hn = self.weights.rms_norm_with(&hh, Some(&block.attn.attn_norm));
-                    maybe_append_compress(
-                        &self.kv,
-                        &self.compress_states,
-                        &self.index_kv,
-                        &pfx,
-                        block,
-                        &hn,
-                        pos,
-                        kv_width,
-                    );
-                    // Advance residual lightly so deeper layers see something non-constant.
-                    if let Some(ref ffn) = block.ffn {
-                        hh = self.weights.shared_ffn_residual_block(ffn, &hh);
+                    if let Some(ref hc) = block.hc {
+                        let residual = streams.clone();
+                        let (x, post, comb) = hc_pre(
+                            &streams,
+                            &hc.attn,
+                            hc.hc_mult,
+                            hc.hidden,
+                            hc.sinkhorn_iters,
+                            hc.eps,
+                            hc.norm_eps,
+                        );
+                        let (mut k, _) = self.weights.project_kv_layer(&block.attn, &x);
+                        k.resize(kv_width, 0.0);
+                        finalize_attn_kv_latent(&mut k, head_dim, &block.attn.rope, pos);
+                        let v = k.clone();
+                        self.kv.lock().append_kv(&pfx, &k, &v);
+                        let hn = self.weights.rms_norm_with(&x, Some(&block.attn.attn_norm));
+                        maybe_append_compress(
+                            &self.kv,
+                            &self.compress_states,
+                            &self.index_kv,
+                            &pfx,
+                            block,
+                            &hn,
+                            pos,
+                            kv_width,
+                        );
+                        // Zero attn delta placeholder: residual advances via HC comb only
+                        // until next full decode overwrites K and runs real attn.
+                        let zero = vec![0.0f32; hc.hidden];
+                        streams = hc_post(&zero, &residual, &post, &comb, hc.hc_mult, hc.hidden);
+                        let residual = streams.clone();
+                        let (x, post, comb) = hc_pre(
+                            &streams,
+                            &hc.ffn,
+                            hc.hc_mult,
+                            hc.hidden,
+                            hc.sinkhorn_iters,
+                            hc.eps,
+                            hc.norm_eps,
+                        );
+                        let y = self.weights.moe_block_delta(
+                            block.ffn.as_ref(),
+                            block.moe.as_ref(),
+                            &x,
+                            Some(tid as u32),
+                        );
+                        streams = hc_post(&y, &residual, &post, &comb, hc.hc_mult, hc.hidden);
+                    } else {
+                        let mut hh = if streams.len() == self.weights.hidden {
+                            streams.clone()
+                        } else {
+                            mean_collapse_streams(&streams, hc_mult, self.weights.hidden)
+                        };
+                        let (mut k, _) = self.weights.project_kv_layer(&block.attn, &hh);
+                        k.resize(kv_width, 0.0);
+                        finalize_attn_kv_latent(&mut k, head_dim, &block.attn.rope, pos);
+                        let v = k.clone();
+                        self.kv.lock().append_kv(&pfx, &k, &v);
+                        let hn = self.weights.rms_norm_with(&hh, Some(&block.attn.attn_norm));
+                        maybe_append_compress(
+                            &self.kv,
+                            &self.compress_states,
+                            &self.index_kv,
+                            &pfx,
+                            block,
+                            &hn,
+                            pos,
+                            kv_width,
+                        );
+                        if let Some(ref ffn) = block.ffn {
+                            hh = self.weights.shared_ffn_residual_block(ffn, &hh);
+                        }
+                        if let Some(ref moe) = block.moe {
+                            let norm = block.ffn.as_ref().map(|f| f.ffn_norm.as_slice());
+                            hh = self.weights.routed_moe_residual_block(
+                                moe,
+                                norm,
+                                &hh,
+                                Some(tid as u32),
+                            );
+                        }
+                        streams = hh;
                     }
                 }
             }
@@ -2699,6 +2818,22 @@ mod tests {
         assert!(runner.pages_allocated() >= 1);
         runner.free_prefix(&prefix, None).await.unwrap();
         assert_eq!(runner.pages_allocated(), 0);
+    }
+
+    #[test]
+    fn overwrite_last_kv_replaces_tail() {
+        let mut pool = PagedKvPool::new(8, 1, 2);
+        let k1 = vec![1.0f32, 2.0];
+        let v1 = vec![3.0f32, 4.0];
+        pool.append_kv("p", &k1, &v1);
+        let k2 = vec![5.0f32, 6.0];
+        let v2 = vec![7.0f32, 8.0];
+        pool.append_kv("p", &k2, &v2);
+        assert!(pool.overwrite_last_kv("p", &[9.0, 10.0], &[11.0, 12.0]));
+        let (k, v, n) = pool.materialize_kv("p");
+        assert_eq!(n, 2);
+        assert_eq!(k, vec![1.0, 2.0, 9.0, 10.0]);
+        assert_eq!(v, vec![3.0, 4.0, 11.0, 12.0]);
     }
 
     #[test]

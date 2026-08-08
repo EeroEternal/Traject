@@ -173,4 +173,5 @@ Chunk logs report `multihead`, `sliding_window`, `n_layers`, `moe_cache`.
 - [x] Linear act_quant on FP8/FP4 matvec inputs (block 128, ue8m0)  
 - [x] Rayon-parallel dense/expert matvec + multi-head attn; default full heads  
 - [x] Rayon-parallel lm_head logits + MoE gate scores + top-k expert SwiGLU  
+- [x] Decode overwrite last KV from full residual; shared-expert `swiglu_limit`  
 - [ ] Quality/perf parity with sglang-lite (GPU kernels, full eval)  

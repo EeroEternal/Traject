@@ -739,6 +739,8 @@ pub struct Layer0SharedFfn {
     pub ffn_norm: Vec<f32>,
     pub hidden: usize,
     pub intermediate: usize,
+    /// Clamp for SwiGLU gate/up (official `swiglu_limit`; 0 = disabled).
+    pub swiglu_limit: f32,
     /// [intermediate, hidden]
     pub w1: LinearMat,
     /// [hidden, intermediate]
@@ -1943,12 +1945,21 @@ fn load_layer_shared_ffn_into(
         )));
     }
 
+    let swiglu_limit = {
+        use crate::weights::HfModelConfig;
+        HfModelConfig::load(model_dir)
+            .ok()
+            .and_then(|c| c.swiglu_limit)
+            .unwrap_or(10.0)
+    };
+
     info!(
         dir = %model_dir.display(),
         hidden,
         intermediate,
         layer,
         packed_fp8 = w1.is_fp8(),
+        swiglu_limit,
         "loaded layer shared expert FFN"
     );
 
@@ -1956,6 +1967,7 @@ fn load_layer_shared_ffn_into(
         ffn_norm: ffn_norm.data,
         hidden,
         intermediate,
+        swiglu_limit,
         w1,
         w2,
         w3,
