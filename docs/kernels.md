@@ -174,4 +174,5 @@ Chunk logs report `multihead`, `sliding_window`, `n_layers`, `moe_cache`.
 - [x] Rayon-parallel dense/expert matvec + multi-head attn; default full heads  
 - [x] Rayon-parallel lm_head logits + MoE gate scores + top-k expert SwiGLU  
 - [x] Decode overwrite last KV from full residual; shared-expert `swiglu_limit`  
+- [x] Position-aware decode KV store (append new / refresh last); no crude post-sample  
 - [ ] Quality/perf parity with sglang-lite (GPU kernels, full eval)  

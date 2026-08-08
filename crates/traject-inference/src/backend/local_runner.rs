@@ -845,6 +845,42 @@ fn finalize_attn_kv_latent(
     crate::weights::dtype::fp8_act_quant_nope_inplace(&mut x[..d], rd, 64);
 }
 
+/// Store layer K/V for absolute position `abs_pos`.
+///
+/// - `cache_len == abs_pos` → **append** (new token, like official write at start_pos)
+/// - `cache_len == abs_pos + 1` → **overwrite last** (refresh residual for that token)
+/// - otherwise → append (best-effort recovery)
+///
+/// Returns `(seq_len_after, did_append)`.
+fn store_layer_kv_at_pos(
+    kv: &Mutex<PagedKvPool>,
+    pfx: &str,
+    k: &[f32],
+    v: &[f32],
+    abs_pos: usize,
+) -> (u32, bool) {
+    let mut guard = kv.lock();
+    let prev = guard.materialize_kv(pfx).2 as usize;
+    if prev == abs_pos {
+        guard.append_kv(pfx, k, v);
+        ((prev + 1) as u32, true)
+    } else if prev == abs_pos + 1 {
+        let ok = guard.overwrite_last_kv(pfx, k, v);
+        if !ok {
+            guard.append_kv(pfx, k, v);
+            return ((prev + 1) as u32, true);
+        }
+        (prev as u32, false)
+    } else if prev == 0 {
+        guard.append_kv(pfx, k, v);
+        (1, true)
+    } else {
+        // Cache ahead/behind abs_pos — append to avoid stalling decode.
+        guard.append_kv(pfx, k, v);
+        ((prev + 1) as u32, true)
+    }
+}
+
 /// First `n_q` entries of layer `attn_sink`, if present.
 fn sink_for_heads(layer: &crate::weights::Layer0AttnWeights, n_q: usize) -> Option<Vec<f32>> {
     layer.attn_sink.as_ref().map(|s| {
@@ -2274,6 +2310,13 @@ impl InferenceBackend for LocalWeightRunner {
                 .copied()
                 .or_else(|| prompt_ids.last().copied())
                 .unwrap_or(1);
+            // Absolute position of `last_tid` in the sequence (0-based).
+            // Prefill fills 0..prompt_len-1; generated tokens start at prompt_len.
+            let abs_pos = if out_ids.is_empty() {
+                prompt_ids.len().saturating_sub(1)
+            } else {
+                prompt_ids.len() + out_ids.len() - 1
+            };
             let emb = self.weights.embed_token(last_tid);
             let mut streams = if self.weights.has_hc() && !self.weights.layers.is_empty() {
                 expand_hc_streams(&emb, hc_mult)
@@ -2338,21 +2381,14 @@ impl InferenceBackend for LocalWeightRunner {
                             hc.eps,
                             hc.norm_eps,
                         );
-                        // Project K/V from full residual; overwrite last cache slot
-                        // (or append if empty) so decode K matches the HC path.
-                        let prev_len = self.kv.lock().materialize_kv(&pfx).2 as usize;
-                        let kv_pos = prev_len.saturating_sub(1);
+                        // Write K/V at abs_pos from full residual (append new or refresh).
                         let (mut kk, _) = self.weights.project_kv_layer(&block.attn, &x);
                         kk.resize(kv_width, 0.0);
-                        finalize_attn_kv_latent(&mut kk, head_dim, &block.attn.rope, kv_pos);
+                        finalize_attn_kv_latent(&mut kk, head_dim, &block.attn.rope, abs_pos);
                         let vv = kk.clone();
-                        {
-                            let mut guard = self.kv.lock();
-                            if prev_len == 0 || !guard.overwrite_last_kv(&pfx, &kk, &vv) {
-                                guard.append_kv(&pfx, &kk, &vv);
-                            }
-                        }
-                        if prev_len == 0 {
+                        let (seq_len, did_append) =
+                            store_layer_kv_at_pos(&self.kv, &pfx, &kk, &vv, abs_pos);
+                        if did_append {
                             let hn = self.weights.rms_norm_with(&x, Some(&block.attn.attn_norm));
                             maybe_append_compress(
                                 &self.kv,
@@ -2361,14 +2397,16 @@ impl InferenceBackend for LocalWeightRunner {
                                 &pfx,
                                 block,
                                 &hn,
-                                0,
+                                abs_pos,
                                 kv_width,
                             );
+                        }
+                        if seq_len == 0 {
                             streams = residual;
                             continue;
                         }
                         let (k_cache, v_cache, seq_len) = self.kv.lock().materialize_kv(&pfx);
-                        let q_pos = (seq_len as usize).saturating_sub(1);
+                        let q_pos = abs_pos.min((seq_len as usize).saturating_sub(1));
                         let mut qq = self.weights.project_q_layer(&block.attn, &x);
                         qq.resize(q_width, 0.0);
                         apply_rope_heads(&mut qq, n_q, head_dim, &block.attn.rope, q_pos, false);
@@ -2442,19 +2480,13 @@ impl InferenceBackend for LocalWeightRunner {
                         } else {
                             mean_collapse_streams(&streams, hc_mult, self.weights.hidden)
                         };
-                        let prev_len = self.kv.lock().materialize_kv(&pfx).2 as usize;
-                        let kv_pos = prev_len.saturating_sub(1);
                         let (mut kk, _) = self.weights.project_kv_layer(&block.attn, &h);
                         kk.resize(kv_width, 0.0);
-                        finalize_attn_kv_latent(&mut kk, head_dim, &block.attn.rope, kv_pos);
+                        finalize_attn_kv_latent(&mut kk, head_dim, &block.attn.rope, abs_pos);
                         let vv = kk.clone();
-                        {
-                            let mut guard = self.kv.lock();
-                            if prev_len == 0 || !guard.overwrite_last_kv(&pfx, &kk, &vv) {
-                                guard.append_kv(&pfx, &kk, &vv);
-                            }
-                        }
-                        if prev_len == 0 {
+                        let (seq_len, did_append) =
+                            store_layer_kv_at_pos(&self.kv, &pfx, &kk, &vv, abs_pos);
+                        if did_append {
                             let hn = self.weights.rms_norm_with(&h, Some(&block.attn.attn_norm));
                             maybe_append_compress(
                                 &self.kv,
@@ -2463,14 +2495,16 @@ impl InferenceBackend for LocalWeightRunner {
                                 &pfx,
                                 block,
                                 &hn,
-                                0,
+                                abs_pos,
                                 kv_width,
                             );
+                        }
+                        if seq_len == 0 {
                             streams = h;
                             continue;
                         }
                         let (k_cache, v_cache, seq_len) = self.kv.lock().materialize_kv(&pfx);
-                        let q_pos = (seq_len as usize).saturating_sub(1);
+                        let q_pos = abs_pos.min((seq_len as usize).saturating_sub(1));
                         let mut qq = self.weights.project_q_layer(&block.attn, &h);
                         qq.resize(q_width, 0.0);
                         apply_rope_heads(&mut qq, n_q, head_dim, &block.attn.rope, q_pos, false);
@@ -2558,110 +2592,9 @@ impl InferenceBackend for LocalWeightRunner {
                 .await?;
 
             let tid = sampled.token_id % self.weights.vocab;
-            // Append new-token KV using the full HC residual path so the next
-            // decode step's overwrite/attend sees a consistent latent.
-            let emb_n = self.weights.embed_token(tid);
-            if self.weights.layers.is_empty() {
-                let (mut k, mut v) = self.weights.project_kv(&emb_n);
-                k.resize(kv_width, 0.0);
-                v.resize(kv_width, 0.0);
-                self.kv.lock().append_kv(&prefix, &k, &v);
-            } else {
-                let mut streams = if self.weights.has_hc() {
-                    expand_hc_streams(&emb_n, hc_mult)
-                } else {
-                    emb_n
-                };
-                for (li, block) in self.weights.layers.iter().enumerate() {
-                    let pfx = format!("{prefix}:L{li}");
-                    let pos = self.kv.lock().materialize_kv(&pfx).2 as usize;
-                    if let Some(ref hc) = block.hc {
-                        let residual = streams.clone();
-                        let (x, post, comb) = hc_pre(
-                            &streams,
-                            &hc.attn,
-                            hc.hc_mult,
-                            hc.hidden,
-                            hc.sinkhorn_iters,
-                            hc.eps,
-                            hc.norm_eps,
-                        );
-                        let (mut k, _) = self.weights.project_kv_layer(&block.attn, &x);
-                        k.resize(kv_width, 0.0);
-                        finalize_attn_kv_latent(&mut k, head_dim, &block.attn.rope, pos);
-                        let v = k.clone();
-                        self.kv.lock().append_kv(&pfx, &k, &v);
-                        let hn = self.weights.rms_norm_with(&x, Some(&block.attn.attn_norm));
-                        maybe_append_compress(
-                            &self.kv,
-                            &self.compress_states,
-                            &self.index_kv,
-                            &pfx,
-                            block,
-                            &hn,
-                            pos,
-                            kv_width,
-                        );
-                        // Zero attn delta placeholder: residual advances via HC comb only
-                        // until next full decode overwrites K and runs real attn.
-                        let zero = vec![0.0f32; hc.hidden];
-                        streams = hc_post(&zero, &residual, &post, &comb, hc.hc_mult, hc.hidden);
-                        let residual = streams.clone();
-                        let (x, post, comb) = hc_pre(
-                            &streams,
-                            &hc.ffn,
-                            hc.hc_mult,
-                            hc.hidden,
-                            hc.sinkhorn_iters,
-                            hc.eps,
-                            hc.norm_eps,
-                        );
-                        let y = self.weights.moe_block_delta(
-                            block.ffn.as_ref(),
-                            block.moe.as_ref(),
-                            &x,
-                            Some(tid as u32),
-                        );
-                        streams = hc_post(&y, &residual, &post, &comb, hc.hc_mult, hc.hidden);
-                    } else {
-                        let mut hh = if streams.len() == self.weights.hidden {
-                            streams.clone()
-                        } else {
-                            mean_collapse_streams(&streams, hc_mult, self.weights.hidden)
-                        };
-                        let (mut k, _) = self.weights.project_kv_layer(&block.attn, &hh);
-                        k.resize(kv_width, 0.0);
-                        finalize_attn_kv_latent(&mut k, head_dim, &block.attn.rope, pos);
-                        let v = k.clone();
-                        self.kv.lock().append_kv(&pfx, &k, &v);
-                        let hn = self.weights.rms_norm_with(&hh, Some(&block.attn.attn_norm));
-                        maybe_append_compress(
-                            &self.kv,
-                            &self.compress_states,
-                            &self.index_kv,
-                            &pfx,
-                            block,
-                            &hn,
-                            pos,
-                            kv_width,
-                        );
-                        if let Some(ref ffn) = block.ffn {
-                            hh = self.weights.shared_ffn_residual_block(ffn, &hh);
-                        }
-                        if let Some(ref moe) = block.moe {
-                            let norm = block.ffn.as_ref().map(|f| f.ffn_norm.as_slice());
-                            hh = self.weights.routed_moe_residual_block(
-                                moe,
-                                norm,
-                                &hh,
-                                Some(tid as u32),
-                            );
-                        }
-                        streams = hh;
-                    }
-                }
-            }
-            let _ = n_layers; // used in logs
+            // Next loop iteration processes `tid` at abs_pos=prompt_len+out_ids.len()
+            // and appends its K/V from the full residual (no separate post-sample path).
+            let _ = (n_layers, abs_pos); // used above / in logs
 
             out_ids.push(tid);
             if self.tokenizer.is_some() {
@@ -2834,6 +2767,30 @@ mod tests {
         assert_eq!(n, 2);
         assert_eq!(k, vec![1.0, 2.0, 9.0, 10.0]);
         assert_eq!(v, vec![3.0, 4.0, 11.0, 12.0]);
+    }
+
+    #[test]
+    fn store_layer_kv_at_pos_append_then_overwrite() {
+        let pool = Mutex::new(PagedKvPool::new(8, 1, 2));
+        let k0 = vec![1.0f32, 0.0];
+        let v0 = vec![0.0f32, 1.0];
+        // abs_pos=0, empty cache → append
+        let (n, app) = store_layer_kv_at_pos(&pool, "p", &k0, &v0, 0);
+        assert_eq!(n, 1);
+        assert!(app);
+        // abs_pos=0 again with len=1 → overwrite last
+        let k0b = vec![2.0f32, 2.0];
+        let (n, app) = store_layer_kv_at_pos(&pool, "p", &k0b, &k0b, 0);
+        assert_eq!(n, 1);
+        assert!(!app);
+        // abs_pos=1 → append second token
+        let k1 = vec![3.0f32, 3.0];
+        let (n, app) = store_layer_kv_at_pos(&pool, "p", &k1, &k1, 1);
+        assert_eq!(n, 2);
+        assert!(app);
+        let (k, _, n) = pool.lock().materialize_kv("p");
+        assert_eq!(n, 2);
+        assert_eq!(k, vec![2.0, 2.0, 3.0, 3.0]);
     }
 
     #[test]
